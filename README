@@ -1,0 +1,281 @@
+OVERVIEW
+
+sigtree.pl is a tool for creating records of your filesystem structure
+in order to detect unauthorized modifications to your system.  Its
+records are called "specifications."  A specification is created for
+a particular directory tree on your system, or, in some cases, for
+a particular file.  Specifications are classified into sets, which
+serve two functions.  First, you can choose which sets of trees you
+want to create specifications for, which sets of trees you want to
+check for changes, or which sets of trees' specifications you want
+to update with detected changes.  Second, the primary set for each
+tree determines a numeric priority level and a set of attributes
+to be checked for changes.  The priority level is used for generating
+summary reports of changes; higher priority items are listed first.
+
+INSTALLATION
+
+sigtree.pl requires the following in order to work:
+
+* Perl 5.
+* CPAN Perl modules Digest::SHA, Sys::Hostname, Getopt::Std, File::Basename,
+  Cwd, and Storable (all included with OpenBSD standard distribution).
+* CPAN Perl module Digest::SHA3.
+
+If PGP signing is used (which is recommended), the following is also
+required:
+
+* PGP 5 or later, or GPG, or OpenBSD's signify.
+* CPAN Perl module PGP::Sign (security/p5-PGP-Sign port in OpenBSD).
+* /bin/stty to turn off echoing when PGP passphrases are requested.
+
+The default is none, GPG or signify are preferred. If you want to use
+PGP 5 or later, make sure you set the variable PGP_or_GPG in sigtree.pl
+to be 'PGP' instead of 'GPG' or set it in your config file.
+
+If immutable flags are to be used, sigtree.pl requires:
+
+* An operating system that supports immutable files (e.g., *BSD, Linux).
+* /usr/bin/chflags for setting/unsetting immutable flags.
+* /usr/sbin/sysctl to get the kernel securelevel.
+OR (for Linux)
+* /usr/bin/chattr for setting/unsetting the immutable file attribute.
+* /usr/bin/lsattr for obtaining system file attributes.
+* /sbin/runlevel to get the kernel runlevel.
+
+To obtain CPAN Perl modules, it is recommended that you use the
+standard CPAN module, as follows (as root):
+
+   perl -MCPAN -e shell;
+   install Bundle::CPAN         (this includes Digest::SHA1)
+   install Storable
+   install PGP::Sign
+   install Digest::SHA3
+
+The recommended location for sigtree.pl is in /usr/local/bin.  Sigtree
+configs go in /var/db/sigtree by default, but you can use any other
+location, so long as you specify that location with the -r (root dir)
+option to sigtree.pl.
+
+The default config file name is <hostname>.conf in your root dir,
+but a different config file can be specified with the -c (config
+file) option to sigtree.pl.  Modify the configuration file to
+monitor directories and files that you want monitored, and prioritize
+based on your own criteria.
+
+The recommended mechanism for running sigtree tests is to use
+a daily and weekly cron tab entry that emails the results to
+another machine.  On *BSD machines, you can put the following
+lines in daily.local and weekly.local, respectively:
+
+    host=`hostname -s`
+    /usr/local/bin/sigtree.pl -d secondary -s daily check | mail -s "daily $host sigtree test" email-address
+    /usr/local/bin/sigtree.pl -d secondary -s daily update
+
+    host=`hostname -s`
+    /usr/local/bin/sigtree.pl check | mail -s "weekly $host sigtree test" email-address
+
+Add the -v option if you want more verbose results that show the old
+and new values of all file attributes that change.
+
+This will cause a daily report of all new changes that occur each day
+in files in the "daily" set, and a weekly report of all changes
+against the primary specification that occur in any files in your
+config.  The daily checks are against the secondary specification,
+which is immediately updated to reflect detected changes, so that you
+won't see them on the next daily report.
+
+Note that to speed things up, rather than using "initialize" with -d
+secondary, you can simply copy the primary specifications into the
+directory "secondary/<hostname>" under your root directory, then
+do an "initialize_specs"  to get started.
+
+COMMAND OPTIONS (from "sigtree.pl -h")
+
+Usage: sigtree.pl [options] command
+Options:
+-r root_dir
+-c config_file
+-d spec_dir (absolute path or relative to root_dir)
+-s set list ("new" is synonymous with "uninitialized" and can be used with
+             the "initialize" command; you can specify multiple sets
+	     separated by commas)
+-v verbose
+-h help and version
+Commands:
+initialize: Initialize specifications for a set of trees.
+initialize_specs: Initialize specification for the specification dir.
+changes: Show non-updated or reinitialized changes found by check.
+check: Check specifications for a set of trees.
+check_file: Check an individual file against a specification.
+   (The file name is specified on the command line after "check_file".)
+check_specs: Check specification for the specification dir.
+update: Update specifications with changes found by check.
+
+The commands initialize_specs, check_specs, and check_file do not
+take the -s option.
+
+By default, the root directory is /var/db/sigtree and the
+specification directory for each host is specs/<hostname> relative
+to that root directory.  This is designed to allow you to rsync
+your specs directories across multiple machines without name
+conflicts.
+
+Giving the argument "secondary" to the -d option is special-cased
+to mean <root dir>/secondary/<hostname>, and to not use PGP signing
+or immutable flags--unless you are using BSD, in which case the
+secondary files use user immutability (uchg) if the immutable option
+is turned on.
+
+CONFIGURATION
+
+The configuration file is divided into three sections--the global
+attributes section, the set definition section, and the trees list
+section.  Any line in the configuration file may be blank or a
+comment (a line beginning with a # is a comment).  The configuration
+file must end with a newline.
+
+The global attributes section consists of the following:
+
+    crypto-sigs: GPG|GPG1|PGP|signify
+    pgpkeyring: path (default /root/.gnupg)
+    pgpkeyid: keyid
+    signify_pubkey: path
+    signify_seckey: path
+    immutable-specs: yes|no
+    sha2_digest: 256|384|512
+    sha3_digest: 224|256|384|512
+
+All of these fields may be omitted. If the pgpkeyid: alone is used,
+sigtree.pl will use GPG signatures on all specifications. It must
+specify a PGP key ID which is in the keyring of the user running
+sigtree.pl (usually root). The public key is required to do a check,
+and access to the private key is required to do an initialize or
+update.  Specify a crypto-sigs: field value to use GPG1, PGP, or
+signify.  The pgpkeyring: field is optional and defaults to
+/root/.gnupg.  The signify_pubkey: and signify_seckey: fields must be
+specified if crypto-sigs: signify is used.
+
+Signatures are checked against specifications during check commands,
+and are generated from specifications during initialize and update
+commands.
+
+The immutable-specs: field may be omitted, in which case the default
+is "no."  If it is set to "yes," then system immutability flags are
+set on specifications (and PGP signatures, if used) after their
+creation, and initialize and update commands then require booting
+to single user mode so that the system secure level will allow the
+flags to be reset so that the files may be changed.  On *BSD systems,
+immutable-specs may be set to "schg" (equivalent to "yes") or to
+"uchg"--system or user immutability, respectively.  "schg" means the
+system must be in single-user mode to reset the flag. On *BSD systems,
+enabling immutability will also enable user immutability on secondary
+files.
+
+The pgpkeyid: field is ignored when secondary specifications are used,
+but if immutable-specs: are turned on (yes, schg, or uchg), then
+user immutability will be used for secondary specifications
+(-d secondary).
+
+The default value for SHA digests if none is specified is 256-bit
+SHA3. SHA2 or SHA3 digests are only generated and comparisons are only
+performed if shadigest is specified in the keywords for a set. If you
+initialize specifications without any shadigest specified in the
+keywords and subsequently add it to the keywords, the next time you do
+a check the associated files will show as having changed from
+<undefined> to the current actual value.
+
+The set definition section consists of any number of the following
+fields used to define sets:
+
+   set: long name,short name
+   description: Human-readable description of set.
+   keywords: list of keywords
+   priority: priority level
+
+The set: and description: fields are required; the keywords: and
+priority: keywords are optional.  Set names may consist of up to
+twelve alpha-numeric characters.  Hyphens may also be used in
+set names.
+
+Sets are used in two ways by sigtree.pl.  First, they are used
+as a method of grouping trees, so that sigtree.pl's commands
+may be used on different sets of trees.  The initialize, check,
+and update operations work on entire trees.  The -s option to
+sigtree.pl references sets used in this way; exceptions within
+a tree are always members of the sets their tree is a member of.
+The keywords: and priority: fields have no meaning for sets used
+only in this way, and should not be defined for them.  The -s
+option will complain about sets that are only used as primary
+sets for exceptions, which have no trees as members.
+  Second, sets are used to define groups of files that share
+common characteristics, that need to have similar attributes
+monitored for changes, and that are of a similar priority level.
+The keywords: field determines which file attributes are checked
+for changes, and the priority: field determines where changes
+are reported in the check command's summary report--the higher
+the priority, the higher it appears in the report.  Each tree or
+exception may only have one set used in this way; this set is
+known as its primary set and is the first one associated with
+its name in the configuration file.
+   Keywords available are
+
+        type   type of file (file, dir, link, fifo, device, socket)
+	linktarget_type  type of file that is the target of a link
+        uid    user ID of owner
+        gid    group ID of owner
+        mode   file permissions
+        size   size in bytes
+        nlink  number of hard links to the file
+        link   link target, if it's a symbolic link
+        mtime  modification time of file
+        mtimestasis-NN[smhd]  report if mtime doesn't change for
+               more than NN seconds/minutes/hours/days
+        ctime  inode change time of file 
+        shadigest  SHA-3 or SHA-2 digest of file (the old sha2digest and
+	       sha3digest keywords are now synonyms, the digests computed
+	       are based on the global shaN_digest setting)
+        flags  file system flags (those shown with ls -lo/set by chflags)
+        ignore overrides all other keywords, no file attributes are
+                  checked
+
+and must be separated by commas in the keywords list.  If no
+keywords: field is specified, the default is to check all of these
+attributes except mtimestasis.
+
+Priority must be a decimal integer.
+
+The trees list section of the configuration file lists the pathnames
+of trees for which specifications are to be produced and a list of
+the sets they belong to.  The first set listed is the tree or file's
+primary set and determines its priority and keyword settings.
+   For each tree, any number of exception files within the tree may
+be specified with a different primary set.  The exact syntax is:
+
+    tree: path:set list
+    exception: path:primary set
+    exception-tree: dirpath:primary set
+
+The "exception" field specifies a single file or directory as an
+exception, while the "exception-tree" field specifies a directory
+subtree (a directory and everything it contains) as an exception.
+If "." is specified as an exception, the primary set of the tree
+directory itself (but not its contents) is changed.  This is useful
+for directories that frequently change mtime and ctime (like /etc).
+
+Set names specified may be either long or short names of sets.
+
+NOTES
+
+Symbolic links are never followed by sigtree.pl, to avoid loops.
+If you have a file you want monitored that is not under a specified
+tree, but only the target of a symbolic link under a specified tree,
+that file will not be monitored unless you add it or one of its
+parent directories to the configuration file.
+
+Trees may not overlap--no tree in the configuration file may be a
+subtree of another tree in the configuration file.
+
+TO REPORT BUGS AND SUGGESTIONS
+
+Send bug reports and suggested enhancements to lippard-sigtree@discord.org.

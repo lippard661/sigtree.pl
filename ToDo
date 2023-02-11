@@ -1,0 +1,76 @@
+BUGS:
+
+Doesn't report SHA digest changes or directory file changes for link targets.
+
+Errors can sometimes occur if -s <bogussetname> is used.
+
+If /var/db/sigtree/spec/host or /var/db/sigtree/secondary/spec/host is
+in the changed file, initialize_specs doesn't take it out. (Have modified
+update to permit updating a changed spec directory with version 1.14.)
+
+FEATURES TO ADD:
+
+Allow importing hashes from mtree and pkg db? Or sha2/3_create files?
+  Or via config file reference to same? (Import sounds better.)
+Add to config file a reference to file of system SHA hashes, and ability to
+   check against that (hash check only). Ability to create such a file?
+   (i.e., incorporate sha3_create/compare capability).
+
+Add use of user immutability (uchg) for changed files.
+
+Add ability to re-initialize signatures for all specs (initialize_specs doesn't
+and probably shouldn't do that).
+
+Add ability to auto-generate a configuration via interactive questions
+about directories off the root directory (descending the tree on
+demand).
+
+Add ability to send notifications, with email addresses definable
+per-set and per-tree. (Or more general API interface to functionality.)
+
+Add ability to initialize new trees added to the conf file without
+initializing anything else or having to put those trees into a special
+set.  Perhaps create an implicit set called "new" or "uncreated" that
+includes all and only trees without specifications. (Or via interactive
+browsing feature.)
+
+Per-user sigtree conf files (~/.sigtree.conf ?), when run as non-root.
+Allow setting root dir, spec dir in ~/.sigtree.conf; perhaps also
+via environmental variables.
+
+Add keyword(s) for cyclog/multilog dirs, so that it won't keep
+commenting on every new addition to/deletion from the log directory
+unless it somehow violates the format of a cyclog/multilog dir.
+The reason this can't currently be done with exceptions is that
+there is no flag to ignore file adds/deletions.  (With regexps,
+you could get close, by having it ignore files in the directory
+that are of the appropriate format.) [This can now be done with exceptions
+using the "ignore" set:  exception-tree: logdir:IGN.]
+
+Allow the ability to use reg exps (or limited regexps) in exception:
+fields.  (Will require changing the subroutines underlying the
+determination of primary set...)  Useful for, e.g., measuring
+different things based on file suffixes.
+
+Create an API layer to expose functionality for other tools.
+
+Add functionality to facilitate remote execution (i.e., keep 
+specifications on a secure bastion host, scp them (and the code)
+out to each remote host, run the check, and summarize changes
+for all hosts; run updates on all hosts and scp the specifications
+back to the bastion host).  Use a client/server architecture.
+GUI?  Showing hosts, files changed/added/deleted?
+
+Or: add ability to detect changes in real-time and report back
+to a central server.
+
+Add the ability to attempt to correlate file changes with entries in
+logs (in particular, in the sudo log --/var/log/security, where we can
+come up with a username, and perhaps also with /var/log/messages).
+
+Add support for Windows and MacOS.  (Will need to use File::Basename
+in a lot of places.)  (Actually, this should already work on Mac OS X
+now--or Cygwin.)
+
+Add the ability to generate an mtree file from a spec. (low priority)
+(And vice versa?)

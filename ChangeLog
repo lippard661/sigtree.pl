@@ -1,0 +1,135 @@
+23 January 2022: 1.17c: Fixed all edge cases of the display issue and an
+	update issue for extraneous files.
+23 January 2022: 1.17b: Removed paren escaping, unnecessary and wrong.
+	Fixed a minor cosmetic display issue (added an extra blank line after
+	found extraneous files).
+22 January 2022: 1.17a: Fix "$" escape, remove extraneous stuff from
+	changed file and be more careful about update_sets trying to
+	use changed file trees that are no longer in the config.
+20 January 2022: 1.17: Escape "$" char in commands to get immutable flags,
+	fix error message for signing key-related fields when specified
+	file can't be read (change made shortly after 1.16 release).
+	Also re-implement escaping of parens from 2012. Warn about
+	extraneous files (not in config) in specification dir for check
+	commands, remove extraneous files from specification dir for
+	initialize/update commands. Allow initialize to use
+	-s option with a set name "new" or "uninitialized" to
+	initialize all uninitialized trees in the config. Make "new" and
+	"uninitialized" a reserved word for sets in configs. Gave the
+	README file a long-overdue update.
+28 July 2021: 1.16: Added signify as alternative to PGP/GPG.
+21 July 2021: 1.15: Don't warn for nonexistent exceptions or exception-trees
+	when the primary set has the "ignore" keyword.
+23 May 2021: 1.14: Don't prompt for passphrase with GPG 2, remove partial
+	implementation of "interactive mode".
+3 August 2019: 1.13: Bug fix to allow update to update spec_dir tree.
+7 October 2018: 1.13: Bug fix in initialize with -s, improved macOS config.
+17 November 2017: 1.12: Bug fixes in flag handling, default config for macOS.
+10 October 2015: 1.11: Added SHA-3 and made it the default. Added
+	sha3_digest keyword to config, shadigest/sha3digest keyword for sets.
+	The internal storage of SHA digests has changed incompatibly,
+	requiring all existing specs to be reinitialized.
+24 March 2014: 1.11 (still unreleased): Split out tree for /usr/X11R6
+	into /usr/X11R6/bin and /usr/X11R6/lib.
+30 March 2013: 1.11 Changed CRIT-LOG definition to use mtimestasis-24h,
+	and added it to authlog, daemon, lastlog, maillog, messages,
+	and secure.
+25 March 2013: 1.10 Added mtimestasis-\d{1,2}[smhd] keyword, which
+	reports on mtime failure to change for more than \d{1,2}
+	seconds/minutes/hours/days.
+19 November 2012: 1.9 Fix double error message for nonexistent
+	exception-trees, plus typo in error message/inadvertent
+	lowercasing of line. Added new secondary sets system (SYS) and
+	user (USER) to default config file.
+10 November 2012: 1.9 Will die if hostname is undefined.
+3 November 2012: 1.8 Using Digest::SHA instead of Digest::SHA1 and
+	Digest::SHA2. Removed sha_digest configuration keyword, replaced
+	it with sha2_digest keyword which allows values of 256, 384, and 512.
+25 December 2011: 1.7 Repackaged the tarball to make it work better as
+	an OpenBSD port/package, changed default location of sigtree.pl
+	and sigtree.conf, fixed bug in &verify_required_dirs to allow
+	creation of new specs when using immutable flag, added option to
+	use either system or user immutable flags on BSD, fixed bug in
+	&is_immutable that had BSD and Linux options switched.  Default
+	location of config file is now /etc/<hostname>.sigtree.conf,
+	default location of specs is now /var/db/sigtree.
+23 December 2011: 1.6a Repackaged the tarball to make it work better
+	as an OpenBSD port/package, changed default location of sigtree.pl
+	and sigtree.conf.
+23 November 2008: 1.6 Modified to not create trees in sets marked ignore and
+	to compute SHA1/SHA2 digests based on keywords in primary set rather
+	than based on the global configuration sha_digest field, which is now
+	ignored.
+5 March 2005: 1.5 Added sha_digest field to global section of config file;
+	added support for SHA2 digests (instead of or in addition to SHA1
+	digests).
+3 September 2004: 1.4a Test for $self->{LINKTARGET_TYPE} being defined
+	before using it, for backwards compatibility with old specs.
+2 September 2004: 1.4 Test for whether we got file flags results, set to
+	"<undefined>" if we didn't.
+24 August 2004: Moved file type assignment to separate subroutine.  Added
+	new linktarget_type keyword.  Started tracking attributes of link
+	targets, except for directory contents.
+16 July 2004: 1.3 Fixed bug in check_file command to allow check_file for
+	files that don't exist in the file system.  Fixed bug in
+	FileAttr::compare that was causing deleted files to sometimes show
+	up as added.
+14 July 2004: Fixed bug in show_changes subroutine where it was attempting
+	to display changed attributes via call to subroutine that requires
+	a set as an argument, but supplying a tree.
+10 June 2004: 1.2c Fixed bug created by OpenBSD 3.5's move of the
+	location of sysctl from /usr/sbin to /sbin.
+5 January 2004: 1.2b Fixed bug--stopped calling Digest::SHA1 on dirs
+	since it's not supported.
+8 April 2003: 1.2a Fixed bug in listing file attributes where special
+	characters in file names need to be quoted (now that OpenBSD 3.3
+	has a file with a space in its name in the default install).
+26 February 2003: 1.2 Fixed bug in file writability check (when file doesn't
+	exist), fixed references to directory of spec directories.
+25 February 2003: Added better Linux support for file system attributes,
+	allow -d paths relative to root_dir, special-cased -d secondary to
+	not use PGP or immutable flags and to use a separate changed file.
+23 February 2003: Added check for file writability for specifications
+	before attempting to write to them.
+22 February 2003: Made changes show list of changed attributes for
+	each changed path.  Added "new" set code to valid_setlist and
+	defined_set in preparation for adding the ability to initialize
+	only new sets.  (Need to add code to automatically identify trees
+	that don't have specs as members of "new", and to allow initialize
+	to work for set new (and only set new) when immutable flags are
+	used and securelevel is > 0.  There is a potential problem
+	regarding specs for specs.)
+22 January 2003: 1.1b Made a change to reset_changed_file.
+9 January 2003: 1.1a Fixed bug in changed file support to allow -v support
+	for "changes" command to work.
+6 January 2003: 1.1 Added file system flags support.  Changed the behavior
+	of the "exception:" field for directories (now counts just for the
+	directory itself, not any files or directories under it) and added
+	"exception-dir:" for the old behavior.  Added -v support to "changes"
+	command (it now prints the details that "check" prints).  Allowed "."
+	for "exception:" field.
+3 March 2001: 1.05 Fixed GPG support and made it the default.
+	Host setting will now respect case where no domain name
+	is set (pretty much just cosmetic).
+2 April 2000: 1.04 Added "ignore" keyword for files that aren't to be
+	checked for changes, added "ignored" set in default config file.
+28 March 2000: Modified to support chattr +i/-i for Linux immutable
+	files.
+12 February 2000: 1.03 Added additional documentation to README file.
+	Modified Config to make sure that no trees are subtrees of other
+	trees. 	Modified to check to make sure that at least one of the
+	sets specified with the -s option has members (and warn about
+	those that don't).  Added check_file command.  Fixed bug where
+	no summary report would be printed if there were no changes,
+	only additions or deletions of files.  Added changes command.
+11 February 2000:  Modified to correct minor bug in reg exp that validates
+	"tree:" fields in conf file.
+6 February 2000: 1.02 Modified to correct "new nonexistent added" problem
+	which occurred when a file was added after initialization (found
+	at time of check) and deleted before update, and to fix problem
+	where check summary report wouldn't list sets that had only
+	additions and deletions but no changes.
+5 February 2000: 1.01 Modified to check existence of files before using
+	chflags (added set_immutable_flag subroutine), to record user
+	when creating a spec or checking a tree.
+30 January 2000:  Version 1.0 created from mtree.pl.
