@@ -10,6 +10,22 @@ update to permit updating a changed spec directory with version 1.14.)
 
 FEATURES TO ADD:
 
+Should do more consistent escaping of potentially dangerous characters in filenames
+that will be used in command lines.
+
+Could use append-only file flags to create checkpoint files for hashes
+of spec files, which are verified at time of update (sappnd for primary,
+uappnd for secondary, perhaps--or sappnd for secondary also).
+
+On macOS have a mode or report that doesn't report details below directories
+named "<name>.app".
+
+Allow doing comparison of the contents of a sigtree database against a set
+of directories that may be mounted or on an altroot, so that there is a
+prefix on the directory name. This would probably need to be limited to
+check, no initialize or update, and would probably require passing an
+extra parameter around through a number of functions and packages.
+
 Allow importing hashes from mtree and pkg db? Or sha2/3_create files?
   Or via config file reference to same? (Import sounds better.)
 Add to config file a reference to file of system SHA hashes, and ability to
