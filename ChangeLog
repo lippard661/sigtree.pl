@@ -1,3 +1,5 @@
+18 October 2023: 1.17d: Continue instead of aborting when fileattr cannot
+	be retrieved.
 23 January 2022: 1.17c: Fixed all edge cases of the display issue and an
 	update issue for extraneous files.
 23 January 2022: 1.17b: Removed paren escaping, unnecessary and wrong.
