@@ -148,6 +148,9 @@
 #    not only unnecessary but wrong, escaping is only required for $. Fixed
 #    some cosmetic issues with line spacing, and an update issue when handling
 #    extraneous files in the spec_dir.
+# Modified 18 October 2023 by Jim Lippard to continue when a fileattr cannot
+#    be retrieved rather than aborting, which can occur, e.g., when a critical
+#    log is mid-rotation and doesn't exist yet.
 
 ### Required packages.
 
@@ -216,7 +219,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.17c of 23 January 2022';
+my $VERSION = 'sigtree 1.17d of 18 October 2023';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -3090,7 +3093,10 @@ sub new {
 	$self = retrieve ($spec_path);
 	$fileattr = ${$self->{FILEATTR}}{$tree};
         if (!defined ($fileattr)) {
-	    die "Unable to retrieve fileattr for tree $tree from specification. $spec_path\nTry re-initializing the specification.\n";
+	    print "Unable to retrieve fileattr for tree $tree from specification. $spec_path\nContinuing. Try re-initializing the specification if necessary.\n";
+	    $self->{TREE} = $tree;
+	    $fileattr = new FileAttr ($tree, '.', $config->path_sha_digest ($tree, '.'));
+	    ${$self->{FILEATTR}}{$tree} = $fileattr;    
         }
     }
 
