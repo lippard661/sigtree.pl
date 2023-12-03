@@ -13,6 +13,8 @@ tree determines a numeric priority level and a set of attributes
 to be checked for changes.  The priority level is used for generating
 summary reports of changes; higher priority items are listed first.
 
+sigtree.pl uses pledge and unveil on OpenBSD.
+
 INSTALLATION
 
 sigtree.pl requires the following in order to work:

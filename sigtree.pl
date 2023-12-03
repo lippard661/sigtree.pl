@@ -151,6 +151,7 @@
 # Modified 18 October 2023 by Jim Lippard to continue when a fileattr cannot
 #    be retrieved rather than aborting, which can occur, e.g., when a critical
 #    log is mid-rotation and doesn't exist yet.
+# Modified 3 December 2023 by Jim Lippard to use pledge and veil on OpenBSD.
 
 ### Required packages.
 
@@ -195,6 +196,8 @@ use Getopt::Std;
 use PGP::Sign;
 use Storable;
 use Sys::Hostname;
+use if $^O eq "OpenBSD", "OpenBSD::Pledge";
+use if $^O eq "OpenBSD", "OpenBSD::Unveil";
 
 ### Global constants.
 
@@ -208,7 +211,6 @@ my $CHFLAGS = '/usr/bin/chflags';
 my $LSFLAGS = '/bin/ls -lod';
 my $MAC_LSFLAGS = '/bin/ls -lOd';
 my $MKTEMP = '/usr/bin/mktemp';
-my $SENDMAIL = '/usr/sbin/sendmail';
 my $SIGNIFY = '/usr/bin/signify';
 my $ECHO = '/bin/echo'; # yuck
 my $STTY = '/bin/stty';
@@ -219,7 +221,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.17d of 18 October 2023';
+my $VERSION = 'sigtree 1.18 of 3 December 2023';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -229,6 +231,7 @@ my $SIGTREE_SIGNIFY_PUBKEY = '/etc/signify/sigtree.pub';
 my $SIGTREE_SIGNIFY_SECKEY = '/etc/signify/sigtree.sec';
 
 my $OSNAME = $^O;
+
 if ($OSNAME eq 'darwin') {
     $LSFLAGS = $MAC_LSFLAGS;
 }
@@ -525,6 +528,59 @@ if ($use_pgp) {
     else {
 	die "PGP_or_GPG is set to something other than PGP or GPG.\n";
     }
+}
+
+# If OpenBSD, use pledge and unveil.
+# This is occurring after config parsing but before all argument and
+# file validation, so it's not quite as narrowly specified as it could
+# be, but if we did it later it would need to be a subroutine called
+# before or by initialize_sets, check_sets, update_sets, and show_changes,
+# and could be more narrowly tailored for each based on need to access
+# all or a subset of trees or just what's in the sigtree root dir.
+if ($OSNAME eq 'OpenBSD') {
+    # fattr might not be necessary due to wpath
+    pledge ('stdio,rpath,wpath,cpath,fattr,exec,unveil');
+    # Need rwc for sigtree files.
+    unveil ($root_dir, 'rwc');
+    # Need x for immutable flag setting and checking.
+    if ($use_immutable) {
+	unveil ($CHFLAGS, 'x');
+	unveil ($LSFLAGS, 'x');
+    }
+    # Need x for crypto sign/verify and keys.
+    if ($use_pgp) {
+	if ($use_signify) {
+	    unveil ($SIGNIFY, 'x');
+	    unveil ($signify_pubkey, 'r');
+	    unveil ($signify_seckey, 'r');
+	}
+	else {
+	    unveil ($PGP::Sign::PGPPATH, 'x');
+	    if ($PGP_or_GPG eq 'PGP') {
+		unveil ($ROOT_PGP_PATH, 'rw');
+	    }
+	    else {
+		unveil ($ROOT_GPG_PATH, 'rw');
+	    }
+	}
+
+	# Need x for passphrase collection.
+	unveil ($ECHO, 'x');
+	unveil ($STTY, 'x');
+	unveil ($TTY, 'x');
+    }
+    # Need x for mktemp.
+    unveil ($MKTEMP, 'x');
+
+    # Need r for all trees.
+    my ($tree, @trees);
+    @trees = $config->all_trees;
+    foreach $tree (@trees) {
+	unveil ($tree, 'r');
+    }
+
+    # Lock unveil.
+    unveil ();
 }
 
 if ($ARGV[0] eq 'initialize') {

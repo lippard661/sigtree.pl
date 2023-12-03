@@ -1,3 +1,5 @@
+3 December 2023: 1.18: Added pledge and unveil for OpenBSD;
+	updated config file to not monitor pflog, just pflog.txt
 18 October 2023: 1.17d: Continue instead of aborting when fileattr cannot
 	be retrieved.
 23 January 2022: 1.17c: Fixed all edge cases of the display issue and an
