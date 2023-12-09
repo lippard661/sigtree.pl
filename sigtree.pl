@@ -196,8 +196,8 @@ use Getopt::Std;
 use PGP::Sign;
 use Storable;
 use Sys::Hostname;
-use if $^O eq "OpenBSD", "OpenBSD::Pledge";
-use if $^O eq "OpenBSD", "OpenBSD::Unveil";
+use if $^O eq "openbsd", "OpenBSD::Pledge";
+use if $^O eq "openbsd", "OpenBSD::Unveil";
 
 ### Global constants.
 
@@ -221,7 +221,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.18 of 3 December 2023';
+my $VERSION = 'sigtree 1.18a of 9 December 2023';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -537,7 +537,7 @@ if ($use_pgp) {
 # before or by initialize_sets, check_sets, update_sets, and show_changes,
 # and could be more narrowly tailored for each based on need to access
 # all or a subset of trees or just what's in the sigtree root dir.
-if ($OSNAME eq 'OpenBSD') {
+if ($OSNAME eq 'openbsd') {
     # fattr might not be necessary due to wpath
     pledge ('stdio,rpath,wpath,cpath,fattr,exec,unveil');
     # Need rwc for sigtree files.
