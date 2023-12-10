@@ -205,6 +205,7 @@ use vars qw( $SECURELEVEL );
 
 $SECURELEVEL = 0;
 
+my $BINSH = '/bin/sh'; # needed for unveil only
 my $CHATTR = '/usr/bin/chattr';
 my $LSATTR = '/usr/bin/lsattr';
 my $CHFLAGS = '/usr/bin/chflags';
@@ -544,9 +545,12 @@ if ($OSNAME eq 'openbsd') {
     # Need rwc for sigtree files.
     unveil ($root_dir, 'rwc');
     # Need x for immutable flag setting and checking.
+    # Need r to be able to detect chflags' existence.
+    # Need x on /bin/sh for execution of list command.
     if ($use_immutable) {
-	unveil ($CHFLAGS, 'x');
+	unveil ($CHFLAGS, 'rx');
 	unveil ($LIST_CMD, 'x');
+	unveil ($BINSH, 'x');
     }
     # Need x for crypto sign/verify and keys.
     if ($use_pgp) {
