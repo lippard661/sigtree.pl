@@ -545,22 +545,22 @@ if ($OSNAME eq 'openbsd') {
     # Need rwc for sigtree files.
     unveil ($root_dir, 'rwc');
     # Need x for immutable flag setting and checking.
-    # Need r to be able to detect chflags' existence.
+    # Need r to be able to detect existence for sigtree checks.
     # Need x on /bin/sh for execution of list command.
     if ($use_immutable) {
 	unveil ($CHFLAGS, 'rx');
-	unveil ($LIST_CMD, 'x');
-	unveil ($BINSH, 'x');
+	unveil ($LIST_CMD, 'rx');
+	unveil ($BINSH, 'rx');
     }
     # Need x for crypto sign/verify and keys.
     if ($use_pgp) {
 	if ($use_signify) {
-	    unveil ($SIGNIFY, 'x');
+	    unveil ($SIGNIFY, 'rx');
 	    unveil ($signify_pubkey, 'r');
 	    unveil ($signify_seckey, 'r');
 	}
 	else {
-	    unveil ($PGP::Sign::PGPPATH, 'x');
+	    unveil ($PGP::Sign::PGPPATH, 'rx');
 	    if ($PGP_or_GPG eq 'PGP') {
 		unveil ($ROOT_PGP_PATH, 'rw');
 	    }
@@ -570,12 +570,12 @@ if ($OSNAME eq 'openbsd') {
 	}
 
 	# Need x for passphrase collection.
-	unveil ($ECHO, 'x');
-	unveil ($STTY, 'x');
-	unveil ($TTY, 'x');
+	unveil ($ECHO, 'rx');
+	unveil ($STTY, 'rx');
+	unveil ($TTY, 'rx');
     }
     # Need x for mktemp.
-    unveil ($MKTEMP, 'x');
+    unveil ($MKTEMP, 'rx');
 
     # Need r for all trees.
     my ($tree, @trees);
