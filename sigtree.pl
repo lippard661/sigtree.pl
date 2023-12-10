@@ -208,8 +208,9 @@ $SECURELEVEL = 0;
 my $CHATTR = '/usr/bin/chattr';
 my $LSATTR = '/usr/bin/lsattr';
 my $CHFLAGS = '/usr/bin/chflags';
-my $LSFLAGS = '/bin/ls -lod';
-my $MAC_LSFLAGS = '/bin/ls -lOd';
+my $LIST_CMD = '/bin/ls';
+my $LSFLAGS = "$LIST_CMD -lod";
+my $MAC_LSFLAGS = "$LIST_CMD -lOd";
 my $MKTEMP = '/usr/bin/mktemp';
 my $SIGNIFY = '/usr/bin/signify';
 my $ECHO = '/bin/echo'; # yuck
@@ -545,7 +546,7 @@ if ($OSNAME eq 'openbsd') {
     # Need x for immutable flag setting and checking.
     if ($use_immutable) {
 	unveil ($CHFLAGS, 'x');
-	unveil ($LSFLAGS, 'x');
+	unveil ($LIST_CMD, 'x');
     }
     # Need x for crypto sign/verify and keys.
     if ($use_pgp) {
