@@ -151,7 +151,10 @@
 # Modified 18 October 2023 by Jim Lippard to continue when a fileattr cannot
 #    be retrieved rather than aborting, which can occur, e.g., when a critical
 #    log is mid-rotation and doesn't exist yet.
-# Modified 3 December 2023 by Jim Lippard to use pledge and veil on OpenBSD.
+# Modified 3 December 2023 by Jim Lippard to use pledge and unveil on OpenBSD.
+# Modified 9 December 2023 by Jim Lippard for some unveil fixes (need r,
+#    not just x, for commands used).
+# Modified 16 December 2023 by Jim Lippard to unveil /tmp.
 
 ### Required packages.
 
@@ -223,7 +226,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.18a of 9 December 2023';
+my $VERSION = 'sigtree 1.18b of 16 December 2023';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -576,6 +579,8 @@ if ($OSNAME eq 'openbsd') {
     }
     # Need x for mktemp.
     unveil ($MKTEMP, 'rx');
+    # Need /tmp access.
+    unveil ('/tmp', 'rwc');
 
     # Need r for all trees.
     my ($tree, @trees);
