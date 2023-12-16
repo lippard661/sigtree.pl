@@ -232,6 +232,8 @@ my $VERSION = 'sigtree 1.18b of 16 December 2023';
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
 my $ROOT_PGP_PATH = '/root/.pgp';
 my $ROOT_GPG_PATH = '/root/.gnupg';
+my $PGP_COMMAND = '/usr/local/bin/pgp';
+my $GPG_COMMAND = '/usr/local/bin/gpg';
 my $SIGTREE_SIGNIFY_PUBKEY = '/etc/signify/sigtree.pub';
 my $SIGTREE_SIGNIFY_SECKEY = '/etc/signify/sigtree.sec';
 
@@ -566,9 +568,11 @@ if ($OSNAME eq 'openbsd') {
 	    unveil ($PGP::Sign::PGPPATH, 'rx');
 	    if ($PGP_or_GPG eq 'PGP') {
 		unveil ($ROOT_PGP_PATH, 'rw');
+		unveil ($PGP_COMMAND, 'rx');
 	    }
 	    else {
 		unveil ($ROOT_GPG_PATH, 'rw');
+		unveil ($GPG_COMMAND, 'rx');
 	    }
 	}
 
