@@ -1,5 +1,10 @@
 BUGS:
 
+if a tree is removed from config while present in the changed file,
+update will not remove it from the changed file. (Shouldn't check do this with its call to reset_changed_file?)
+
+when reporting change in mode, show the changed mode?
+
 Doesn't report SHA digest changes or directory file changes for link targets.
 
 Errors can sometimes occur if -s <bogussetname> is used.
@@ -9,6 +14,27 @@ in the changed file, initialize_specs doesn't take it out. (Have modified
 update to permit updating a changed spec directory with version 1.14.)
 
 FEATURES TO ADD:
+
+Allow forking child processes to run check_tree (e.g., using
+Parallel::ForkManager; it will require adding 'proc' to pledge
+and doing a new pledge and unveil for the child processes). Easiest
+way would be to add the ability for ChangedFile to merge a temp file
+changed file (used for each child tree) into the main changed file by
+the parent process after each child finishes. This should all be doable
+as a relatively light lift and improve performance of check. Biggest
+annoyance is that it adds another perl module dependency.
+
+Allow sigtree to be used to check backups of multiple hosts, which
+would require a --host <hostname> and --altroot <altroot-prefix>
+option to check, check_file, check_specs.  (prefix would have to be
+stuck on the front of each tree and unveiled). Also allow a random
+sample (random files from random trees in a possibly specified set)
+to be checked with check_file. [The original point of different hostname
+dirs was to allow specs from multiple hosts to be in one place, but
+it's not really practical unless implemented within sigtree itself
+somehow, at least when immutability is used. Maybe import specs from
+backup/check backup? Note that I don't backup some things that are
+monitored -- e.g., binaries.]]
 
 Should do more consistent escaping of potentially dangerous characters in filenames
 that will be used in command lines.

@@ -1,3 +1,5 @@
+30 December 2023: 1.18c: Call pledge correctly, not require pgpkeyid when
+	using signify.
 16 December 2023: 1.18b: Fix bug for OpenBSD: unveil /tmp. Oops.
 9 December 2023: 1.18a: Fix unveil for commands to be rx, not x.
 3 December 2023: 1.18: Added pledge and unveil for OpenBSD;

@@ -155,6 +155,9 @@
 # Modified 9 December 2023 by Jim Lippard for some unveil fixes (need r,
 #    not just x, for commands used).
 # Modified 16 December 2023 by Jim Lippard to unveil /tmp.
+# Modified 28 December 2023 by Jim Lippard to not require pgpkeyid to be
+#    set to 'signify' (it can be omitted) when signify is used.
+# Modified 30 December 2023 by Jim Lippard to call pledge correctly.
 
 ### Required packages.
 
@@ -226,7 +229,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.18b of 16 December 2023';
+my $VERSION = 'sigtree 1.18c of 30 December 2023';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -453,7 +456,7 @@ elsif ($config->{CRYPTO_SIGS} ne 'none') {
     $use_pgp = 1;
     $use_signify = 1 if ($PGP_or_GPG eq 'signify');
     if (($PGP_or_GPG ne 'signify' && $config->{PGPKEYID} eq 'signify') ||
-	($PGP_or_GPG eq 'signify' && $config->{PGPKEYID} ne 'signify')) {
+	($PGP_or_GPG eq 'signify' && ($config->{PGPKEYID} && $config->{PGPKEYID} ne 'signify'))) {
 	die "Inconsistent crypto_sigs and pgpkeyid options in config file.\n";
     }
 }
@@ -545,8 +548,9 @@ if ($use_pgp) {
 # and could be more narrowly tailored for each based on need to access
 # all or a subset of trees or just what's in the sigtree root dir.
 if ($OSNAME eq 'openbsd') {
-    # fattr might not be necessary due to wpath
-    pledge ('stdio,rpath,wpath,cpath,fattr,exec,unveil');
+    # fattr might not be necessary due to wpath; stdio is automatically
+    # included
+    pledge ('rpath', 'wpath', 'cpath', 'fattr', 'exec', 'unveil', 'access');
     # Need rwc for sigtree files.
     unveil ($root_dir, 'rwc');
     # Need x for immutable flag setting and checking.
