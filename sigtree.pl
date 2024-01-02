@@ -550,7 +550,7 @@ if ($use_pgp) {
 if ($OSNAME eq 'openbsd') {
     # fattr might not be necessary due to wpath; stdio is automatically
     # included
-    pledge ('rpath', 'wpath', 'cpath', 'fattr', 'exec', 'unveil', 'access');
+    pledge ('rpath', 'wpath', 'cpath', 'fattr', 'exec', 'proc', 'unveil') || die "Cannot pledge promises. $!\n";
     # Need rwc for sigtree files.
     unveil ($root_dir, 'rwc');
     # Need x for immutable flag setting and checking.
