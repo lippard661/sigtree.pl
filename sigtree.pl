@@ -207,7 +207,7 @@ use Digest::SHA3;
 use File::Basename;
 use Getopt::Std;
 use PGP::Sign;
-use Storable qw(lock_store lock_retrieve);;
+use Storable qw(lock_store lock_retrieve);
 use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
@@ -3157,7 +3157,7 @@ sub display {
 # Methods to store information for an entire tree in a specification.
 package Spec;
 
-use Storable;
+use Storable qw(lock_retrieve lock_store);
 
 # Method to create new spec or restore one from a saved file.
 sub new {
@@ -3290,7 +3290,7 @@ sub get_info {
 # only at new changes since the last check.
 package ChangedFile;
 
-use Storable;
+use Storable qw(lock_retrieve lock_store);
 
 # Method to create a new changed file or read in its contents,
 # and reset counters for check.
