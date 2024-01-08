@@ -165,6 +165,8 @@
 #    signatures when they don't already exist and to remove need to
 #    put signify passphrases on a command line passed to system or use
 #    of echo.
+# Modified 8 January 2023 by Jim Lippard to fix bug in verify_required_dirs
+#    when checking kernel securelevel.
 
 ### Required packages.
 
@@ -226,6 +228,7 @@ my $LIST_CMD = '/bin/ls';
 my $LSFLAGS = "$LIST_CMD -lod";
 my $MAC_LSFLAGS = "$LIST_CMD -lOd";
 my $MKTEMP = '/usr/bin/mktemp';
+my $RUNLEVEL = '/sbin/runlevel';
 my $SIGNIFY = '/usr/bin/signify';
 my $STTY = '/bin/stty';
 my $SYSCTL = '/sbin/sysctl';
@@ -235,7 +238,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.18d of 7 January 2024';
+my $VERSION = 'sigtree 1.18d of 8 January 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -516,7 +519,8 @@ if ($use_immutable) {
 	# Perhaps ideally this whole section of code should be modified to check
 	# to see if immutable flags can be set on and off, and refuse to allow it
 	# if not.  Maybe later.
-	$SECURELEVEL = `/sbin/runlevel`;
+	$SECURELEVEL = `$RUNLEVEL`;
+	chop ($SECURELEVEL);
 	if ($SECURELEVEL !~ /^\d+\s+(\d+)$/) {
 	    die "Immutable file flags do not appear to be supported by your operating system.\n";
 	}
@@ -562,6 +566,7 @@ if ($OSNAME eq 'openbsd') {
     # Need x for immutable flag setting and checking.
     # Need r to be able to detect existence for sigtree checks.
     # Need x on /bin/sh for execution of list command.
+    # $SYSCTL absent because it's already been run.
     if ($use_immutable) {
 	unveil ($CHFLAGS, 'rx');
 	unveil ($LIST_CMD, 'rx');
@@ -1396,15 +1401,16 @@ sub verify_required_dirs {
 	die "Host changed file is not writeable. $changed_file\n";
     }
 
-    if (!-e $root_dir . "/$spec_spec") {
-	die "Host specification does not exist. $root_dir/$spec_spec.\n"
-	    if ($caller != $INITIALIZE);
+    if (!-e $root_dir . "/$spec_spec" && $caller != $INITIALIZE) {
+	die "Host specification does not exist. $root_dir/$spec_spec.\n";
     }
-    elsif (!-r $root_dir . "/$spec_spec") {
-	die "Host specification is not readable. $root_dir/$spec_spec.\n";
-    }
-    elsif ($caller != $CHECK && !-w $root_dir . "/$spec_spec") {
-	die "Host specification is not writable. $root_dir/$spec_spec\n";
+    elsif (-e $root_dir . "$spec_spec") {
+	if (!-r $root_dir . "/$spec_spec") {
+	    die "Host specification is not readable. $root_dir/$spec_spec.\n";
+	}
+	elsif ($caller != $CHECK && !-w $root_dir . "/$spec_spec") {
+	    die "Host specification is not writable. $root_dir/$spec_spec\n";
+	}
     }
     elsif ($caller != $CHECK && $use_immutable && $SECURELEVEL != 0 && ($immutable_flag ne $BSD_USER_IMMUTABLE_FLAG)) {
 	die "Cannot write to existing host specification when kernel securelevel > 0.  Securelevel = $SECURELEVEL\n";
