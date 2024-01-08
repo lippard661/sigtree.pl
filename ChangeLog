@@ -1,3 +1,5 @@
+7 January 2024: 1.18d: Minor bug fixes in error messages and signify
+	signature creation. Use Storable built-in locking.
 30 December 2023: 1.18c: Call pledge correctly, not require pgpkeyid when
 	using signify.
 16 December 2023: 1.18b: Fix bug for OpenBSD: unveil /tmp. Oops.

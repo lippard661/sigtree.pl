@@ -158,6 +158,13 @@
 # Modified 28 December 2023 by Jim Lippard to not require pgpkeyid to be
 #    set to 'signify' (it can be omitted) when signify is used.
 # Modified 30 December 2023 by Jim Lippard to call pledge correctly.
+# Modified 2 January 2023 by Jim Lippard to use Storable's advisory lock
+#    methods and use newer perl file open style. Fixed a couple error
+#    messages about digital signatures.
+# Modified 7 January 2023 by Jim Lippard to test properly for signify
+#    signatures when they don't already exist and to remove need to
+#    put signify passphrases on a command line passed to system or use
+#    of echo.
 
 ### Required packages.
 
@@ -200,7 +207,7 @@ use Digest::SHA3;
 use File::Basename;
 use Getopt::Std;
 use PGP::Sign;
-use Storable;
+use Storable qw(lock_store lock_retrieve);;
 use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
@@ -220,7 +227,6 @@ my $LSFLAGS = "$LIST_CMD -lod";
 my $MAC_LSFLAGS = "$LIST_CMD -lOd";
 my $MKTEMP = '/usr/bin/mktemp';
 my $SIGNIFY = '/usr/bin/signify';
-my $ECHO = '/bin/echo'; # yuck
 my $STTY = '/bin/stty';
 my $SYSCTL = '/sbin/sysctl';
 my $TTY = '/usr/bin/tty';
@@ -229,7 +235,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.18c of 30 December 2023';
+my $VERSION = 'sigtree 1.18d of 7 January 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -550,7 +556,7 @@ if ($use_pgp) {
 if ($OSNAME eq 'openbsd') {
     # fattr might not be necessary due to wpath; stdio is automatically
     # included
-    pledge ('rpath', 'wpath', 'cpath', 'fattr', 'exec', 'proc', 'unveil') || die "Cannot pledge promises. $!\n";
+    pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'fattr', 'exec', 'proc', 'flock', 'unveil') || die "Cannot pledge promises. $!\n";
     # Need rwc for sigtree files.
     unveil ($root_dir, 'rwc');
     # Need x for immutable flag setting and checking.
@@ -581,7 +587,6 @@ if ($OSNAME eq 'openbsd') {
 	}
 
 	# Need x for passphrase collection.
-	unveil ($ECHO, 'rx');
 	unveil ($STTY, 'rx');
 	unveil ($TTY, 'rx');
     }
@@ -1685,7 +1690,7 @@ sub sigtree_pgp_sign {
     my ($file, $pgp_passphrase) = @_;
     my ($signature, $version, @data, @errors);
 
-    if (open (FILE, "<$file")) {
+    if (open (FILE, '<', $file)) {
 	while (<FILE>) {
 	    push (@data, $_);
 	}
@@ -1703,12 +1708,12 @@ sub sigtree_pgp_sign {
 	die "@errors";
     }
 
-    if (open (FILE, ">$file.sig")) {
+    if (open (FILE, '>', "$file.sig")) {
 	print FILE "$signature\n";
 	close (FILE);
     }
     else {
-	print "Could not write $file to create $PGP_or_GPG signature.\n";
+	print "Could not write $file.sig to create $PGP_or_GPG signature.\n";
 	return;
     }
 }
@@ -1719,7 +1724,7 @@ sub sigtree_pgp_verify {
     my ($signer, $signature, $version, @data, @errors);
     # $version is left undefined.
 
-    if (open (FILE, "<$file")) {
+    if (open (FILE, '<', $file)) {
 	while (<FILE>) {
 	    push (@data, $_);
 	}
@@ -1729,7 +1734,7 @@ sub sigtree_pgp_verify {
 	print "Cannot open file $file to verify $PGP_or_GPG signature.\n";
 	return;
     }
-    if (open (FILE, "<$file.sig")) {
+    if (open (FILE, '<', "$file.sig")) {
 	while (<FILE>) {
 	    $signature .= $_;
 	}
@@ -1763,8 +1768,9 @@ sub sigtree_signify_sign {
 	return;
     }
 
-    if (!-w "$file.sig") {
-	print "Could not write $file to create $PGP_or_GPG signature.\n";
+    # not writeable AND exists
+    if (!-w "$file.sig" && -e "$file.sig") {
+	print "Could not write $file.sig to create $PGP_or_GPG signature.\n";
 	return;
     }
 
@@ -1772,11 +1778,12 @@ sub sigtree_signify_sign {
 	print "Could not read secret key $signify_seckey to create $PGP_or_GPG signature.\n";
     }
 
-    # Not great to have the passphrase on the command line.
-    system ("$ECHO $signify_passphrase | $SIGNIFY -S -s $signify_seckey -m $file");
-    if ($?) {
-	# Something went wrong. At the moment stderr is not captured, so
-	# it will be displayed.
+    if (open (SIGSIGN, '|-', "$SIGNIFY -S -s $signify_seckey -m $file")) {
+	print SIGSIGN "$signify_passphrase\n";
+	close (SIGSIGN);
+    }
+    else {
+	# if an error occurred it will be displayed.
 	return;
     }
 }
@@ -1887,7 +1894,7 @@ sub new {
 
     $current_set = 0;
 
-    open (CONFIG, $config_file) ||
+    open (CONFIG, '<', $config_file) ||
 	die "Cannot open config file. $!. $config_file\n";
     while (<CONFIG>) {
 	$line++;
@@ -2627,7 +2634,7 @@ sub new {
 	if (-f $full_path) {
 	    if ($sha_digest =~ /-/) {
 		($sha_version, $sha_bits) = split (/-/, $sha_digest);
-		if (open (FILE, $full_path)) {
+		if (open (FILE, '<', $full_path)) {
 		    if ($sha_version == 2) {
 			$ctx = Digest::SHA->new($sha_bits);
 		    }
@@ -3164,7 +3171,7 @@ sub new {
 	${$self->{FILEATTR}}{$tree} = $fileattr;
     }
     else {
-	$self = retrieve ($spec_path);
+	$self = lock_retrieve ($spec_path);
 	$fileattr = ${$self->{FILEATTR}}{$tree};
         if (!defined ($fileattr)) {
 	    print "Unable to retrieve fileattr for tree $tree from specification. $spec_path\nContinuing. Try re-initializing the specification if necessary.\n";
@@ -3256,7 +3263,7 @@ sub store_spec {
     $self->{TIME} = time();
     $self->{USER} = $USERNAME;
 
-    store ($self, $spec_path);
+    lock_store ($self, $spec_path);
 }
 
 # Method to return hostname and creation time for a spec.
@@ -3292,7 +3299,7 @@ sub new {
     my ($self);
 
     if (-e $changed_file) {
-	$self = retrieve ($changed_file);
+	$self = lock_retrieve ($changed_file);
     }
     else {
 	$self = ();
@@ -3601,7 +3608,7 @@ sub store_changedfile {
     my $self = shift;
     my $class = ref ($self) || $self;
 
-    store ($self, $changed_file);
+    lock_store ($self, $changed_file);
 }
 
 1;
