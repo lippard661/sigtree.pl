@@ -698,6 +698,7 @@ sub initialize_sets {
     &remove_extraneous_files ($config, $spec_dir_dir, $spec_dir, $verbose, $use_immutable);
 
     if (!$specs_only) {
+	
 	if (-e $changed_file) {
 	    $changed_file_exists = 1;
 	    $changedfile = new ChangedFile ($changed_file);
@@ -707,6 +708,7 @@ sub initialize_sets {
 		print "There are changed specifications, we will re-initialize them.\n" if ($changed_specs);
 	    }
 	}
+	
 	print "Initializing specifications.\n" if ($verbose);
 
 	# This goes through all trees in the config, but leaves in the
@@ -730,21 +732,27 @@ sub initialize_sets {
 	}
 	
 	foreach $tree (@trees) {
-	    
+
+	    # Could do this differently by pulling out all the relevant trees before the
+	    # foreach $tree loop. Can't put this inside the if tree_uses_sets or might have
+	    # a child created that skips the finish.
 	    if ($FORK_CHILDREN) {
 		$pm->run_on_finish (
 		    sub {
 			my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tree_ref) = @_;
+			my ($child_tree);
 			if (defined ($tree_ref) || defined ($ident)) {
 			    if (defined ($tree_ref)) {
-				$tree = ${$tree_ref};
+				$child_tree = ${$tree_ref};
 			    }
 			    else {
 				print "Warning: using ident $ident instead of tree ref for child $pid.\n";
-				$tree = $ident;
+				$child_tree = $ident;
 			    }
-			    if ($changed_file_exists && $changedfile->tree_present ($tree)) {
-				$changedfile->delete ($tree);
+			    # Need to do this check again, only remove if it was in a specified set.
+			    if ($config->tree_uses_sets ($child_tree, @sets) &&
+				$changed_file_exists && $changedfile->tree_present ($child_tree)) {
+				$changedfile->delete ($child_tree);
 			    }
 			}
 			else {
@@ -753,18 +761,14 @@ sub initialize_sets {
 			}
 		    }
 		    );
+		
 		$pm->start ($tree) and next;
 	    }
 	    
 	    $tree_spec_name = &path_to_spec ($tree);
-### This "or" clause causes initialization of trees not in sets specified in -s. Is there any reason for it?
-### It's possible, I suppose, for all sets to be specified and to have some trees in a changed file that
-### aren't in any of those sets, if they've been removed from the config file... but that's a weird edge
-### case that should be handled differently. There's already an option to initialize only what's in the
-### changed file, it's called update.
-###	    if ($config->tree_uses_sets ($tree, @sets) ||
-###		($changed_specs && $changedfile->path_present ($spec_dir, $tree_spec_name))) {
+
 	    if ($config->tree_uses_sets ($tree, @sets)) {
+
 		if ($use_immutable) {
 		    &set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
 		    &set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
@@ -785,21 +789,25 @@ sub initialize_sets {
 		    }
 		}
 
-		if ($FORK_CHILDREN) {
-		    # Return the tree name.
-		    $pm->finish (0, \$tree);
-		}
 		# Remove this tree from the changed file if present.
 		# Parent needs to do this if forking children.
-		else {
+		if (!$FORK_CHILDREN) {
 		    if ($changed_file_exists && $changedfile->tree_present ($tree)) {
 			$changedfile->delete ($tree);
 		    }
 		}
-		
+
+	    } # tree uses sets (may be specified sets)
+
+	    # This needs to be outside the tree uses sets conditional.
+	    if ($FORK_CHILDREN) {
+		# Return the tree name.
+		$pm->finish (0, \$tree);
 	    }
-	}
-    }
+
+	} # foreach $tree loop
+	
+    } # !$specs_only
 
     if ($FORK_CHILDREN) {
 	# Wait for all children to finish.
@@ -1018,6 +1026,7 @@ sub check_sets {
     }
 
     foreach $tree (@trees) {
+	
 	if ($FORK_CHILDREN) {
 	    $pm->run_on_finish (
 		sub {
@@ -1039,7 +1048,9 @@ sub check_sets {
 		    }
 		}
 		);
+	    
 	    $pm->start ($tree) and next;
+	    
 	    # Create unique $child_temp_file in $child_temp_dir.
 	    if ($^O eq 'openbsd') {
 		(my $fh, $child_temp_file) = mkstemp ("$child_temp_dir/child.XXXXXXXX");
