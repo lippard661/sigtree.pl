@@ -23,11 +23,13 @@ sigtree.pl requires the following in order to work:
 * CPAN Perl modules Digest::SHA, Sys::Hostname, Getopt::Std, File::Basename,
   Cwd, and Storable (all included with OpenBSD standard distribution).
 * CPAN Perl module Digest::SHA3.
+* CPAN Perl module Parallel::ForkManager (1.19 w/OpenBSD or later).
+* Optional for OpenBSD: OpenBSD::MkTemp, OpenBSD::Pledge, OpenBSD::Unveil.
 
 If PGP signing is used (which is recommended), the following is also
 required:
 
-* PGP 5 or later, or GPG, or OpenBSD's signify.
+* PGP 5 or later, or GPG, or OpenBSD's signify, Signify.pm.
 * CPAN Perl module PGP::Sign (security/p5-PGP-Sign port in OpenBSD).
 * /bin/stty to turn off echoing when PGP passphrases are requested.
 

@@ -1,3 +1,5 @@
+10 August 2024: 1.19: Fork children to speed up check and initialize.
+	Use Signify.pm and OpenBSD::MkTemp.
 7 January 2024: 1.18d: Minor bug fixes in error messages and signify
 	signature creation. Use Storable built-in locking.
 30 December 2023: 1.18c: Call pledge correctly, not require pgpkeyid when

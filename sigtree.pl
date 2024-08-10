@@ -167,6 +167,10 @@
 #    of echo.
 # Modified 8 January 2023 by Jim Lippard to fix bug in verify_required_dirs
 #    when checking kernel securelevel.
+# Modified 7-10 August 2024 by Jim Lippard to allow forking of child processes
+#    to speed up check process. Use OpenBSD::MkTemp for OpenBSD. Use
+#    Signify.pm. Allow forking of child processes to speed up initialize
+#    process.
 
 ### Required packages.
 
@@ -175,6 +179,7 @@
 # * Standard Perl modules File::Basename, Getopt::Std, Storable, and
 #   Sys::Hostname.
 # * CPAN module Digest::SHA
+# * CPAN module Parallel::ForkManager
 # * If PGP/GPG/signify signing is used (recommended):
 #   * PGP 5 or later or GPG.
 #   * CPAN module PGP::Sign.
@@ -182,10 +187,12 @@
 #   * /bin/stty (for PGP or GPG 1, without gpg-agent)
 #   * /usr/bin/tty (for GPG 2, with gpg-agent)
 #   * /usr/bin/mktemp (for GPG 2, with gpg-agent)
+#     (uses OpenBSD::MkTemp on OpenBSD)
+#   * Signify.pm wrapper for signify
 # * If immutable flags are used (recommended for BSD):
 #   BSD:
 #   * /usr/bin/chflags (schg/noschg or uchg/nouchg)
-#   * /usr/sbin/sysctl kern.securelevel
+#   * /sbin/sysctl kern.securelevel
 #   Linux:
 #   * /usr/bin/chattr (+i/-i)
 #   * /usr/bin/lsattr
@@ -208,9 +215,12 @@ use Digest::SHA;
 use Digest::SHA3;
 use File::Basename;
 use Getopt::Std;
-use PGP::Sign;
+use Parallel::ForkManager;
+#use PGP::Sign;
+use Signify;
 use Storable qw(lock_store lock_retrieve);
 use Sys::Hostname;
+use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkstemp mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
@@ -238,7 +248,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.18d of 8 January 2024';
+my $VERSION = 'sigtree 1.19 of 10 August 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -248,6 +258,8 @@ my $PGP_COMMAND = '/usr/local/bin/pgp';
 my $GPG_COMMAND = '/usr/local/bin/gpg';
 my $SIGTREE_SIGNIFY_PUBKEY = '/etc/signify/sigtree.pub';
 my $SIGTREE_SIGNIFY_SECKEY = '/etc/signify/sigtree.sec';
+
+my $FORK_CHILDREN = 4; # set to number of children for check_sets
 
 my $OSNAME = $^O;
 
@@ -563,9 +575,10 @@ if ($OSNAME eq 'openbsd') {
     pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'fattr', 'exec', 'proc', 'flock', 'unveil') || die "Cannot pledge promises. $!\n";
     # Need rwc for sigtree files.
     unveil ($root_dir, 'rwc');
+
     # Need x for immutable flag setting and checking.
     # Need r to be able to detect existence for sigtree checks.
-    # Need x on /bin/sh for execution of list command.
+    # Need x on /bin/sh for execution of list command..
     # $SYSCTL absent because it's already been run.
     if ($use_immutable) {
 	unveil ($CHFLAGS, 'rx');
@@ -595,12 +608,20 @@ if ($OSNAME eq 'openbsd') {
 	unveil ($STTY, 'rx');
 	unveil ($TTY, 'rx');
     }
-    # Need x for mktemp.
-    unveil ($MKTEMP, 'rx');
+    # Needed x for mktemp. (now use OpenBSD::MkTemp)
     # Need /tmp access.
     unveil ('/tmp', 'rwc');
 
-    # Need r for all trees.
+    # Need r for all trees. If a tree in the config contains
+    # symlinks to a directory not in the config, this will cause
+    # unveil violations. E.g., if a config contains /usr/bin as
+    # a tree, it contains symlinks to /usr/sbin/mailwrapper (hoststat,
+    # mailq, newaliases, and purgestat), so if /usr/sbin is not also
+    # in the config, those will cause unveil violations. Similarly,
+    # /usr/bin/rcs2log is a symlink to /usr/libexec/cvs/contrib/rcs2log,
+    # so if /usr/libexec isn't in the config, there will be a violation.
+    # Rather than add another config option, the best workaround is to
+    # add further trees to such a config with IGNORE as the primary set.
     my ($tree, @trees);
     @trees = $config->all_trees;
     foreach $tree (@trees) {
@@ -652,6 +673,8 @@ sub initialize_sets {
     my ($pgp_passphrase, 
 	$changed_file_exists, $changedfile, $changed_specs, @changed_trees,
 	@trees, $tree, $tree_spec_name);
+    # used for Parallel::ForkManager
+    my ($pm, $child_temp_dir);
 
     $| = 1;
 
@@ -677,7 +700,7 @@ sub initialize_sets {
     if (!$specs_only) {
 	if (-e $changed_file) {
 	    $changed_file_exists = 1;
-	    $changedfile = new ChangedFile;
+	    $changedfile = new ChangedFile ($changed_file);
 	    $changed_specs = $changedfile->tree_present ($spec_dir);
 	    if ($verbose) {
 		print "A changed file exists.  We will remove any trees we initialize from it.\n";
@@ -689,7 +712,50 @@ sub initialize_sets {
 	# This goes through all trees in the config, but leaves in the
 	# changed file any trees that are no longer in the config.
 	@trees = $config->all_trees;
+
+	# Split this up among children. This children will produce some
+	# output if verbose but don't need to coordinate with the parent
+	# like in check_sets.
+	if ($FORK_CHILDREN) {
+	    # create $child_temp_dir with mktemp
+	    if ($^O eq 'openbsd') {
+		$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
+	    }
+	    else {
+		$child_temp_dir = `$MKTEMP -q -d /tmp/sigtree.XXXXXXXX`;
+		chop ($child_temp_dir);
+	    }
+	    $pm = Parallel::ForkManager->new ($FORK_CHILDREN,
+					      $child_temp_dir);
+	}
+	
 	foreach $tree (@trees) {
+	    
+	    if ($FORK_CHILDREN) {
+		$pm->run_on_finish (
+		    sub {
+			my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tree_ref) = @_;
+			if (defined ($tree_ref) || defined ($ident)) {
+			    if (defined ($tree_ref)) {
+				$tree = ${$tree_ref};
+			    }
+			    else {
+				print "Warning: using ident $ident instead of tree ref for child $pid.\n";
+				$tree = $ident;
+			    }
+			    if ($changed_file_exists && $changedfile->tree_present ($tree)) {
+				$changedfile->delete ($tree);
+			    }
+			}
+			else {
+			    # child failed
+			    print "Warning: child pid $pid did not return a tree name or ident, exit code $exit_code.\n";
+			}
+		    }
+		    );
+		$pm->start ($tree) and next;
+	    }
+	    
 	    $tree_spec_name = &path_to_spec ($tree);
 ### This "or" clause causes initialization of trees not in sets specified in -s. Is there any reason for it?
 ### It's possible, I suppose, for all sets to be specified and to have some trees in a changed file that
@@ -719,12 +785,27 @@ sub initialize_sets {
 		    }
 		}
 
-		# Remove this tree from the changed file if present.
-		if ($changed_file_exists && $changedfile->tree_present ($tree)) {
-		    $changedfile->delete ($tree);
+		if ($FORK_CHILDREN) {
+		    # Return the tree name.
+		    $pm->finish (0, \$tree);
 		}
+		# Remove this tree from the changed file if present.
+		# Parent needs to do this if forking children.
+		else {
+		    if ($changed_file_exists && $changedfile->tree_present ($tree)) {
+			$changedfile->delete ($tree);
+		    }
+		}
+		
 	    }
 	}
+    }
+
+    if ($FORK_CHILDREN) {
+	# Wait for all children to finish.
+	$pm->wait_all_children;
+	# Remove $child_temp_dir.
+	rmdir ($child_temp_dir);
     }
 
     # If we reinitialized any changed specs, delete spec_dir from the
@@ -815,7 +896,7 @@ sub show_changes {
 	die "There is no changed file.\n";
     }
 
-    $changedfile = new ChangedFile;
+    $changedfile = new ChangedFile ($changed_file);
 
     $displayed_something = 0;
 
@@ -872,6 +953,8 @@ sub check_sets {
     my ($config, $specs_only, @sets) = @_;
     my ($subtree_only, $changedfile, @trees, $tree, $quoted_tree, $tree_spec_name,
 	@changed_sets, $set, $priority, $keywords, $description, $path);
+    # used for Parallel::ForkManager
+    my ($pm, $child_temp_dir, $child_temp_file, $child_changedfile);
 
     $| = 1;
     
@@ -883,7 +966,7 @@ sub check_sets {
 	$path = $sets[0];
     }
 
-    $changedfile = new ChangedFile;
+    $changedfile = new ChangedFile ($changed_file);
 
     # Clear the current contents of the changed file.
     $changedfile->reset_changed_file;
@@ -921,7 +1004,55 @@ sub check_sets {
 	$path = '.';
     }
 
+    if ($FORK_CHILDREN) {
+	# create $child_temp_dir with mktemp
+	if ($^O eq 'openbsd') {
+	    $child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
+	}
+	else {
+	    $child_temp_dir = `$MKTEMP -q -d /tmp/sigtree.XXXXXXXX`;
+	    chop ($child_temp_dir);
+	}
+	$pm = Parallel::ForkManager->new ($FORK_CHILDREN,
+					     $child_temp_dir);
+    }
+
     foreach $tree (@trees) {
+	if ($FORK_CHILDREN) {
+	    $pm->run_on_finish (
+		sub {
+		    my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tempfile_ref) = @_;
+		    if (defined ($tempfile_ref)) {
+			# Get the returned filename.
+			$child_temp_file = ${$tempfile_ref};
+			# Retrieve from stored.
+			$child_changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
+			# Merge into main one.
+			$changedfile->merge ($child_changedfile);
+			# Remove the file.
+			unlink ("$child_temp_dir/$child_temp_file");
+		    }
+		    else {
+			# child failed
+			# what's the recovery here?
+			print "Warning: child $pid ($ident) did not return a changedfile, exit code $exit_code.\n";
+		    }
+		}
+		);
+	    $pm->start ($tree) and next;
+	    # Create unique $child_temp_file in $child_temp_dir.
+	    if ($^O eq 'openbsd') {
+		(my $fh, $child_temp_file) = mkstemp ("$child_temp_dir/child.XXXXXXXX");
+	    }
+	    else {
+		$child_temp_file = `$MKTEMP -q $child_temp_dir/child.XXXXXXXX`;
+		chop ($child_temp_file);		
+	    }
+	    $child_temp_file = File::Basename::basename ($child_temp_file);
+	    # Use temp file for location of changedfile.
+	    $changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
+	}
+	
 	$tree_spec_name = &path_to_spec ($tree);
 	if (!-e "$spec_dir/$tree_spec_name") {
 	    print "\n" if ($verbose);
@@ -938,6 +1069,20 @@ sub check_sets {
 		$changedfile->add_time ($tree);
 	    }
 	}
+
+	if ($FORK_CHILDREN) {
+	    # Store the changedfile.
+	    $changedfile->store_changedfile;
+	    # Return the filename.
+	    $pm->finish (0, \$child_temp_file);
+	}
+    }
+
+    if ($FORK_CHILDREN) {
+	# Wait for all children to finish.
+	$pm->wait_all_children;
+	# Remove $child_temp_dir.
+	rmdir ($child_temp_dir);
     }
 
     &show_change_details ($changedfile, $verbose, 1);
@@ -1655,8 +1800,14 @@ sub get_pgp_passphrase {
 	$current_tty = `$TTY`;
 	chop ($current_tty);
 	$ENV{'GPG_TTY'} = $current_tty;
-	$temp_file = `$MKTEMP -q /tmp/sigtree.XXXXXX`;
-	chop ($temp_file);
+	if ($^O eq 'openbsd') {
+	    # OpenBSD::MkTemp's mkstemp returns a file handle we don't need.
+	    (my $fh, $temp_file) = mkstemp ('/tmp/sigtree.XXXXXXXX');
+	}
+	else {
+	    $temp_file = `$MKTEMP -q /tmp/sigtree.XXXXXXXX`;
+	    chop ($temp_file);
+	}
 	&sigtree_pgp_sign ($temp_file, $pgp_passphrase); # can skip the wrapper
 	unlink ($temp_file);
 	unlink ("$temp_file.sig");
@@ -1693,6 +1844,7 @@ sub sigtree_verify {
 
 # Create a PGP signature in a detached file and save it.
 sub sigtree_pgp_sign {
+    use PGP::Sign;
     my ($file, $pgp_passphrase) = @_;
     my ($signature, $version, @data, @errors);
 
@@ -1726,6 +1878,7 @@ sub sigtree_pgp_sign {
 
 # Verify a PGP signature.
 sub sigtree_pgp_verify {
+    use PGP::Sign;
     my ($file) = @_;
     my ($signer, $signature, $version, @data, @errors);
     # $version is left undefined.
@@ -1768,63 +1921,58 @@ sub sigtree_pgp_verify {
 # Create a signify signature in a detached file and save it.
 sub sigtree_signify_sign {
     my ($file, $signify_passphrase) = @_;
+    my (@errors);
+    my $SKIP_SIGNIFY_CHECK = 1;
 
-    if (!-r $file) {
+    if (Signify::sign ($file, $signify_passphrase, $signify_seckey, $SKIP_SIGNIFY_CHECK)) {
+	return;
+    }
+
+    @errors = Signify::signify_error;
+
+    if ($errors[0] =~ /^no readable file/) {
 	print "Could not read $file to create $PGP_or_GPG signature.\n";
-	return;
     }
-
-    # not writeable AND exists
-    if (!-w "$file.sig" && -e "$file.sig") {
+    elsif ($errors[0] =~ /^cannot write signature file/) {
 	print "Could not write $file.sig to create $PGP_or_GPG signature.\n";
-	return;
     }
-
-    if (!-r $signify_seckey) {
+    elsif ($errors[0] =~ /^no readable secret key/) {
 	print "Could not read secret key $signify_seckey to create $PGP_or_GPG signature.\n";
     }
-
-    if (open (SIGSIGN, '|-', "$SIGNIFY -S -s $signify_seckey -m $file")) {
-	print SIGSIGN "$signify_passphrase\n";
-	close (SIGSIGN);
-    }
     else {
-	# if an error occurred it will be displayed.
-	return;
+	print "@errors";
     }
+    return;
 }
 
 # Verify a signify signature on a specification.
 sub sigtree_signify_verify {
     my ($file) = @_;
-    my ($result);
+    my (@errors);
+    my $SKIP_SIGNIFY_CHECK = 1;
 
-    if (!-r $file) {
-	print "Cannot open file $file to verify $PGP_or_GPG signature.\n";
-	return;
-    }
-
-    if (!-r "$file.sig") {
-	print "Cannot open file $file.sig to read $PGP_or_GPG signature.\n";
-	return;
-    }
-
-    if (!-r $signify_pubkey) {
-	print "Cannot open public key $signify_pubkey to verify $PGP_or_GPG signature.\n";
-	return;
-    }
-
-    $result = `$SIGNIFY -V -p $signify_pubkey -m $file 2>/dev/null`;
-    chop ($result);
-    if ($?) {
-	print "   Warning: Bad $PGP_or_GPG signature on specification. $file.sig\n";
-    }
-    elsif ($result eq 'Signature Verified') {
+    if (Signify::verify ($file, $signify_pubkey, $SKIP_SIGNIFY_CHECK)) {
 	print "   Good $PGP_or_GPG signature from $signify_pubkey on specification.\n" if ($verbose);
+	return;
+    }
+
+    @errors = Signify::signify_error;
+
+    # Report any errors, apart from readability of file itself.
+    if ($errors[0] =~ /^no readable signature file/) {
+	print "Cannot open file $file.sig to read $PGP_or_GPG signature.\n";
+    }
+    elsif ($errors[0] =~ /^no readable public key/) {
+	print "Cannot open public key $signify_pubkey to verify $PGP_or_GPG signature.\n";
+    }
+    elsif ($errors[0] =~ /^no readable file/) {
+	print "Cannot open file $file to verify $PGP_or_GPG signature.\n";
     }
     else {
-	print "   Unexpected signature result on $file. $result\n";
+	print "   Warning: Bad $PGP_or_GPG signature on specification. $file.sig\n";
+	print "   @errors" if ($verbose);
     }
+    return;
 }
 
 # Subroutine to convert pathname to a specification name by
@@ -3303,21 +3451,28 @@ use Storable qw(lock_retrieve lock_store);
 sub new {
     my $class = shift;
     my ($self);
+    my ($changed_file) = @_;
 
-    if (-e $changed_file) {
+    # Might be a zero-length temp file.
+    if (-e $changed_file && !-z $changed_file) {
 	$self = lock_retrieve ($changed_file);
+	# If it's a changedfile from before sigtree-1.19.
+	if (!defined ($self->{CHANGEDFILE})) {
+	    $self->{CHANGEDFILE} = $changed_file;
+	}
     }
     else {
 	$self = ();
 
+	$self->{CHANGEDFILE} = $changed_file;
 	$self->{CHANGES} = ();
 	$self->{ADDITIONS} = ();
 	$self->{DELETIONS} = (); 
-	$self->{SET_TO_PATH} = (); 
 	$self->{SET_TO_PATH_ADD} = (); 
 	$self->{SET_TO_PATH_DEL} = (); 
 	$self->{SET_TO_PATH_CHANGE} = (); 
-	$self->{SET_TO_PATH_CH_ATTR} = (); 
+	$self->{SET_TO_PATH_CH_ATTR} = ();
+	$self->{PATH} = ();	
     }
 
     bless $self, $class;
@@ -3332,11 +3487,11 @@ sub reset_changed_file {
     $self->{CHANGES} = ();
     $self->{ADDITIONS} = ();
     $self->{DELETIONS} = (); 
-    $self->{SET_TO_PATH} = (); 
     $self->{SET_TO_PATH_ADD} = (); 
     $self->{SET_TO_PATH_DEL} = (); 
     $self->{SET_TO_PATH_CHANGE} = (); 
-    $self->{SET_TO_PATH_CH_ATTR} = (); 
+    $self->{SET_TO_PATH_CH_ATTR} = ();
+    $self->{PATH} = ();
 }
 
 # Method to add a path to the changed file (unless already present).
@@ -3390,9 +3545,52 @@ sub add_time {
     push (@{${$self->{USER}}{$tree}}, $USERNAME);
 }
 
+# Method to merge a changed file with the main changed file.
+# In current usage it should only be a single-set/single-tree changed
+# file, but this is written more generally.
+sub merge {
+    my $self = shift;
+    my $class = ref ($self) || $self;
+    my ($other) = @_;
+    my ($set);
+    my (@trees, $tree);
+
+    # Merge total and per-set additions, deletions, changes.
+    foreach $set (keys (%{$other->{ADDITIONS}})) {
+	if (${$other->{ADDITIONS}}{$set}) {
+	    ${$self->{ADDITIONS}}{$set} +=  ${$other->{ADDITIONS}}{$set};
+	    push (@{${$self->{SET_TO_PATH_ADD}}{$set}}, @{${$other->{SET_TO_PATH_ADD}}{$set}}) unless ($set eq '_total_');
+	}
+    }
+    foreach $set (keys (%{$other->{DELETIONS}})) {
+	if (${$other->{DELETIONS}}{$set}) {
+	    ${$self->{DELETIONS}}{$set} +=  ${$other->{DELETIONS}}{$set};
+	    push (@{${$self->{SET_TO_PATH_DEL}}{$set}}, @{${$other->{SET_TO_PATH_DEL}}{$set}}) unless ($set eq '_total_');
+	}
+    }
+    foreach $set (keys (%{$other->{CHANGES}})) {
+	if (${$other->{CHANGES}}{$set}) {
+	    ${$self->{CHANGES}}{$set} +=  ${$other->{CHANGES}}{$set};
+	    push (@{${$self->{SET_TO_PATH_CHANGE}}{$set}}, @{${$other->{SET_TO_PATH_CHANGE}}{$set}}) unless ($set eq '_total_');
+	    push (@{${$self->{SET_TO_PATH_CH_ATTR}}{$set}}, @{${$other->{SET_TO_PATH_CH_ATTR}}{$set}}) unless ($set eq '_total_');
+        }
+    }
+
+    # Get trees. Should be only one but this is more general.
+    @trees = keys (%{$other->{PATH}});
+
+    # Add trees and check times and users for each tree.
+    foreach $tree (@trees) {
+	push (@{${$self->{PATH}}{$tree}}, @{${$other->{PATH}}{$tree}});
+	push (@{${$self->{TIME}}{$tree}}, @{${$other->{TIME}}{$tree}});
+	push (@{${$self->{USER}}{$tree}}, @{${$other->{USER}}{$tree}});
+    }
+}
+
 # Method to return array of changed sets, ordered from highest
 # to lowest priority, along with total number of changes, additions,
 # and deletions found in this check.
+# This method uses a $config (Config) object, set_info method.
 sub get_sets {
     my $self = shift;
     my $class = ref ($self) || $self;
@@ -3426,6 +3624,7 @@ sub get_sets {
 # Method to return priority, description, number of total changed
 # objects, number of added objects, and number of deleted objects
 # for a set.
+# This method uses a $config (Config) object, set_info method.
 sub get_set_info {
     my $self = shift;
     my $class = ref ($self) || $self;
@@ -3605,16 +3804,17 @@ sub delete_if_empty {
 
     @trees = keys (%{$self->{PATH}});
     if ($#trees == -1) {
-	unlink ($changed_file);
+	unlink ($self->{CHANGEDFILE});
     }
 }
 
 # Method to store changed file.
 sub store_changedfile {
     my $self = shift;
+    my ($temp_file) = @_;
     my $class = ref ($self) || $self;
 
-    lock_store ($self, $changed_file);
+    lock_store ($self, $self->{CHANGEDFILE});
 }
 
 1;
