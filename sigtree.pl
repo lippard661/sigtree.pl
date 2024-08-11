@@ -1245,7 +1245,7 @@ sub update_sets {
 
     &verify_required_dirs ($UPDATE);
 
-    $changedfile = new ChangedFile;
+    $changedfile = new ChangedFile ($changed_file);
 
     @changed_trees = $changedfile->get_trees;
     $something_to_update = 0;
