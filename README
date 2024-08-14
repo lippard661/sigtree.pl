@@ -55,6 +55,13 @@ standard CPAN module, as follows (as root):
    install Storable
    install PGP::Sign
    install Digest::SHA3
+   install Parallel::ForkManager
+
+The Signify.pm perl module is also now required and may be obtained
+from either
+   https://github.com/lippard661/Signify
+ or
+   https://www.discord.org/lippard/software
 
 The recommended location for sigtree.pl is in /usr/local/bin.  Sigtree
 configs go in /var/db/sigtree by default, but you can use any other
@@ -105,6 +112,8 @@ Options:
              the "initialize" command; you can specify multiple sets
 	     separated by commas)
 -v verbose
+-f number of children to fork
+-m don't show macOS application contents (but still process them)
 -h help and version
 Commands:
 initialize: Initialize specifications for a set of trees.
@@ -149,6 +158,8 @@ The global attributes section consists of the following:
     immutable-specs: yes|no
     sha2_digest: 256|384|512
     sha3_digest: 224|256|384|512
+    max_child_procs: [default 5]
+    default_child_procs: [default 4]
 
 All of these fields may be omitted. If the pgpkeyid: alone is used,
 sigtree.pl will use GPG signatures on all specifications. It must
@@ -276,6 +287,11 @@ If you have a file you want monitored that is not under a specified
 tree, but only the target of a symbolic link under a specified tree,
 that file will not be monitored unless you add it or one of its
 parent directories to the configuration file.
+
+Symbolic and hard links are *referenced* via the ls command to
+obtain immutable flags, which on OpenBSD will cause an unveil
+violation if the referenced location is not a tree in the config
+file.
 
 Trees may not overlap--no tree in the configuration file may be a
 subtree of another tree in the configuration file.

@@ -24,7 +24,7 @@ and pledge can potentially be ratcheted down for the child
 processes (which should inherit the same pledge/unveil of the
 parent).
 (DONE) Ditto for initialize.
-ToDo: add -f <N> option to specify number of children to allow (0-5?).
+(DONE)ToDo: add -f <N> option to specify number of children to allow (0-5?).
 
 Allow sigtree to be used to check backups of multiple hosts, which
 would require a --host <hostname> and --altroot <altroot-prefix>

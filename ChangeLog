@@ -1,3 +1,7 @@
+14 August 2024: 1.19a: -f option for number of child processes, config
+	options for max_child_procs and default_child_procs, -m for
+	macOS to not show contents of macOS applications, fixed bug
+	in filename escaping for immutable flag collection.
 10 August 2024: 1.19: Fork children to speed up check and initialize.
 	Use Signify.pm and OpenBSD::MkTemp.
 7 January 2024: 1.18d: Minor bug fixes in error messages and signify

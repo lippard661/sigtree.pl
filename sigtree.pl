@@ -171,6 +171,15 @@
 #    to speed up check process. Use OpenBSD::MkTemp for OpenBSD. Use
 #    Signify.pm. Allow forking of child processes to speed up initialize
 #    process.
+# Modified 12 August 2024 by Jim Lippard to add -f option to specify
+#    number of child processes and global config settings for
+#    max_child_procs and default_child_procs. If child procs are being
+#    used, report both the start and end of processing for each tree for
+#    both initialize and check. Add -m to not show macOS app dir contents
+#    changes (or adds or deletions) from changes, show_changes, or
+#    show_change_details, as well as in check_sets/check_tree and
+#    update_sets. Change method for quoting args to list command for
+#    immutable flags.
 
 ### Required packages.
 
@@ -248,7 +257,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19 of 10 August 2024';
+my $VERSION = 'sigtree 1.19a of 14 August 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -259,7 +268,11 @@ my $GPG_COMMAND = '/usr/local/bin/gpg';
 my $SIGTREE_SIGNIFY_PUBKEY = '/etc/signify/sigtree.pub';
 my $SIGTREE_SIGNIFY_SECKEY = '/etc/signify/sigtree.sec';
 
-my $FORK_CHILDREN = 4; # set to number of children for check_sets
+my $MAX_CHILD_PROCS = 5;
+my $DEFAULT_CHILD_PROCS = 4;
+
+my $MACOS_APP_CONTENTS = '\.app\/';
+my $MACOS_APP = '\.app$';
 
 my $OSNAME = $^O;
 
@@ -325,6 +338,8 @@ my (%opts,         # Command line options.
     $config,       # Config file object.
     $set,          # List of sets to use.
     @sets,         # List of sets being processed.
+    $fork_children,# number of children to fork.
+    $no_macos_app_contents, # don't show stuff that is inside an app directory.
     $arg_no,       # Used for returning error message on set list validation.
     $error,        # Ditto.
     $something_to_do, # Are any trees members of specified sets?
@@ -340,13 +355,22 @@ my (%opts,         # Command line options.
 ### Main program.
 
 # Get/set options.
-getopts ('r:c:s:d:vh', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+getopts ('r:c:s:d:f:vhm', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
 
 $root_dir = $opts{'r'} || $ROOT_DIR;
 $spec_spec = $HOSTNAME . '.spec';
 $config_file = $opts{'c'} || $SYSCONF_DIR . '/' . $HOSTNAME . '.sigtree.conf';
 $config_file = $SYSCONF_DIR . '/' . $config_file if ($config_file !~ /^\.\/|^\//);
 $set = $opts{'s'} || 0;
+
+# if -m, then don't display app dir contents from changes/show_changes/show_change_details.
+$no_macos_app_contents = $opts{'m'} || 0;
+
+# check -f for integer, but do check on quantity after parsing config.
+if ($opts{'f'}) {
+    die "-f option must be an integer number of child processes.\n" if ($opts{'f'} !~ /^\d+$/);
+}
+
 if ($opts{'d'}) {
     if (substr ($opts{'d'}, 0, 1) eq '/') {
 	$spec_dir = $opts{'d'};
@@ -386,6 +410,8 @@ if ($opts{'h'}) {
     print "-c config_file\n";
     print "-d spec_dir (absolute path or relative to root_dir)\n";
     print "-s set list (CSV)\n";
+    print "-f num_child_procs\n";
+    print "-m don't show macOS app dir content changes\n";
     print "-v verbose\n";
     print "-h help and version\n";
     print "Commands:\n";
@@ -458,6 +484,14 @@ else {
     # If no set is specified, use them all.
     @sets = $config->all_sets;
 }
+
+# Handle -f option. Placed here to allow a config option for
+# max and default child counts vs. the hard coded ones.
+if ($opts{'f'}) {
+    die "-f option is greater than max number of child processes ($config->{$MAX_CHILD_PROCS}).\n" if ($opts{'f'} > $config->{MAX_CHILD_PROCS});
+}
+
+$fork_children = $opts{'f'} || $config->{DEFAULT_CHILD_PROCS};
 
 # Handle crypto_sigs options.
 # If configuration doesn't have a crypto_sigs field, rely on PGPKEYID
@@ -637,16 +671,19 @@ if ($ARGV[0] eq 'initialize') {
 }
 elsif ($ARGV[0] eq 'initialize_specs') {
     die "The -s option cannot be used with initialize_specs.\n" if ($opts{'s'});
+    die "The -f option cannot be used with initialize_specs.\n" if ($opts{'f'});
     &initialize_sets ($config, $SPECS_ONLY, @sets);
 }
 elsif ($ARGV[0] eq 'changes') {
-    &show_changes ($config, @sets);
+    die "The -f option cannot be used with changes.\n" if ($opts{'f'});
+    &show_changes ($config, $no_macos_app_contents, @sets);
 }
 elsif ($ARGV[0] eq 'check') {
     &check_sets ($config, $ALL, @sets);
 }
 elsif ($ARGV[0] eq 'check_file') {
     die "The -s option cannot be used with check_file.\n" if ($opts{'s'});
+    die "The -f option cannot be used with check_file.\n" if ($opts{'f'});
     print "File does not exist. $file\n" if (!-e $file);
     if ($file =~ /^\.\// || $file !~ /^\//) {
 	$file =~ s/^\.\///;
@@ -656,6 +693,7 @@ elsif ($ARGV[0] eq 'check_file') {
 }
 elsif ($ARGV[0] eq 'check_specs') {
     die "The -s option cannot be used with check_specs.\n" if ($opts{'s'});
+    die "The -f option cannot be used with check_specs.\n" if ($opts{'f'});
     &check_sets ($config, $SPECS_ONLY, @sets)
 }
 elsif ($ARGV[0] eq 'update') {
@@ -718,7 +756,7 @@ sub initialize_sets {
 	# Split this up among children. This children will produce some
 	# output if verbose but don't need to coordinate with the parent
 	# like in check_sets.
-	if ($FORK_CHILDREN) {
+	if ($fork_children) {
 	    # create $child_temp_dir with mktemp
 	    if ($^O eq 'openbsd') {
 		$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
@@ -727,7 +765,7 @@ sub initialize_sets {
 		$child_temp_dir = `$MKTEMP -q -d /tmp/sigtree.XXXXXXXX`;
 		chop ($child_temp_dir);
 	    }
-	    $pm = Parallel::ForkManager->new ($FORK_CHILDREN,
+	    $pm = Parallel::ForkManager->new ($fork_children,
 					      $child_temp_dir);
 	}
 	
@@ -736,7 +774,7 @@ sub initialize_sets {
 	    # Could do this differently by pulling out all the relevant trees before the
 	    # foreach $tree loop. Can't put this inside the if tree_uses_sets or might have
 	    # a child created that skips the finish.
-	    if ($FORK_CHILDREN) {
+	    if ($fork_children) {
 		$pm->run_on_finish (
 		    sub {
 			my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tree_ref) = @_;
@@ -777,7 +815,11 @@ sub initialize_sets {
 			&set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
 		    }
 		}
-		print "$tree\n" if ($verbose);
+		if ($verbose) {
+		    print "$tree";
+		    print ": start child" if ($fork_children);
+		    print "\n";
+		}
 		&create_tree ($config, $TREE_ROOT, $tree, '.', '', "$spec_dir/$tree_spec_name");
 		if ($use_pgp) {
 			&sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
@@ -791,7 +833,7 @@ sub initialize_sets {
 
 		# Remove this tree from the changed file if present.
 		# Parent needs to do this if forking children.
-		if (!$FORK_CHILDREN) {
+		if (!$fork_children) {
 		    if ($changed_file_exists && $changedfile->tree_present ($tree)) {
 			$changedfile->delete ($tree);
 		    }
@@ -800,7 +842,8 @@ sub initialize_sets {
 	    } # tree uses sets (may be specified sets)
 
 	    # This needs to be outside the tree uses sets conditional.
-	    if ($FORK_CHILDREN) {
+	    if ($fork_children) {
+		print "$tree: finish child\n" if ($verbose);
 		# Return the tree name.
 		$pm->finish (0, \$tree);
 	    }
@@ -809,7 +852,7 @@ sub initialize_sets {
 	
     } # !$specs_only
 
-    if ($FORK_CHILDREN) {
+    if ($fork_children) {
 	# Wait for all children to finish.
 	$pm->wait_all_children;
 	# Remove $child_temp_dir.
@@ -896,7 +939,7 @@ sub create_tree {
 
 # Subroutine to display contents of changed file (for specified sets).
 sub show_changes {
-    my ($config, @sets) = @_;
+    my ($config, $no_macos_app_contents, @sets) = @_;
     my ($changedfile, $displayed_something, @changed_trees, $tree,
 	@times, @users, @paths, @attrs, $time, $user, $path, $attr);
 
@@ -919,6 +962,7 @@ sub show_changes {
 	    $displayed_something = 1;
 	    print "tree: $tree";
 	    print " (specification dir)" if ($tree eq $spec_dir);
+	    print " (macOS app)" if ($no_macos_app_contents && $tree =~ /$MACOS_APP/);
 	    print "\n";
 	    @times = $changedfile->get_times ($tree);
 	    @users = $changedfile->get_users ($tree);
@@ -934,7 +978,15 @@ sub show_changes {
 	    # but that subroutine takes a set, not a tree, as an argument.  We aren't looking at
 	    # sets unless the details are displayed.
 	    foreach $path (@paths) {
-		print "   $path\n";
+		if (!$no_macos_app_contents ||
+		    $path !~ /$MACOS_APP_CONTENTS/) {
+		    if ($no_macos_app_contents && $path =~ /$MACOS_APP/) {
+			print "   $path (macOS app)\n";
+		    }
+		    else {
+			print "   $path\n";
+		    }
+		}
 	    }
 	}
     }
@@ -943,8 +995,8 @@ sub show_changes {
 	print "No trees in sets specified have been changed prior to last check.\n";
     }
     elsif ($verbose) {
-	# Args are changedfile, verbose flag, write flag.
-	&show_change_details ($changedfile, 0, 0);
+	# Args are changedfile, verbose flag, write flag, no_macos_app_contents
+	&show_change_details ($changedfile, 0, 0, $no_macos_app_contents);
     }
 }
 
@@ -1012,7 +1064,7 @@ sub check_sets {
 	$path = '.';
     }
 
-    if ($FORK_CHILDREN) {
+    if ($fork_children) {
 	# create $child_temp_dir with mktemp
 	if ($^O eq 'openbsd') {
 	    $child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
@@ -1021,13 +1073,13 @@ sub check_sets {
 	    $child_temp_dir = `$MKTEMP -q -d /tmp/sigtree.XXXXXXXX`;
 	    chop ($child_temp_dir);
 	}
-	$pm = Parallel::ForkManager->new ($FORK_CHILDREN,
+	$pm = Parallel::ForkManager->new ($fork_children,
 					     $child_temp_dir);
     }
 
     foreach $tree (@trees) {
 	
-	if ($FORK_CHILDREN) {
+	if ($fork_children) {
 	    $pm->run_on_finish (
 		sub {
 		    my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tempfile_ref) = @_;
@@ -1070,7 +1122,13 @@ sub check_sets {
 	    print "Warning: Specification for tree $tree doesn't exist. You need to initialize it. Skipping.\n";
 	}
 	elsif ($subtree_only || $config->tree_uses_sets ($tree, @sets)) {
-	    print "\n$tree\n" if ($verbose && (!$specs_only || $use_pgp));
+	    if ($verbose &&
+		(!$specs_only || $use_pgp) &&
+		(!$no_macos_app_contents || $tree !~ /$MACOS_APP_CONTENTS/)) {
+		print "\n$tree";
+		print ": start child" if ($fork_children);
+		print "\n";
+	    }
 
 	    if ($use_pgp) {
 		&sigtree_verify ("$spec_dir/$tree_spec_name");
@@ -1081,28 +1139,30 @@ sub check_sets {
 	    }
 	}
 
-	if ($FORK_CHILDREN) {
+	if ($fork_children) {
 	    # Store the changedfile.
 	    $changedfile->store_changedfile;
+	    # Report child finish if verbose.
+	    print "$tree: finish child\n" if ($verbose);
 	    # Return the filename.
 	    $pm->finish (0, \$child_temp_file);
 	}
     }
 
-    if ($FORK_CHILDREN) {
+    if ($fork_children) {
 	# Wait for all children to finish.
 	$pm->wait_all_children;
 	# Remove $child_temp_dir.
 	rmdir ($child_temp_dir);
     }
 
-    &show_change_details ($changedfile, $verbose, 1);
+    &show_change_details ($changedfile, $verbose, 1, $no_macos_app_contents);
 }
 
 # Subroutine to show details of the changed file.  Used by check and changes -v.
 # The verbose flag argument and the write flag argument are both used by check.
 sub show_change_details {
-    my ($changedfile, $verbose, $write_flag) = @_;
+    my ($changedfile, $verbose, $write_flag, $no_macos_app_contents) = @_;
     my ($total_changes, $total_additions, $total_deletions, @changed_sets,
 	$priority, $description,
 	$changes, $additions, $deletions, @paths, $path, @attrs, $attr);
@@ -1132,22 +1192,28 @@ sub show_change_details {
 		@paths = $changedfile->get_set_changes ($set);
 		@attrs = $changedfile->get_set_changed_attrs ($set);
 		foreach $path (@paths) {
-		    $attr = shift (@attrs);
-		    print "   $path ($attr)\n";
+		    if (!$no_macos_app_contents || $path !~ /$MACOS_APP_CONTENTS/) {
+			$attr = shift (@attrs);
+			print "   $path ($attr)\n";
+		    }
 		}
 	    }
 	    if ($additions > 0) {
 		print "Additions:\n";
 		@paths = $changedfile->get_set_additions ($set);
 		foreach $path (@paths) {
-		    print "   $path\n";
+		    if (!$no_macos_app_contents || $path !~ /$MACOS_APP_CONTENTS/) {
+			print "   $path\n";
+		    }
 		}
 	    }
 	    if ($deletions > 0) {
 		print "Deletions:\n";
 		@paths = $changedfile->get_set_deletions ($set);
 		foreach $path (@paths) {
-		    print "   $path\n";
+		    if (!$no_macos_app_contents || $path !~ /$MACOS_APP_CONTENTS/) {
+			print "   $path\n";
+		    }
 		}
 	    }
 	}
@@ -1166,6 +1232,7 @@ sub check_tree {
     my ($config, $tree_root, $tree, $path, $spec, $changedfile, $spec_path) = @_;
     my ($fileattr, $fileattr2, $host, $time, $user, $primary_set,
 	$description, $keywords, $priority, %priorities, $file, $full_path, %differences);
+    my ($macos_OK_flag);
 
     return if ($config->path_is_ignored ($tree, $path));
 
@@ -1193,6 +1260,9 @@ sub check_tree {
         $primary_set = $config->primary_set_for_path ($tree, $path);
     }
 
+    $macos_OK_flag = (!$no_macos_app_contents ||
+		      $path !~ /$MACOS_APP_CONTENTS/);
+
     ($description, $keywords, $priority) = $config->set_info ($primary_set);
 
     %differences = $fileattr->compare ($fileattr2, $keywords);
@@ -1203,7 +1273,7 @@ sub check_tree {
 	$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose);
     }
     elsif ($differences{'mtimestasis'}) { # special case for where only change is a noticeable lack of change.
-	$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose);
+	$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose && $macos_OK_flag);
     }
 
     # Deleted files are a special case.  We walk through them.  (Which
@@ -1242,6 +1312,7 @@ sub update_sets {
 	@times, $time, @users, $user, @changed_paths, $changed_path,
 	$spec, $fileattr, $fileattr2, $full_path, $path, $primary_set, $description,
 	$keywords, $priority, %differences);
+    my ($macos_OK_flag);
 
     &verify_required_dirs ($UPDATE);
 
@@ -1313,7 +1384,8 @@ sub update_sets {
 		    &set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
 		}
 	    }
-	    if ($verbose) {
+	    if ($verbose &&
+		(!$no_macos_app_contents || $tree !~ /$MACOS_APP_CONTENTS/)) {
 		print "\n$tree\n";
 		@times = $changedfile->get_times ($tree);
 		@users = $changedfile->get_users ($tree);
@@ -1343,21 +1415,23 @@ sub update_sets {
 		$primary_set = $config->primary_set_for_path ($tree, $changed_path);
 		($description, $keywords, $priority) = $config->set_info ($primary_set);
 		%differences = $fileattr->compare ($fileattr2, $keywords);
-		$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose);
+		$macos_OK_flag = (!$no_macos_app_contents ||
+				  $full_path !~ /$MACOS_APP_CONTENTS/);
+		$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose && $macos_OK_flag);
 		if (!$differences{'any'}) {
-		    print "Warning: There are no longer changes to path $full_path.\n";
+		    print "Warning: There are no longer changes to path $full_path.\n" if ($macos_OK_flag);
 		}
 		elsif ($differences{'deleted'}) {
-		    print "   Deleting $path.\n" if ($verbose);
+		    print "   Deleting $path.\n" if ($verbose && $macos_OK_flag);
 		    $spec->delete ($tree, $changed_path);
 		}
 		else {
 		    if ($differences{'added'} && $differences{'type'} eq 'nonexistent') {
-			print "   No change made to spec for $path.\n" if ($verbose);
+			print "   No change made to spec for $path.\n" if ($verbose && $macos_OK_flag);
 		    }
 		    else {
-			print "   Adding $path.\n" if ($verbose && $differences{'added'});
-			print "   Updating $path.\n" if ($verbose && !$differences{'added'});
+			print "   Adding $path.\n" if ($verbose && $differences{'added'} && $macos_OK_flag);
+			print "   Updating $path.\n" if ($verbose && !$differences{'added'} && $macos_OK_flag);
 			$spec->update ($tree, $changed_path, $fileattr2);
 		    }
 		}
@@ -1699,20 +1773,15 @@ sub immutable_file {
     my ($full_path) = @_;
     my ($escaped_full_path, $flags, $perms, $nlinks, $uid, $gid, $file);
 
-    # Escape $ ( ) SP characters.
-    $escaped_full_path = $full_path;
-    #    $escaped_full_path =~ s/([\$\(\)\s])/\\$1/g;
-    $escaped_full_path =~ s/(\$)/\\$1/g;
-
     if ((-e $CHFLAGS) && (-e "$full_path")) {
-	$flags = `$LSFLAGS "$escaped_full_path"`;
+	$flags = `$LSFLAGS \Q$full_path\E`;
 	($flags, $file) = split (/\s+/, $flags);
 	if ($flags =~ /$BSD_SYS_IMMUTABLE_FLAG/ || $flags =~ /$BSD_USER_IMMUTABLE_FLAG/) {
 	    return 1;
 	}
     }
     elsif ((-e $LSATTR) && (-e "$full_path")) {
-	$flags = `$LSATTR "$full_path"`;
+	$flags = `$LSATTR \Q$full_path\E`;
 	($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
 	if ($flags =~ /i/) {
 	    return 1;
@@ -2050,6 +2119,8 @@ sub new {
     $self->{IMMUTABLE_SPECS} = 0;
     $self->{SHA_DIGEST} = 0;
     $self->{SHA_DIGEST_BITS} = 0;
+    $self->{MAX_CHILD_PROCS} = 0;
+    $self->{DEFAULT_CHILD_PROCS} = 0;
 
     bless $self, $class;
 
@@ -2173,6 +2244,42 @@ sub new {
 		    $self->{SHA_DIGEST} = $SHA3_DIGEST;
 		    $self->{SHA_DIGEST_BITS} = $value;
 		}
+	    }
+	    elsif ($field eq 'max_child_procs') {
+		if ($state != $GLOBAL_ATTRIBUTES) {
+		    die "A \"max_child_procs:\" field is in the wrong section, line $line. $config_file\nLine: $raw_line";
+		}
+		if ($self->{MAX_CHILD_PROCS}) {
+		    die "A second \"max_child_procs:\" field, line $line. $config_file\nLine: $raw_line";		    
+		}
+		if ($value =~ /^\d+/) {
+		    $self->{MAX_CHILD_PROCS} = $value;
+		}
+		else {
+		    die "\"max_child_procs:\" field must be an integer, line $line. $config_file\nLine: $raw_line";
+		}
+		$self->{MAX_CHILD_PROCS} = $value;
+		if ($self->{DEFAULT_CHILD_PROCS} && $self->{DEFAULT_CHILD_PROCS} > $self->{MAX_CHILD_PROCS}) {
+		    die "\"max_child_procs:\" field is set to a value lower than \"default_child_procs:\", line $line $config_file\nLine: $raw_line";
+		}
+	    }
+	    elsif ($field eq 'default_child_procs') {
+		if ($state != $GLOBAL_ATTRIBUTES) {
+		    die "A \"default_child_procs:\" field is in the wrong section, line $line. $config_file\nLine: $raw_line";
+		}
+		if ($self->{DEFAULT_CHILD_PROCS}) {
+		    die "A second \"default_child_procs:\" field, line $line. $config_file\nLine: $raw_line";		    
+		}
+		if ($value =~ /^\d+/) {
+		    $self->{DEFAULT_CHILD_PROCS} = $value;
+		}
+		else {
+		    die "\"default_child_procs:\" field must be an integer, line $line. $config_file\nLine: $raw_line";
+		}
+		$self->{DEFAULT_CHILD_PROCS} = $value;
+		if ($self->{DEFAULT_CHILD_PROCS} && $self->{DEFAULT_CHILD_PROCS} > $self->{MAX_CHILD_PROCS}) {
+		    die "\"default_child_procs:\" field is set to a value higher than \"max_child_procs:\", line $line $config_file\nLine: $raw_line";
+		}	
 	    }
 	    
 	    elsif ($field eq 'set') {
@@ -2386,6 +2493,24 @@ sub new {
     # is SHA-3, 256 bits.
     $self->{SHA_DIGEST} = $SHA3_DIGEST if ($self->{SHA_DIGEST} == 0);
     $self->{SHA_DIGEST_BITS} = $SHA3_256 if ($self->{SHA_DIGEST_BITS} == 0);
+
+    # If no max_child_procs or default_child_procs set, set to defaults,
+    # and if only one or the other is set, make sure default < max, otherwise
+    # adjust and warn.
+    if ($self->{MAX_CHILD_PROCS} == 0) {
+	$self->{MAX_CHILD_PROCS} = $MAX_CHILD_PROCS;
+	if ($self->{DEFAULT_CHILD_PROCS} > $MAX_CHILD_PROCS) {
+	    print "Warning: your config sets default_child_procs to a value greater than the default for max_child_procs, which is not set in your config. Adjusting max_child_procs to match your config default_child_procs setting.\n";
+	    $self->{MAX_CHILD_PROCS} = $self->{DEFAULT_CHILD_PROCS};
+	}
+    }
+    if ($self->{DEFAULT_CHILD_PROCS} == 0) {
+	$self->{DEFAULT_CHILD_PROCS} = $DEFAULT_CHILD_PROCS;
+	if ($self->{MAX_CHILD_PROCS} < $DEFAULT_CHILD_PROCS) {
+	    print "Warning: your config sets max_child_procs to a value lower than the default for default_child_procs, which is not set in your config. Adjusting default_child_procs to match your config max_child_procs setting.\n";
+	    $self->{DEFAULT_CHILD_PROCS} = $self->{MAX_CHILD_PROCS};
+	}
+    }
 
     # Make sure at least one tree is defined (or abort).
     if (!$current_tree) {
