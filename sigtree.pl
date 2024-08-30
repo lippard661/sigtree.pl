@@ -180,6 +180,8 @@
 #    show_change_details, as well as in check_sets/check_tree and
 #    update_sets. Change method for quoting args to list command for
 #    immutable flags.
+# Modified 30 August 2024 by Jim Lippard to fix bugs in both immutable_flags
+#    (for BSD!) and _get_file_flags (for Linux).
 
 ### Required packages.
 
@@ -257,7 +259,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19a of 14 August 2024';
+my $VERSION = 'sigtree 1.19b of 30 August 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1771,18 +1773,18 @@ sub writable_file {
 # in some earlier version, there's now little resemblance.]
 sub immutable_file {
     my ($full_path) = @_;
-    my ($escaped_full_path, $flags, $perms, $nlinks, $uid, $gid, $file);
+    my ($flags, $perms, $nlinks, $uid, $gid, $file);
 
     if ((-e $CHFLAGS) && (-e "$full_path")) {
 	$flags = `$LSFLAGS \Q$full_path\E`;
-	($flags, $file) = split (/\s+/, $flags);
+	($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
 	if ($flags =~ /$BSD_SYS_IMMUTABLE_FLAG/ || $flags =~ /$BSD_USER_IMMUTABLE_FLAG/) {
 	    return 1;
 	}
     }
     elsif ((-e $LSATTR) && (-e "$full_path")) {
 	$flags = `$LSATTR \Q$full_path\E`;
-	($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
+	($flags) = split (/\s+/, $flags);
 	if ($flags =~ /i/) {
 	    return 1;
 	}
@@ -3013,16 +3015,11 @@ sub _get_file_type {
 # from lstat.
 sub _get_file_flags {
     my ($full_path) = @_;
-    my ($escaped_full_path, $flags, $perms, $nlinks, $uid, $gid);
+    my ($flags, $perms, $nlinks, $uid, $gid);
 
-    # Escape $ ( ) SP characters.
-    $escaped_full_path = $full_path;
-    #    $escaped_full_path =~ s/([\$\(\)\s])/\\$1/g;
-    $escaped_full_path =~ s/(\$)/\\$1/g;   
-    
     if (-e $CHFLAGS) {
 	if (-e "$full_path") {
-	    $flags = `$LSFLAGS "$escaped_full_path"`;
+	    $flags = `$LSFLAGS \Q$full_path\E`;
 	    if (defined ($flags) && (length ($flags) > 0)) {
 		($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
 
@@ -3039,9 +3036,9 @@ sub _get_file_flags {
 	}
     }
     elsif (-e $CHATTR) { # Linux
-	$flags = `$LSATTR $full_path`;
+	$flags = `$LSATTR \Q$full_path\E`;
+	($flags) = split (/\s+/, $flags);
 	if (defined ($flags)) {
-	    ($flags, $file) = split (/\s+/, $flags);
 	    if ($flags =~ /^[-]+$/) {
 		$flags = 'none';
 	    }
