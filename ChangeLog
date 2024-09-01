@@ -1,3 +1,4 @@
+1 September 2024: 1.19c: fix Linux immutability issues.
 30 August 2024: 1.19b: fix immutable_file/_get_file_flags bugs.
 14 August 2024: 1.19a: -f option for number of child processes, config
 	options for max_child_procs and default_child_procs, -m for

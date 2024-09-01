@@ -182,6 +182,10 @@
 #    immutable flags.
 # Modified 30 August 2024 by Jim Lippard to fix bugs in both immutable_flags
 #    (for BSD!) and _get_file_flags (for Linux).
+# Modified 31 August 2024 by Jim Lippard to use lsattr -d on Linux so that
+#    dirs don't list flags of contents instead of the directory's flags.
+#    Use chattr -f to suppress error messages, don't try to use lsattr
+#    on links.
 
 ### Required packages.
 
@@ -259,7 +263,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19b of 30 August 2024';
+my $VERSION = 'sigtree 1.19c of 1 September 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1782,8 +1786,8 @@ sub immutable_file {
 	    return 1;
 	}
     }
-    elsif ((-e $LSATTR) && (-e "$full_path")) {
-	$flags = `$LSATTR \Q$full_path\E`;
+    elsif ((-e $LSATTR) && (-e "$full_path") && (!-l "$full_path")) {
+	$flags = `$LSATTR -d \Q$full_path\E`;
 	($flags) = split (/\s+/, $flags);
 	if ($flags =~ /i/) {
 	    return 1;
@@ -1853,8 +1857,8 @@ sub set_immutable_flag {
 	if ($bsd) {
 	    system "$CHFLAGS $flag $path";
 	}
-	elsif ($linux) {
-	    system "$CHATTR $flag $path";
+	elsif ($linux && !-l $path) {
+	    system "$CHATTR -f $flag $path";
 	}
 
 	if (!$on && !&writable_file ($path)) {
@@ -3036,8 +3040,10 @@ sub _get_file_flags {
 	}
     }
     elsif (-e $CHATTR) { # Linux
-	$flags = `$LSATTR \Q$full_path\E`;
-	($flags) = split (/\s+/, $flags);
+	if (!-l $full_path) {
+	    $flags = `$LSATTR -d \Q$full_path\E`;
+	    ($flags) = split (/\s+/, $flags);
+	}
 	if (defined ($flags)) {
 	    if ($flags =~ /^[-]+$/) {
 		$flags = 'none';
