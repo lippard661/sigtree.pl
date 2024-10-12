@@ -186,6 +186,9 @@
 #    dirs don't list flags of contents instead of the directory's flags.
 #    Use chattr -f to suppress error messages, don't try to use lsattr
 #    on links.
+# Modified 12 October 2024 by Jim Lippard to unveil / due to likely
+#    presence of symlinks. (Instigated by my own moving of /usr/share/relink
+#    to /home due to space considerations.)
 
 ### Required packages.
 
@@ -263,7 +266,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19c of 1 September 2024';
+my $VERSION = 'sigtree 1.19d of 12 October 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -652,21 +655,9 @@ if ($OSNAME eq 'openbsd') {
     # Need /tmp access.
     unveil ('/tmp', 'rwc');
 
-    # Need r for all trees. If a tree in the config contains
-    # symlinks to a directory not in the config, this will cause
-    # unveil violations. E.g., if a config contains /usr/bin as
-    # a tree, it contains symlinks to /usr/sbin/mailwrapper (hoststat,
-    # mailq, newaliases, and purgestat), so if /usr/sbin is not also
-    # in the config, those will cause unveil violations. Similarly,
-    # /usr/bin/rcs2log is a symlink to /usr/libexec/cvs/contrib/rcs2log,
-    # so if /usr/libexec isn't in the config, there will be a violation.
-    # Rather than add another config option, the best workaround is to
-    # add further trees to such a config with IGNORE as the primary set.
-    my ($tree, @trees);
-    @trees = $config->all_trees;
-    foreach $tree (@trees) {
-	unveil ($tree, 'r');
-    }
+    # Need r for all trees, and there could be symlinks from a tree
+    # to a non-tree, so we just unveil /.
+    unveil ('/', 'r');
 
     # Lock unveil.
     unveil ();
