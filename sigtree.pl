@@ -189,6 +189,8 @@
 # Modified 12 October 2024 by Jim Lippard to unveil / due to likely
 #    presence of symlinks. (Instigated by my own moving of /usr/share/relink
 #    to /home due to space considerations.)
+# Modified 21 December 2024 by Jim Lippard to change unveil permissions for
+#    sigtree dirs (add x), which impacts ability to create initial dirs.
 
 ### Required packages.
 
@@ -266,7 +268,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19d of 12 October 2024';
+my $VERSION = 'sigtree 1.19e of 21 December 2024';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -616,8 +618,8 @@ if ($OSNAME eq 'openbsd') {
     # fattr might not be necessary due to wpath; stdio is automatically
     # included
     pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'fattr', 'exec', 'proc', 'flock', 'unveil') || die "Cannot pledge promises. $!\n";
-    # Need rwc for sigtree files.
-    unveil ($root_dir, 'rwc');
+    # Need rwc for sigtree files (and x for dirs).
+    unveil ($root_dir, 'rwxc');
 
     # Need x for immutable flag setting and checking.
     # Need r to be able to detect existence for sigtree checks.
@@ -653,7 +655,7 @@ if ($OSNAME eq 'openbsd') {
     }
     # Needed x for mktemp. (now use OpenBSD::MkTemp)
     # Need /tmp access.
-    unveil ('/tmp', 'rwc');
+    unveil ('/tmp', 'rwxc');
 
     # Need r for all trees, and there could be symlinks from a tree
     # to a non-tree, so we just unveil /.
