@@ -618,8 +618,12 @@ if ($OSNAME eq 'openbsd') {
     # fattr might not be necessary due to wpath; stdio is automatically
     # included
     pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'fattr', 'exec', 'proc', 'flock', 'unveil') || die "Cannot pledge promises. $!\n";
-    # Need rwc for sigtree files (and x for dirs).
+    # Need rwc for sigtree files (and x for dirs). This doesn't work if $root_dir doesn't exist yet.
     unveil ($root_dir, 'rwxc');
+    if (!-e $root_dir) {
+	my $root_dir_dir = File::Basename::dirname ($root_dir);
+	unveil ($root_dir_dir, 'rwxc');
+    }
 
     # Need x for immutable flag setting and checking.
     # Need r to be able to detect existence for sigtree checks.
