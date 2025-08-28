@@ -1,3 +1,4 @@
+27 August 2025: 1.19f: sanitize environment, avoid shell in system calls.
 21 December 2024: 1.19e: unveil sigtree dirs with rwxc.
 12 October 2024: 1.19d: expand unveil to /.
 1 September 2024: 1.19c: fix Linux immutability issues.

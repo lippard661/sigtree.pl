@@ -191,6 +191,8 @@
 #    to /home due to space considerations.)
 # Modified 21 December 2024 by Jim Lippard to change unveil permissions for
 #    sigtree dirs (add x), which impacts ability to create initial dirs.
+# Modified 27 August 2025 by Jim Lippard to sanitize environment and change
+#    system calls to avoid use of shell.
 
 ### Required packages.
 
@@ -244,6 +246,12 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkstemp mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
+### Sanitize environment.                                                                                   
+BEGIN {
+    $ENV{PATH} = '/usr/bin:/bin';
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+}
+
 ### Global constants.
 
 use vars qw( $SECURELEVEL );
@@ -268,7 +276,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19e of 21 December 2024';
+my $VERSION = 'sigtree 1.19f of 27 August 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1852,10 +1860,10 @@ sub set_immutable_flag {
 
     if (-e $path) {
 	if ($bsd) {
-	    system "$CHFLAGS $flag $path";
+	    system ($CHFLAGS, $flag, $path);
 	}
 	elsif ($linux && !-l $path) {
-	    system "$CHATTR -f $flag $path";
+	    system ($CHATTR, '-f', $flag, $path);
 	}
 
 	if (!$on && !&writable_file ($path)) {
@@ -1870,11 +1878,11 @@ sub get_pgp_passphrase {
     my ($pgp_passphrase, $current_tty, $temp_file);
 
     if ($PGP_or_GPG eq 'PGP' || $PGP_or_GPG eq 'GPG1' || $PGP_or_GPG eq 'signify') {
-	system ("$STTY -echo");
+	system ($STTY, '-echo');
 	print "$PGP_or_GPG Passphrase: ";
 	$pgp_passphrase = <STDIN>;
 	print "\n";
-	system ("$STTY echo");
+	system ($STTY, 'echo');
 	chop ($pgp_passphrase);
 	return ($pgp_passphrase);
     }
