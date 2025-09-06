@@ -193,6 +193,8 @@
 #    sigtree dirs (add x), which impacts ability to create initial dirs.
 # Modified 27 August 2025 by Jim Lippard to sanitize environment and change
 #    system calls to avoid use of shell.
+# Modified 6 September 2025 by Jim Lippard to set fork_children to 0 for
+#    initialize_specs.
 
 ### Required packages.
 
@@ -276,7 +278,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19f of 27 August 2025';
+my $VERSION = 'sigtree 1.19g of 6 September 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -683,6 +685,7 @@ if ($ARGV[0] eq 'initialize') {
 elsif ($ARGV[0] eq 'initialize_specs') {
     die "The -s option cannot be used with initialize_specs.\n" if ($opts{'s'});
     die "The -f option cannot be used with initialize_specs.\n" if ($opts{'f'});
+    $fork_children = 0;
     &initialize_sets ($config, $SPECS_ONLY, @sets);
 }
 elsif ($ARGV[0] eq 'changes') {
