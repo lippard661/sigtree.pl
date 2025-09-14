@@ -195,6 +195,10 @@
 #    system calls to avoid use of shell.
 # Modified 6 September 2025 by Jim Lippard to set fork_children to 0 for
 #    initialize_specs.
+# Modified 13 September 2025 by Jim Lippard to only load PGP::Sign and
+#    Signify at runtime when used, not use Linux runlevel as a test for
+#    immutable capability, and not run Linux lsattr on character special
+#    files or files on fuse, msdos, or other non-standard filesystems.
 
 ### Required packages.
 
@@ -207,7 +211,7 @@
 # * If PGP/GPG/signify signing is used (recommended):
 #   * PGP 5 or later or GPG.
 #   * CPAN module PGP::Sign.
-#   * Or: /usr/bin/signify
+#   * Or: /usr/bin/signify (signify-openbsd for Linux)
 #   * /bin/stty (for PGP or GPG 1, without gpg-agent)
 #   * /usr/bin/tty (for GPG 2, with gpg-agent)
 #   * /usr/bin/mktemp (for GPG 2, with gpg-agent)
@@ -220,7 +224,7 @@
 #   Linux:
 #   * /usr/bin/chattr (+i/-i)
 #   * /usr/bin/lsattr
-#   * /sbin/runlevel
+#   * /usr/bin/stat
 # Note that each of these dependencies is potentially a route that
 # could be exploited to subvert this program's intended function.
 #
@@ -240,8 +244,6 @@ use Digest::SHA3;
 use File::Basename;
 use Getopt::Std;
 use Parallel::ForkManager;
-#use PGP::Sign;
-use Signify;
 use Storable qw(lock_store lock_retrieve);
 use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkstemp mkdtemp );
@@ -268,8 +270,8 @@ my $LIST_CMD = '/bin/ls';
 my $LSFLAGS = "$LIST_CMD -lod";
 my $MAC_LSFLAGS = "$LIST_CMD -lOd";
 my $MKTEMP = '/usr/bin/mktemp';
-my $RUNLEVEL = '/sbin/runlevel';
 my $SIGNIFY = '/usr/bin/signify';
+my $STAT = '/usr/bin/stat';
 my $STTY = '/bin/stty';
 my $SYSCTL = '/sbin/sysctl';
 my $TTY = '/usr/bin/tty';
@@ -278,7 +280,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.19g of 6 September 2025';
+my $VERSION = 'sigtree 1.20 of 14 September 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -390,6 +392,7 @@ $no_macos_app_contents = $opts{'m'} || 0;
 # check -f for integer, but do check on quantity after parsing config.
 if ($opts{'f'}) {
     die "-f option must be an integer number of child processes.\n" if ($opts{'f'} !~ /^\d+$/);
+    die "-f option must be 0 or >= 2 child processes.\n" if ($opts{'f'} == 1);
 }
 
 if ($opts{'d'}) {
@@ -512,7 +515,8 @@ if ($opts{'f'}) {
     die "-f option is greater than max number of child processes ($config->{$MAX_CHILD_PROCS}).\n" if ($opts{'f'} > $config->{MAX_CHILD_PROCS});
 }
 
-$fork_children = $opts{'f'} || $config->{DEFAULT_CHILD_PROCS};
+$fork_children = $config->{DEFAULT_CHILD_PROCS};
+$fork_children = $opts{'f'} if (defined ($opts{'f'}));
 
 # Handle crypto_sigs options.
 # If configuration doesn't have a crypto_sigs field, rely on PGPKEYID
@@ -535,6 +539,15 @@ elsif ($config->{CRYPTO_SIGS} ne 'none') {
 	($PGP_or_GPG eq 'signify' && ($config->{PGPKEYID} && $config->{PGPKEYID} ne 'signify'))) {
 	die "Inconsistent crypto_sigs and pgpkeyid options in config file.\n";
     }
+}
+# Load required modules.
+# Signify. ($use_pgp is also nonzero)
+if ($use_signify) {
+    require Signify;
+}
+# GPG or PGP.
+elsif ($use_pgp) {
+    require PGP::Sign;
 }
 
 # Handle immutability options.
@@ -580,18 +593,9 @@ if ($use_immutable) {
 	}
     }
     elsif (-e $CHATTR) { # Linux
-	# Get current runlevel from /sbin/runlevel.  First return arg is previous runlevel,
-	# second return arg is current runlevel.
-
-	# Perhaps ideally this whole section of code should be modified to check
-	# to see if immutable flags can be set on and off, and refuse to allow it
-	# if not.  Maybe later.
-	$SECURELEVEL = `$RUNLEVEL`;
-	chop ($SECURELEVEL);
-	if ($SECURELEVEL !~ /^\d+\s+(\d+)$/) {
-	    die "Immutable file flags do not appear to be supported by your operating system.\n";
-	}
-	$SECURELEVEL = $1;
+	# Immutable flags are equivalent to BSD uchg and there is no system
+	# securelevel to consider.
+	$SECURELEVEL = 0;
     }
     else {
 	    die "Immutable file flags do not appear to be supported by your operating system.\n";
@@ -1389,6 +1393,8 @@ sub update_sets {
 	$tree_spec_name = &path_to_spec ($tree);
 	# Added $tree ne $spec_dir && so $spec_dir doesn't get treated as regular tree.
 	# $spec_dir is initialized separately below.
+	# This means changes to spec dir don't get updated, and they are in
+	# the changed_file. (But why wasn't it found above and handled?)
 	if ($tree ne $spec_dir && $config->tree_uses_sets ($tree, @sets)) {
 	    if ($use_immutable) {
 		&set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
@@ -1474,6 +1480,8 @@ sub update_sets {
 	    }
 	}
     }
+    # This will always get hit if there are changes to the spec_dir, since
+    # we skipped it above.
     if (-e $changed_file) {
 	@changed_trees = $changedfile->get_trees;
 	if ($verbose) {
@@ -1530,7 +1538,7 @@ sub update_sets {
 # Note: If we need to write to any specs/sigs that already exist,
 # and we're storing specs as immutable files, then we assume
 # those files are already set immutable, and so we abort if
-# the current runlevel is too high.  It would be better to
+# the current secure level is too high.  It would be better to
 # actually check, but perl's stat/lstat don't return the BSD
 # file flags. [This is irrelevant, see &immutable_file sub!]
 # The same problem will exist for dirs, but in
@@ -1794,7 +1802,11 @@ sub immutable_file {
 	    return 1;
 	}
     }
-    elsif ((-e $LSATTR) && (-e "$full_path") && (!-l "$full_path")) {
+    elsif ((-e $LSATTR) &&
+	   (-e "$full_path") &&
+	   (!-l "$full_path") &&
+	   (!-c "$full_path") &&
+	   (!&_on_nonstd_fs ($full_path))) {
 	$flags = `$LSATTR -d \Q$full_path\E`;
 	($flags) = split (/\s+/, $flags);
 	if ($flags =~ /i/) {
@@ -1804,6 +1816,22 @@ sub immutable_file {
 
     # If immutable flags aren't supported or aren't found.
     return 0;
+}
+
+# Subroutine to tell if a file is on a fuse or msdos filesystem (where
+# Linux lsattr won't work). (This code is in two places, with
+# immutable_file and with _get_file_flags in the FileAttr module,
+# keep them consistent.)
+sub _on_nonstd_fs {
+    my ($file) = @_;
+    my $fs_type;
+
+    $fs_type = `$STAT -f -c %T \Q$file\E`;
+    chomp ($fs_type);
+    return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
+		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
+		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc');
+#    return 1 if ($fs_type ne 'ext2/ext3');
 }
 
 # Subroutine to ask a yes or no question.
@@ -1938,7 +1966,6 @@ sub sigtree_verify {
 
 # Create a PGP signature in a detached file and save it.
 sub sigtree_pgp_sign {
-    use PGP::Sign;
     my ($file, $pgp_passphrase) = @_;
     my ($signature, $version, @data, @errors);
 
@@ -1956,7 +1983,7 @@ sub sigtree_pgp_sign {
     ($signature, $version) = pgp_sign ($config->{PGPKEYID}, $pgp_passphrase, @data);
 
     if (!defined ($signature)) {
-	@errors = PGP::Sign::pgp_error;
+	@errors = &PGP::Sign::pgp_error;
 	die "@errors";
     }
 
@@ -1972,7 +1999,6 @@ sub sigtree_pgp_sign {
 
 # Verify a PGP signature.
 sub sigtree_pgp_verify {
-    use PGP::Sign;
     my ($file) = @_;
     my ($signer, $signature, $version, @data, @errors);
     # $version is left undefined.
@@ -2001,7 +2027,7 @@ sub sigtree_pgp_verify {
 
     $signer = pgp_verify ($signature, $version, @data);
     if (!defined ($signer)) {
-	@errors = PGP::Sign::pgp_error;
+	@errors = &PGP::Sign::pgp_error;
 	print @errors;
     }
     elsif (!$signer) {
@@ -2022,7 +2048,7 @@ sub sigtree_signify_sign {
 	return;
     }
 
-    @errors = Signify::signify_error;
+    @errors = &Signify::signify_error;
 
     if ($errors[0] =~ /^no readable file/) {
 	print "Could not read $file to create $PGP_or_GPG signature.\n";
@@ -2050,7 +2076,7 @@ sub sigtree_signify_verify {
 	return;
     }
 
-    @errors = Signify::signify_error;
+    @errors = &Signify::signify_error;
 
     # Report any errors, apart from readability of file itself.
     if ($errors[0] =~ /^no readable signature file/) {
@@ -2267,6 +2293,7 @@ sub new {
 		    die "A second \"max_child_procs:\" field, line $line. $config_file\nLine: $raw_line";		    
 		}
 		if ($value =~ /^\d+/) {
+		    die "\"max_child_procs:\" field must be zero or an integer >= 2, line $line. $config_file\nLine: $raw_line" if ($value == 1);	    
 		    $self->{MAX_CHILD_PROCS} = $value;
 		}
 		else {
@@ -2285,13 +2312,15 @@ sub new {
 		    die "A second \"default_child_procs:\" field, line $line. $config_file\nLine: $raw_line";		    
 		}
 		if ($value =~ /^\d+/) {
+		    die "\"default_child_procs:\" field must be zero or an integer >= 2, line $line. $config_file\nLine: $raw_line" if ($value == 1);
 		    $self->{DEFAULT_CHILD_PROCS} = $value;
 		}
 		else {
 		    die "\"default_child_procs:\" field must be an integer, line $line. $config_file\nLine: $raw_line";
 		}
 		$self->{DEFAULT_CHILD_PROCS} = $value;
-		if ($self->{DEFAULT_CHILD_PROCS} && $self->{DEFAULT_CHILD_PROCS} > $self->{MAX_CHILD_PROCS}) {
+		if ($self->{DEFAULT_CHILD_PROCS} && $self->{MAX_CHILD_PROCS} &&
+		    $self->{DEFAULT_CHILD_PROCS} > $self->{MAX_CHILD_PROCS}) {
 		    die "\"default_child_procs:\" field is set to a value higher than \"max_child_procs:\", line $line $config_file\nLine: $raw_line";
 		}	
 	    }
@@ -3048,7 +3077,9 @@ sub _get_file_flags {
 	}
     }
     elsif (-e $CHATTR) { # Linux
-	if (!-l $full_path) {
+	if ((!-l $full_path) &&
+	    (!-c $full_path) &&
+	    (!&_on_nonstd_fs ($full_path))) {
 	    $flags = `$LSATTR -d \Q$full_path\E`;
 	    ($flags) = split (/\s+/, $flags);
 	}
@@ -3063,6 +3094,22 @@ sub _get_file_flags {
     }
 
     return ($flags);
+}
+
+# Subroutine to tell if a file is on a fuse or msdos filesystem (where
+# Linux lsattr won't work). (This code is in two places, with
+# immutable_file and with _get_file_flags in the FileAttr module,
+# keep them consistent.)
+sub _on_nonstd_fs {
+    my ($file) = @_;
+    my $fs_type;
+
+    $fs_type = `$STAT -f -c %T \Q$file\E`;
+    chomp ($fs_type);
+    return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
+		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
+		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc');
+#    return 1 if ($fs_type ne 'ext2/ext3');
 }
 
 # Internal method to compare one field of a FileAttr record

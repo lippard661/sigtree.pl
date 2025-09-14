@@ -26,7 +26,13 @@ sigtree.pl requires the following in order to work:
 * CPAN Perl module Parallel::ForkManager (1.19 w/OpenBSD or later).
 * Optional for OpenBSD: OpenBSD::MkTemp, OpenBSD::Pledge, OpenBSD::Unveil.
 
-If PGP signing is used (which is recommended), the following is also
+If signify signing is used (which is recommended), the following is also
+required:
+
+* Signify.pm (see below for where to obtain).
+* signify (standard on OpenBSD) or signify-openbsd (Linux package).
+
+If PGP signing is used, the following is also
 required:
 
 * PGP 5 or later, or GPG, or OpenBSD's signify, Signify.pm.
@@ -45,10 +51,10 @@ If immutable flags are to be used, sigtree.pl requires:
 OR (for Linux)
 * /usr/bin/chattr for setting/unsetting the immutable file attribute.
 * /usr/bin/lsattr for obtaining system file attributes.
-* /sbin/runlevel to get the kernel runlevel.
 
 To obtain CPAN Perl modules, it is recommended that you use the
-standard CPAN module, as follows (as root):
+standard CPAN module, obtained via OpenBSD ports tree, Homebrew,
+apt, or manually as follows:
 
    perl -MCPAN -e shell;
    install Bundle::CPAN         (this includes Digest::SHA1)
@@ -57,8 +63,7 @@ standard CPAN module, as follows (as root):
    install Digest::SHA3
    install Parallel::ForkManager
 
-The Signify.pm perl module is also now required and may be obtained
-from either
+The Signify.pm perl module may be obtained from either
    https://github.com/lippard661/Signify
  or
    https://www.discord.org/lippard/software
@@ -68,7 +73,7 @@ configs go in /var/db/sigtree by default, but you can use any other
 location, so long as you specify that location with the -r (root dir)
 option to sigtree.pl.
 
-The default config file name is <hostname>.conf in your root dir,
+The default config file name is <hostname>.sigtree.conf in your root dir,
 but a different config file can be specified with the -c (config
 file) option to sigtree.pl.  Modify the configuration file to
 monitor directories and files that you want monitored, and prioritize
@@ -79,27 +84,36 @@ a daily and weekly cron tab entry that emails the results to
 another machine.  On *BSD machines, you can put the following
 lines in daily.local and weekly.local, respectively:
 
-    host=`hostname -s`
-    /usr/local/bin/sigtree.pl -d secondary -s daily check | mail -s "daily $host sigtree test" email-address
-    /usr/local/bin/sigtree.pl -d secondary -s daily update
+(For daily but a full test on Wednesdays.)
 
     host=`hostname -s`
-    /usr/local/bin/sigtree.pl check | mail -s "weekly $host sigtree test" email-address
+    dayofweek=`/bin/date +"%a"'
+    case $dayofweek in
+        Wed) sigtreetest="daily,weekly"
+	     ;;
+	*) sigtreetest="daily"
+	   ;;
+    esac
+    echo "Running sigtree $sigtreetest."
+    /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest check | mail -s "$sigtreetest $host sigtree report" email-address
+    /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest update
+
+(For a weekly full test.)
+
+    host=`/bin/hostname -s`
+    echo "Running sigtree weekly test."
+    /usr/bin/perl /usr/local/bin/sigtree.pl check | mail -s "weekly $host sigtree report" email-address
 
 Add the -v option if you want more verbose results that show the old
 and new values of all file attributes that change.
 
-This will cause a daily report of all new changes that occur each day
-in files in the "daily" set, and a weekly report of all changes
-against the primary specification that occur in any files in your
-config.  The daily checks are against the secondary specification,
-which is immediately updated to reflect detected changes, so that you
-won't see them on the next daily report.
-
-Note that to speed things up, rather than using "initialize" with -d
-secondary, you can simply copy the primary specifications into the
-directory "secondary/<hostname>" under your root directory, then
-do an "initialize_specs"  to get started.
+These will cause a daily report of all new changes that occur each day
+in files in the "daily" set and a check of the "weekly" set each
+Wednesday for against the secondary specs, and update them, along with
+a weekly report of all changes against the primary specification that
+occur in any files in your config. The checks against the secondary
+specs are updated immediately afterward, so changes detected won't
+be reported again (except via the primary specs test).
 
 COMMAND OPTIONS (from "sigtree.pl -h")
 

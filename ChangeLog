@@ -1,3 +1,7 @@
+13 September 2025: 1.19h: Only load PGP::Sign/Signify when needed,
+	don't use Linux runlevel for checking immutable capability,
+	don't use lsattr on character special files or files on fuse,
+	msdos, or other non-standard filesystems. Updated README.
 6 September 2025: 1.19g: set fork_children=0 for initialize_specs.
 27 August 2025: 1.19f: sanitize environment, avoid shell in system calls.
 21 December 2024: 1.19e: unveil sigtree dirs with rwxc.
