@@ -1,3 +1,5 @@
+20 September 2025: 1.20a: Use full references for PGP::Sign and add
+	linux.sigtree.conf
 13 September 2025: 1.19h: Only load PGP::Sign/Signify when needed,
 	don't use Linux runlevel for checking immutable capability,
 	don't use lsattr on character special files or files on fuse,

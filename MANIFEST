@@ -5,3 +5,4 @@ ToDo                            The To-Do list for sigtree.pl
 sigtree.pl                      The sigtree.pl code itself
 sigtree.conf                    A sample config file
 macOS.sigtree.conf              Config file for Macintosh
+linux.sigtree.conf              Config file for Linux

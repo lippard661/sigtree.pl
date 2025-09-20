@@ -1,8 +1,5 @@
 BUGS:
 
-Use require instead of use for modules that are not always
-necessary, and only do so when it's known they are needed.
-
 if a tree is removed from config while present in the changed file,
 update will not remove it from the changed file. (Shouldn't check do this with its call to reset_changed_file?)
 

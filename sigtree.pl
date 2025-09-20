@@ -199,6 +199,8 @@
 #    Signify at runtime when used, not use Linux runlevel as a test for
 #    immutable capability, and not run Linux lsattr on character special
 #    files or files on fuse, msdos, or other non-standard filesystems.
+# Modified 20 September 2025 by Jim Lippard to use full references for
+#    calls to PGP::Sign and add default Linux config.
 
 ### Required packages.
 
@@ -280,7 +282,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.20 of 14 September 2025';
+my $VERSION = 'sigtree 1.20a of 20 September 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -543,11 +545,15 @@ elsif ($config->{CRYPTO_SIGS} ne 'none') {
 # Load required modules.
 # Signify. ($use_pgp is also nonzero)
 if ($use_signify) {
-    require Signify;
+    if (!eval { require Signify; 1 }) {
+	die "Could not require Signify. $@\n";
+    }
 }
 # GPG or PGP.
 elsif ($use_pgp) {
-    require PGP::Sign;
+    if (!eval { require PGP::Sign; 1 }) {
+	die "Could not require PGP::Sign. $@\n";
+    }
 }
 
 # Handle immutability options.
@@ -1980,7 +1986,7 @@ sub sigtree_pgp_sign {
 	return;
     }
 
-    ($signature, $version) = pgp_sign ($config->{PGPKEYID}, $pgp_passphrase, @data);
+    ($signature, $version) = &PGP::Sign::pgp_sign ($config->{PGPKEYID}, $pgp_passphrase, @data);
 
     if (!defined ($signature)) {
 	@errors = &PGP::Sign::pgp_error;
@@ -2025,7 +2031,7 @@ sub sigtree_pgp_verify {
 	return;
     }
 
-    $signer = pgp_verify ($signature, $version, @data);
+    $signer = &PGP::Sign::pgp_verify ($signature, $version, @data);
     if (!defined ($signer)) {
 	@errors = &PGP::Sign::pgp_error;
 	print @errors;
