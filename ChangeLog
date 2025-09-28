@@ -1,3 +1,6 @@
+28 September 2025: 1.20b: Add "devpts" to nonstandard fs type list,
+	don't run create_tree or fork children for unnecessary sets when
+	-s is used, add exception to Linux config for /dev/core to ignore.
 20 September 2025: 1.20a: Use full references for PGP::Sign and add
 	linux.sigtree.conf
 13 September 2025: 1.19h: Only load PGP::Sign/Signify when needed,

@@ -1,5 +1,11 @@
 BUGS:
 
+(1.20b fixes) Initialize on /dev takes forever for Proxmox/Debian Linux
+(problem is /dev/core, default config now ignores).
+
+(1.20b fixes) When -s <set name> is used, messages are still displayed for forking
+children that are not being initialized.
+
 if a tree is removed from config while present in the changed file,
 update will not remove it from the changed file. (Shouldn't check do this with its call to reset_changed_file?)
 

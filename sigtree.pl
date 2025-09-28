@@ -201,6 +201,10 @@
 #    files or files on fuse, msdos, or other non-standard filesystems.
 # Modified 20 September 2025 by Jim Lippard to use full references for
 #    calls to PGP::Sign and add default Linux config.
+# Modified 28 September 2025 by Jim Lippard to only run create_tree/fork
+#    children on specified sets when -s is used, to count devpts file
+#    system type as "nonstandard", and to ignore /dev/core in default
+#    Linux config.
 
 ### Required packages.
 
@@ -282,7 +286,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.20a of 20 September 2025';
+my $VERSION = 'sigtree 1.20b of 28 September 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -734,7 +738,7 @@ sub initialize_sets {
     my ($config, $specs_only, @sets) = @_;
     my ($pgp_passphrase, 
 	$changed_file_exists, $changedfile, $changed_specs, @changed_trees,
-	@trees, $tree, $tree_spec_name);
+	@trees, $tree, $tree_spec_name, @specified_trees);
     # used for Parallel::ForkManager
     my ($pm, $child_temp_dir);
 
@@ -792,12 +796,12 @@ sub initialize_sets {
 	    $pm = Parallel::ForkManager->new ($fork_children,
 					      $child_temp_dir);
 	}
-	
-	foreach $tree (@trees) {
 
-	    # Could do this differently by pulling out all the relevant trees before the
-	    # foreach $tree loop. Can't put this inside the if tree_uses_sets or might have
-	    # a child created that skips the finish.
+	foreach $tree (@trees) {
+	    push (@specified_trees, $tree) if ($config->tree_uses_sets ($tree, @sets));
+	}
+	
+	foreach $tree (@specified_trees) {
 	    if ($fork_children) {
 		$pm->run_on_finish (
 		    sub {
@@ -829,43 +833,38 @@ sub initialize_sets {
 	    
 	    $tree_spec_name = &path_to_spec ($tree);
 
-	    if ($config->tree_uses_sets ($tree, @sets)) {
-
-		if ($use_immutable) {
-		    &set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
-		    &set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
-		    &set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
-		    if ($use_pgp) {
-			&set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
-		    }
-		}
-		if ($verbose) {
-		    print "$tree";
-		    print ": start child" if ($fork_children);
-		    print "\n";
-		}
-		&create_tree ($config, $TREE_ROOT, $tree, '.', '', "$spec_dir/$tree_spec_name");
+	    if ($use_immutable) {
+		&set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
+		&set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
+		&set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
-			&sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
+		    &set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
 		}
-		if ($use_immutable) {
-		    &set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
-		    if ($use_pgp) {
-			&set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
-		    }
+	    }
+	    if ($verbose) {
+		print "$tree";
+		print ": start child" if ($fork_children);
+		print "\n";
+	    }
+	    &create_tree ($config, $TREE_ROOT, $tree, '.', '', "$spec_dir/$tree_spec_name");
+	    if ($use_pgp) {
+		&sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
+	    }
+	    if ($use_immutable) {
+		&set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		if ($use_pgp) {
+		    &set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
 		}
+	    }
 
-		# Remove this tree from the changed file if present.
-		# Parent needs to do this if forking children.
-		if (!$fork_children) {
-		    if ($changed_file_exists && $changedfile->tree_present ($tree)) {
-			$changedfile->delete ($tree);
-		    }
+	    # Remove this tree from the changed file if present.
+	    # Parent needs to do this if forking children.
+	    if (!$fork_children) {
+		if ($changed_file_exists && $changedfile->tree_present ($tree)) {
+		    $changedfile->delete ($tree);
 		}
+	    }
 
-	    } # tree uses sets (may be specified sets)
-
-	    # This needs to be outside the tree uses sets conditional.
 	    if ($fork_children) {
 		print "$tree: finish child\n" if ($verbose);
 		# Return the tree name.
@@ -1836,7 +1835,8 @@ sub _on_nonstd_fs {
     chomp ($fs_type);
     return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
 		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
-		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc');
+		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc' ||
+		 $fs_type eq 'devpts');
 #    return 1 if ($fs_type ne 'ext2/ext3');
 }
 
@@ -3114,7 +3114,8 @@ sub _on_nonstd_fs {
     chomp ($fs_type);
     return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
 		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
-		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc');
+		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc' ||
+		 $fs_type eq 'devpts');
 #    return 1 if ($fs_type ne 'ext2/ext3');
 }
 
