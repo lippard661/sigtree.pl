@@ -1,3 +1,6 @@
+5 November 2025: 1.21: Replaced mktemp calls with File::Temp,
+	replaced all backtick shell calls with open pipes. Ignore
+	/dev/shm subtree in default Linux config.
 28 September 2025: 1.20b: Add "devpts" to nonstandard fs type list,
 	don't run create_tree or fork children for unnecessary sets when
 	-s is used, add exception to Linux config for /dev/core to ignore.

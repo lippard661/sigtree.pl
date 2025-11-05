@@ -21,10 +21,11 @@ sigtree.pl requires the following in order to work:
 
 * Perl 5.
 * CPAN Perl modules Digest::SHA, Sys::Hostname, Getopt::Std, File::Basename,
-  Cwd, and Storable (all included with OpenBSD standard distribution).
+  File::Temp (or OpenBSD::MkTemp on OpenBSD), Cwd, and
+  Storable (all included with OpenBSD standard distribution).
 * CPAN Perl module Digest::SHA3.
 * CPAN Perl module Parallel::ForkManager (1.19 w/OpenBSD or later).
-* Optional for OpenBSD: OpenBSD::MkTemp, OpenBSD::Pledge, OpenBSD::Unveil.
+* On OpenBSD, uses OpenBSD::Pledge, OpenBSD::Unveil, and OpenBSD::MkTemp.
 
 If signify signing is used (which is recommended), the following is also
 required:
@@ -86,7 +87,7 @@ lines in daily.local and weekly.local, respectively:
 
 (For daily but a full test on Wednesdays.)
 
-    host=`hostname -s`
+    host=`/bin/hostname -s`
     dayofweek=`/bin/date +"%a"'
     case $dayofweek in
         Wed) sigtreetest="daily,weekly"
@@ -95,7 +96,7 @@ lines in daily.local and weekly.local, respectively:
 	   ;;
     esac
     echo "Running sigtree $sigtreetest."
-    /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest check | mail -s "$sigtreetest $host sigtree report" email-address
+    /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest check | /usr/bin/mail -s "$sigtreetest $host secondary sigtree report" email-address
     /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest update
 
 (For a weekly full test.)

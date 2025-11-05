@@ -205,13 +205,18 @@
 #    children on specified sets when -s is used, to count devpts file
 #    system type as "nonstandard", and to ignore /dev/core in default
 #    Linux config.
+# Modified 4-5 November 2025 by Jim Lippard to replace mktemp calls with
+#    File::Temp for non-OpenBSD systems and remove backtick/shell calls
+#    using open pipes. Add tree name in "Specification created" message
+#    since it may not be clear when using fork manager.
 
 ### Required packages.
 
 # sigtree.pl requires the following in order to work:
 # * Perl 5.
-# * Standard Perl modules File::Basename, Getopt::Std, Storable, and
-#   Sys::Hostname.
+# * Standard Perl modules File::Basename, File::Temp, Getopt::Std,
+#   Storable, and Sys::Hostname.
+#   (OpenBSD::MkTemp used in place of File::Temp on OpenBSD systems.)
 # * CPAN module Digest::SHA
 # * CPAN module Parallel::ForkManager
 # * If PGP/GPG/signify signing is used (recommended):
@@ -220,8 +225,6 @@
 #   * Or: /usr/bin/signify (signify-openbsd for Linux)
 #   * /bin/stty (for PGP or GPG 1, without gpg-agent)
 #   * /usr/bin/tty (for GPG 2, with gpg-agent)
-#   * /usr/bin/mktemp (for GPG 2, with gpg-agent)
-#     (uses OpenBSD::MkTemp on OpenBSD)
 #   * Signify.pm wrapper for signify
 # * If immutable flags are used (recommended for BSD):
 #   BSD:
@@ -248,6 +251,7 @@ use Cwd;
 use Digest::SHA;
 use Digest::SHA3;
 use File::Basename;
+use if $^O ne "openbsd", "File::Temp", qw ( :mktemp tempfile );
 use Getopt::Std;
 use Parallel::ForkManager;
 use Storable qw(lock_store lock_retrieve);
@@ -256,7 +260,7 @@ use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkstemp mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 
-### Sanitize environment.                                                                                   
+### Sanitize environment.
 BEGIN {
     $ENV{PATH} = '/usr/bin:/bin';
     delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
@@ -271,11 +275,11 @@ $SECURELEVEL = 0;
 my $BINSH = '/bin/sh'; # needed for unveil only
 my $CHATTR = '/usr/bin/chattr';
 my $LSATTR = '/usr/bin/lsattr';
+my $LSATTR_FLAGS_OPT = '-d';
 my $CHFLAGS = '/usr/bin/chflags';
-my $LIST_CMD = '/bin/ls';
-my $LSFLAGS = "$LIST_CMD -lod";
-my $MAC_LSFLAGS = "$LIST_CMD -lOd";
-my $MKTEMP = '/usr/bin/mktemp';
+my $LIST_FLAGS_CMD = '/bin/ls';
+my $LIST_FLAGS_OPT = '-lod';
+my $MAC_LIST_FLAGS_OPT = '-lOd';
 my $SIGNIFY = '/usr/bin/signify';
 my $STAT = '/usr/bin/stat';
 my $STTY = '/bin/stty';
@@ -286,7 +290,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.20b of 28 September 2025';
+my $VERSION = 'sigtree 1.21 of 5 November 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -306,7 +310,7 @@ my $MACOS_APP = '\.app$';
 my $OSNAME = $^O;
 
 if ($OSNAME eq 'darwin') {
-    $LSFLAGS = $MAC_LSFLAGS;
+    $LIST_FLAGS_OPT = $MAC_LIST_FLAGS_OPT;
 }
 
 my $HOSTNAME = hostname() || die "Hostname is undefined.\n";
@@ -595,8 +599,10 @@ if ($secondary_specs) {
 
 if ($use_immutable) {
     if (-e $CHFLAGS) { # BSD
-	$SECURELEVEL = `$SYSCTL kern.securelevel`;
-	chop ($SECURELEVEL);
+	open (my $outfh, '-|', $SYSCTL, 'kern.securelevel');
+	$SECURELEVEL = <$outfh>;
+	close ($outfh);
+	chomp ($SECURELEVEL) if (defined ($SECURELEVEL));
 	$SECURELEVEL =~ s/^.*=\s*//;
 	if ($SECURELEVEL !~ /^\d$/) {
 	    die "Immutable file flags do not appear to be supported by your operating system.\n";
@@ -655,7 +661,7 @@ if ($OSNAME eq 'openbsd') {
     # $SYSCTL absent because it's already been run.
     if ($use_immutable) {
 	unveil ($CHFLAGS, 'rx');
-	unveil ($LIST_CMD, 'rx');
+	unveil ($LIST_FLAGS_CMD, 'rx');
 	unveil ($BINSH, 'rx');
     }
     # Need x for crypto sign/verify and keys.
@@ -681,7 +687,6 @@ if ($OSNAME eq 'openbsd') {
 	unveil ($STTY, 'rx');
 	unveil ($TTY, 'rx');
     }
-    # Needed x for mktemp. (now use OpenBSD::MkTemp)
     # Need /tmp access.
     unveil ('/tmp', 'rwxc');
 
@@ -786,13 +791,8 @@ sub initialize_sets {
 	# like in check_sets.
 	if ($fork_children) {
 	    # create $child_temp_dir with mktemp
-	    if ($^O eq 'openbsd') {
-		$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
-	    }
-	    else {
-		$child_temp_dir = `$MKTEMP -q -d /tmp/sigtree.XXXXXXXX`;
-		chop ($child_temp_dir);
-	    }
+	    $child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
+	    chomp ($child_temp_dir);
 	    $pm = Parallel::ForkManager->new ($fork_children,
 					      $child_temp_dir);
 	}
@@ -1089,13 +1089,8 @@ sub check_sets {
 
     if ($fork_children) {
 	# create $child_temp_dir with mktemp
-	if ($^O eq 'openbsd') {
-	    $child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
-	}
-	else {
-	    $child_temp_dir = `$MKTEMP -q -d /tmp/sigtree.XXXXXXXX`;
-	    chop ($child_temp_dir);
-	}
+	$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
+	chomp ($child_temp_dir);
 	$pm = Parallel::ForkManager->new ($fork_children,
 					     $child_temp_dir);
     }
@@ -1131,8 +1126,7 @@ sub check_sets {
 		(my $fh, $child_temp_file) = mkstemp ("$child_temp_dir/child.XXXXXXXX");
 	    }
 	    else {
-		$child_temp_file = `$MKTEMP -q $child_temp_dir/child.XXXXXXXX`;
-		chop ($child_temp_file);		
+		(my $fh, $child_temp_file) = tempfile ("$child_temp_dir/child.XXXXXXXX");
 	    }
 	    $child_temp_file = File::Basename::basename ($child_temp_file);
 	    # Use temp file for location of changedfile.
@@ -1264,7 +1258,7 @@ sub check_tree {
 	if ($verbose) {
 	    ($host, $time, $user) = $spec->get_info;
 	    $time = localtime ($time);
-	    print "   Specification created $time on $host by $user.\n";
+	    print "   Specification for tree $tree created on $time on $host by $user.\n";
 	}
 	# We may be starting with a subtree.
 	if ($path ne '.') {
@@ -1795,13 +1789,16 @@ sub writable_file {
 
 # Subroutine to determine if a file is immutable.
 # Code borrowed from _get_file_flags in FileAttr method. [Perhaps
-# in some earlier version, there's now little resemblance.]
+# in some earlier version, there's now less resemblance.]
 sub immutable_file {
     my ($full_path) = @_;
     my ($flags, $perms, $nlinks, $uid, $gid, $file);
 
     if ((-e $CHFLAGS) && (-e "$full_path")) {
-	$flags = `$LSFLAGS \Q$full_path\E`;
+	open (my $outfh, '-|', $LIST_FLAGS_CMD, $LIST_FLAGS_OPT, $full_path);
+	$flags = <$outfh>;
+	close ($outfh);
+	chomp ($flags) if (defined ($flags));
 	($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
 	if ($flags =~ /$BSD_SYS_IMMUTABLE_FLAG/ || $flags =~ /$BSD_USER_IMMUTABLE_FLAG/) {
 	    return 1;
@@ -1812,7 +1809,10 @@ sub immutable_file {
 	   (!-l "$full_path") &&
 	   (!-c "$full_path") &&
 	   (!&_on_nonstd_fs ($full_path))) {
-	$flags = `$LSATTR -d \Q$full_path\E`;
+	open (my $outfh, '-|', $LSATTR, $LSATTR_FLAGS_OPT, $full_path);
+	$flags = <$outfh>;
+	close ($outfh);
+	chomp ($flags) if (defined ($flags));
 	($flags) = split (/\s+/, $flags);
 	if ($flags =~ /i/) {
 	    return 1;
@@ -1831,8 +1831,10 @@ sub _on_nonstd_fs {
     my ($file) = @_;
     my $fs_type;
 
-    $fs_type = `$STAT -f -c %T \Q$file\E`;
-    chomp ($fs_type);
+    open (my $outfh, '-|', $STAT, '-f', '-c', '%T', $file);
+    $fs_type = <$outfh>;
+    close ($outfh);
+    chomp ($fs_type) if (defined ($fs_type));
     return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
 		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
 		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc' ||
@@ -1925,16 +1927,17 @@ sub get_pgp_passphrase {
     }
     elsif ($PGP_or_GPG eq 'GPG') { # gpg-agent does the work when we sign something, so sign a temp file.
 	$pgp_passphrase = '';
-	$current_tty = `$TTY`;
-	chop ($current_tty);
+	open (my $outfh, '-|', $TTY);
+	$current_tty = <$outfh>;
+	close ($outfh);
+	chomp ($current_tty) if (defined ($current_tty));
 	$ENV{'GPG_TTY'} = $current_tty;
 	if ($^O eq 'openbsd') {
 	    # OpenBSD::MkTemp's mkstemp returns a file handle we don't need.
 	    (my $fh, $temp_file) = mkstemp ('/tmp/sigtree.XXXXXXXX');
 	}
 	else {
-	    $temp_file = `$MKTEMP -q /tmp/sigtree.XXXXXXXX`;
-	    chop ($temp_file);
+	    (my $fh, $temp_file) = tempfile ("/tmp/sigtree.XXXXXXXX");
 	}
 	&sigtree_pgp_sign ($temp_file, $pgp_passphrase); # can skip the wrapper
 	unlink ($temp_file);
@@ -3066,8 +3069,11 @@ sub _get_file_flags {
 
     if (-e $CHFLAGS) {
 	if (-e "$full_path") {
-	    $flags = `$LSFLAGS \Q$full_path\E`;
+	    open (my $outfh, '-|', $LIST_FLAGS_CMD, $LIST_FLAGS_OPT, $full_path);
+	    $flags = <$outfh>;
+	    close ($outfh);
 	    if (defined ($flags) && (length ($flags) > 0)) {
+		chomp ($flags);
 		($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
 
 		if (($flags eq '-') || ($flags !~ /^[\w,]+$/)) {
@@ -3086,7 +3092,10 @@ sub _get_file_flags {
 	if ((!-l $full_path) &&
 	    (!-c $full_path) &&
 	    (!&_on_nonstd_fs ($full_path))) {
-	    $flags = `$LSATTR -d \Q$full_path\E`;
+	    open (my $outfh, '-|', $LSATTR, $LSATTR_FLAGS_OPT, $full_path);
+	    $flags = <$outfh>;
+	    close ($outfh);
+	    chomp ($flags) if (defined ($flags));
 	    ($flags) = split (/\s+/, $flags);
 	}
 	if (defined ($flags)) {
@@ -3110,8 +3119,10 @@ sub _on_nonstd_fs {
     my ($file) = @_;
     my $fs_type;
 
-    $fs_type = `$STAT -f -c %T \Q$file\E`;
-    chomp ($fs_type);
+    open (my $outfh, '-|', $STAT, '-f', '-c', '%T', $file);
+    $fs_type = <$outfh>;
+    close ($outfh);
+    chomp ($fs_type) if (defined ($fs_type));
     return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
 		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
 		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc' ||
