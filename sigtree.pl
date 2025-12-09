@@ -209,6 +209,11 @@
 #    File::Temp for non-OpenBSD systems and remove backtick/shell calls
 #    using open pipes. Add tree name in "Specification created" message
 #    since it may not be clear when using fork manager.
+# Modified 2 December 2025 by Jim Lippard to delete a few more env
+#    variables.
+# Modified 7 December 2025 by Jim Lippard to use Cwd::abs_path on
+#    link targets in FileAttr package and only load Parallel::ForkManager
+#    if forking children.
 
 ### Required packages.
 
@@ -216,9 +221,12 @@
 # * Perl 5.
 # * Standard Perl modules File::Basename, File::Temp, Getopt::Std,
 #   Storable, and Sys::Hostname.
+# * Standard Perl module Cwd used in FileAttr and for check_file.
 #   (OpenBSD::MkTemp used in place of File::Temp on OpenBSD systems.)
+#   (File::Temp is a very large module (3000+ lines) and only used
+#   if PGP/GPG signing is done or children are forked.)
 # * CPAN module Digest::SHA
-# * CPAN module Parallel::ForkManager
+# * CPAN module Parallel::ForkManager (if forking children)
 # * If PGP/GPG/signify signing is used (recommended):
 #   * PGP 5 or later or GPG.
 #   * CPAN module PGP::Sign.
@@ -247,14 +255,12 @@
 
 require 5.004;
 use strict;
-use Cwd;
 use Digest::SHA;
 use Digest::SHA3;
 use File::Basename;
+# File::Temp is much larger than OpenBSD::MkTemp.
 use if $^O ne "openbsd", "File::Temp", qw ( :mktemp tempfile );
 use Getopt::Std;
-use Parallel::ForkManager;
-use Storable qw(lock_store lock_retrieve);
 use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkstemp mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -263,7 +269,7 @@ use if $^O eq "openbsd", "OpenBSD::Unveil";
 ### Sanitize environment.
 BEGIN {
     $ENV{PATH} = '/usr/bin:/bin';
-    delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV PERL5LIB LD_PRELOAD LD_LIBRARY_PATH)};
 }
 
 ### Global constants.
@@ -290,7 +296,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.21 of 5 November 2025';
+my $VERSION = 'sigtree 1.21a of 9 December 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -528,6 +534,13 @@ if ($opts{'f'}) {
 $fork_children = $config->{DEFAULT_CHILD_PROCS};
 $fork_children = $opts{'f'} if (defined ($opts{'f'}));
 
+# Load Parallel::ForkManager if required.
+if ($fork_children) {
+    if (!eval { require Parallel::ForkManager; 1 }) {
+	die "Could not require Parallel::ForkManager. $@\n";
+    }
+}
+
 # Handle crypto_sigs options.
 # If configuration doesn't have a crypto_sigs field, rely on PGPKEYID
 # as before. Default to GPG2 (GPG).
@@ -719,8 +732,10 @@ elsif ($ARGV[0] eq 'check_file') {
     die "The -f option cannot be used with check_file.\n" if ($opts{'f'});
     print "File does not exist. $file\n" if (!-e $file);
     if ($file =~ /^\.\// || $file !~ /^\//) {
+	require Cwd;
+	my $cwd = Cwd::cwd();
 	$file =~ s/^\.\///;
-	$file = cwd() . '/' . $file;
+	$file = $cwd . '/' . $file;
     }
     &check_sets ($config, $SUBTREE_ONLY, $file);
 }
@@ -2931,6 +2946,8 @@ sub tree_for_path {
 # a file's attributes against an existing spec, etc.
 package FileAttr;
 
+use Cwd qw( abs_path );
+
 # Method to create a new FileAttr record.
 sub new {
     my $class = shift;
@@ -2964,8 +2981,9 @@ sub new {
 
 	# Need absolute path to be able to obtain other information about the
 	# target.
-	if (substr ($link_target, 0, 1) ne '/') {
-	    $link_target = File::Basename::dirname ($full_path) . '/' . $link_target;
+	if (substr ($link_target, 0, 1) ne '/' ||
+	    $link_target =~ /\.\./) {
+	    $link_target = abs_path ($link_target);
 	}
 	$self->{LINKTARGET_TYPE} = &_get_file_type ($link_target);
 

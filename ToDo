@@ -1,5 +1,7 @@
 BUGS:
 
+(1.21a fixes) Fixed bug in handling link targets.
+
 (1.20b fixes) Initialize on /dev takes forever for Proxmox/Debian Linux
 (problem is /dev/core, default config now ignores).
 
@@ -20,6 +22,19 @@ in the changed file, initialize_specs doesn't take it out. (Have modified
 update to permit updating a changed spec directory with version 1.14.)
 
 FEATURES TO ADD:
+
+Could use MCE::Shared (or other MCE components) in place of
+Parallel::ForkManager in order to add privilege separation AND
+parallel processing. Or, alternatively, it might be possible to
+augment what exists by adding a per-child pipe for requesting
+file descriptors as needed; the tricky part would be monitoring
+the active pipes on the parent side (probably an arrey of them,
+removing them as each child closed). Would probably be a lot of
+root file and dir opens, but the child should open directly if
+possible so it might not be excessive.
+
+Could change unveiling to only unveil the specific tree for
+each child process? (seems low value compared to privsep)
 
 (DONE) Allow forking child processes to run check_tree (e.g., using
 Parallel::ForkManager; it will require adding 'proc' to pledge

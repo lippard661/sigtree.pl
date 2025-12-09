@@ -1,3 +1,5 @@
+9 December 2025: 1.21a: Fixed bug in link target handling, only load
+	Parallel::ForkManager when needed.
 5 November 2025: 1.21: Replaced mktemp calls with File::Temp,
 	replaced all backtick shell calls with open pipes. Ignore
 	/dev/shm subtree in default Linux config.
