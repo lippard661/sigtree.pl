@@ -2947,13 +2947,14 @@ sub tree_for_path {
 package FileAttr;
 
 use Cwd qw( abs_path );
+use File::Spec;
 
 # Method to create a new FileAttr record.
 sub new {
     my $class = shift;
     my ($tree, $path, $sha_digest, $special) = @_;
     my ($sha_version, $sha_bits);
-    my ($full_path, $link_target, $self, $ctx, $digest,
+    my ($full_path, $base_dir, $link_target, $self, $ctx, $digest,
 	$dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size,
 	$atime, $mtime, $ctime, $blksize, $blocks, $flags);
 
@@ -2981,8 +2982,12 @@ sub new {
 
 	# Need absolute path to be able to obtain other information about the
 	# target.
-	if (substr ($link_target, 0, 1) ne '/' ||
-	    $link_target =~ /\.\./) {
+	if (substr ($link_target, 0, 1) ne '/') {
+	    # Basedir could be a directory within $tree, not $tree itself.
+	    $base_dir = File::Basename::dirname ($full_path);
+	    $link_target = File::Spec->catfile ($base_dir, $link_target);
+	}
+	if ($link_target =~ /\.\./) {
 	    $link_target = abs_path ($link_target);
 	}
 	$self->{LINKTARGET_TYPE} = &_get_file_type ($link_target);
