@@ -214,6 +214,8 @@
 # Modified 7 December 2025 by Jim Lippard to use Cwd::abs_path on
 #    link targets in FileAttr package and only load Parallel::ForkManager
 #    if forking children.
+# Modified 11 December 2025 by Jim Lippard to use File::Spec->rel2abs
+#    when link target contains "../" and doesn't exist.
 
 ### Required packages.
 
@@ -296,7 +298,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.21a of 9 December 2025';
+my $VERSION = 'sigtree 1.21b of 11 December 2025';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -2988,7 +2990,12 @@ sub new {
 	    $link_target = File::Spec->catfile ($base_dir, $link_target);
 	}
 	if ($link_target =~ /\.\./) {
-	    $link_target = abs_path ($link_target);
+	    # Get actual target; if nonexistent, get best estimate.
+	    my $abs_link_target = abs_path ($link_target);
+	    if (!defined ($abs_link_target)) {
+		$abs_link_target = File::Spec->rel2abs ($link_target);
+	    }
+	    $link_target = $abs_link_target;
 	}
 	$self->{LINKTARGET_TYPE} = &_get_file_type ($link_target);
 
