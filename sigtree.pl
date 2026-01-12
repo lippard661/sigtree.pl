@@ -812,6 +812,7 @@ elsif ($ARGV[0] eq 'check_file') {
 	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
 		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
     }
+    $fork_children = 0;
     check_sets ($config, $SUBTREE_ONLY, $file);
 }
 elsif ($ARGV[0] eq 'check_specs') {
@@ -822,6 +823,7 @@ elsif ($ARGV[0] eq 'check_specs') {
 	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
 		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
     }
+    $fork_children = 0;
     check_sets ($config, $SPECS_ONLY, @sets)
 }
 elsif ($ARGV[0] eq 'update') {
