@@ -945,8 +945,6 @@ sub initialize_sets {
 	    $tree_spec_name = path_to_spec ($tree);
 
 	    if ($use_immutable) {
-		# Keep unlocking but do not re-lock.
-		set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
@@ -1015,9 +1013,9 @@ sub initialize_sets {
 
     print "Initializing specification for specification dir.\n" if ($verbose);
     if ($use_immutable) {
-	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_OFF);
+	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
 	if ($use_pgp) {
-	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_OFF);
+	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
 	}
     }
     # This must be done before the specification for the specification dir
@@ -1025,14 +1023,14 @@ sub initialize_sets {
     if ($use_immutable) {
 	set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
     }
-    create_tree ($config, $TREE_ROOT, $spec_dir, '.', '', "$root_dir/$spec_spec");
+    create_tree ($config, $TREE_ROOT, $spec_dir, '.', '', "$spec_dir_dir/$spec_spec");
     if ($use_pgp) {
-	sigtree_sign ("$root_dir/$spec_spec", $pgp_passphrase);
+	sigtree_sign ("$spec_dir_dir/$spec_spec", $pgp_passphrase);
     }
     if ($use_immutable) {
-	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_ON);
+	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
 	if ($use_pgp) {
-	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_ON);
+	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
 	}
     }
 }
@@ -1171,9 +1169,9 @@ sub check_sets {
     print "Checking to see if specification dir has changed.\n" if ($verbose);
     print "$spec_dir\n" if ($verbose);
     if ($use_pgp) {
-	sigtree_verify ("$root_dir/$spec_spec");
+	sigtree_verify ("$spec_dir_dir/$spec_spec");
     }
-    check_tree ($config, $TREE_ROOT, $spec_dir, '.', '', $changedfile, "$root_dir/$spec_spec");
+    check_tree ($config, $TREE_ROOT, $spec_dir, '.', '', $changedfile, "$spec_dir_dir/$spec_spec");
 
     print "\nChecking individual specifications." if ($verbose && !$specs_only);
     if ($subtree_only) {
@@ -1507,8 +1505,6 @@ sub update_sets {
 	# the changed_file. (But why wasn't it found above and handled?)
 	if ($tree ne $spec_dir && $config->tree_uses_sets ($tree, @sets)) {
 	    if ($use_immutable) {
-		# Keep unlocking $spec_dir_dir, but no longer lock it.
-		set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
@@ -1603,9 +1599,9 @@ sub update_sets {
     }
     print "Updating specification for specification dir.\n" if ($verbose);
     if ($use_immutable) {
-	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_OFF);
+	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
 	if ($use_pgp) {
-	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_OFF);
+	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
 	}
     }
     # Update's the same as initialize in this respect.
@@ -1613,17 +1609,15 @@ sub update_sets {
     # is created, since changing flags involves inode modification.
     if ($use_immutable) {
 	set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
-# Stop locking $spec_dir_dir.
-#	set_immutable_flag ($spec_dir_dir, $IMMUTABLE_ON);
     }
-    create_tree ($config, $TREE_ROOT, $spec_dir, '', '', "$root_dir/$spec_spec");
+    create_tree ($config, $TREE_ROOT, $spec_dir, '', '', "$spec_dir_dir/$spec_spec");
     if ($use_pgp) {
-	sigtree_sign ("$root_dir/$spec_spec", $pgp_passphrase);
+	sigtree_sign ("$spec_dir_dir/$spec_spec", $pgp_passphrase);
     }
     if ($use_immutable) {
-	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_ON);
+	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
 	if ($use_pgp) {
-	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_ON);
+	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
 	}
     }
 }
@@ -1767,15 +1761,15 @@ sub verify_required_dirs {
 	die "Host changed file is not writeable. $changed_file\n";
     }
 
-    if (!-e $root_dir . "/$spec_spec" && $caller != $INITIALIZE) {
-	die "Host specification does not exist. $root_dir/$spec_spec.\n";
+    if (!-e $spec_dir_dir . "/$spec_spec" && $caller != $INITIALIZE) {
+	die "Host specification does not exist. $spec_dir_dir/$spec_spec.\n";
     }
-    elsif (-e $root_dir . "$spec_spec") {
-	if (!-r $root_dir . "/$spec_spec") {
-	    die "Host specification is not readable. $root_dir/$spec_spec.\n";
+    elsif (-e $spec_dir_dir . "$spec_spec") {
+	if (!-r $spec_dir_dir . "/$spec_spec") {
+	    die "Host specification is not readable. $spec_dir_dir/$spec_spec.\n";
 	}
-	elsif ($caller != $CHECK && !-w $root_dir . "/$spec_spec") {
-	    die "Host specification is not writable. $root_dir/$spec_spec\n";
+	elsif ($caller != $CHECK && !-w $spec_dir_dir . "/$spec_spec") {
+	    die "Host specification is not writable. $spec_dir_dir/$spec_spec\n";
 	}
     }
     elsif ($caller != $CHECK && $use_immutable && $SECURELEVEL != 0 && ($immutable_flag ne $BSD_USER_IMMUTABLE_FLAG)) {
@@ -1783,15 +1777,15 @@ sub verify_required_dirs {
     }
 
     if ($use_pgp) {
-	if (!-e $root_dir . "/$spec_spec.sig") {
-	    die "Host specification signature does not exist. $root_dir/$HOSTNAME.sig.\n"
+	if (!-e $spec_dir_dir . "/$spec_spec.sig") {
+	    die "Host specification signature does not exist. $spec_dir_dir/$HOSTNAME.sig.\n"
 		if ($caller != $INITIALIZE);
 	}
-	elsif (!-r $root_dir . "/$spec_spec.sig") {
-	    die "Host specification signature is not readable. $root_dir/$spec_spec.sig.\n";
+	elsif (!-r $spec_dir_dir . "/$spec_spec.sig") {
+	    die "Host specification signature is not readable. $spec_dir_dir/$spec_spec.sig.\n";
 	}
-	elsif ($caller != $CHECK && !-w $root_dir . "/$spec_spec.sig") {
-	    die "Host specification signature is not writable. $root_dir/$spec_spec.sig\n";
+	elsif ($caller != $CHECK && !-w $spec_dir_dir . "/$spec_spec.sig") {
+	    die "Host specification signature is not writable. $spec_dir_dir/$spec_spec.sig\n";
 	}
     }
 }
@@ -1822,8 +1816,6 @@ sub remove_extraneous_files {
     @extraneous_files = _identify_extraneous_files ($config, $spec_dir);
     if ($#extraneous_files >= 0) {
 	if ($use_immutable) {
-	    # Keep unlocking but don't re-lock it.
-	    set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
 	    set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
 	}
 
