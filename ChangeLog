@@ -1,3 +1,6 @@
+11 January 2026: 1.21c: Some cleanup, more granular use of pledge,
+	stop locking the main specdir, move changedfile and spec spec
+	location in preparation for privsep implementation.
 11 December 2025: 1.21b: Fixed another bug in link target handling.
 9 December 2025: 1.21a: Fixed bug in link target handling, only load
 	Parallel::ForkManager when needed.

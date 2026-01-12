@@ -2,7 +2,7 @@
 #
 #########################################################################
 #
-# Copyright 2000-2022 by Jim Lippard.  Permission granted for free
+# Copyright 2000-2026 by Jim Lippard.  Permission granted for free
 # distribution, commercial and non-commercial use, with the proviso that
 # this notice remain intact and that any sale of this software or any
 # package or system or service which includes this software or any
@@ -18,7 +18,7 @@
 # directory trees, optionally PGP signing them and setting their
 # immutable flags.
 #
-# Home website location is http://www.discord.org/~lippard/software.
+# Home website location is https://www.discord.org/lippard/software.
 #
 # Written 18-30 January 2000 by Jim Lippard, based on my previous
 #    mtree.pl script of 1 January 1999.
@@ -55,7 +55,7 @@
 #    or immutable flags and to use a separate changed file.
 # Modified 26 February 2003 by Jim Lippard to use $spec_dir_dir instead
 #    of $root_dir/specs and use different specifications dir specification
-#    for secondary specifications.  Fixed bug in &writable_file when file
+#    for secondary specifications.  Fixed bug in writable_file when file
 #    doesn't exist.
 # Modified 5 January 2004 by Jim Lippard to not generate SHA1 digests for
 #    directories, which Digest::SHA1 has never supported but no longer silently
@@ -83,7 +83,7 @@
 #    on keywords in applicable sets.
 # Modified 25 December 2011 by Jim Lippard to allow creation of a new
 #    spec in an existing specs dir even if the latter is immutable.  Fixed
-#    bug in &immutable_file which had BSD and Linux checks reversed.  Added
+#    bug in immutable_file which had BSD and Linux checks reversed.  Added
 #    option to select system or user immutability in BSD. (Not sure what
 #    configuration setting for SHA1/SHA2 was supposedly removed--the main
 #    config setting is still there.)  $root_dir is now just the location
@@ -216,6 +216,16 @@
 #    if forking children.
 # Modified 11 December 2025 by Jim Lippard to use File::Spec->rel2abs
 #    when link target contains "../" and doesn't exist.
+# Modified 4 January 2026 by Jim Lippard to remove & from subroutine calls,
+#    add -V to just print version (in addition to -h).
+# Modified 5-6 January 2026 by Jim Lippard to add privilege separation option
+#    via -p option or "privsep:" field in config file. Add require_module
+#    subroutine. (In preparation for adding privilege separation.)
+# Modified 10 January 2026 by Jim Lippard to avoid use of cwd in use of
+#    File::Spec->rel2abs.
+# Modified 11 January 2026 by Jim Lippard to be more granular with pledge,
+#    stop locking the top specs dir ($spec_dir_dir), and move spec specs
+#    and changedfiles into specs and secondary.
 
 ### Required packages.
 
@@ -298,7 +308,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.21b of 11 December 2025';
+my $VERSION = 'sigtree 1.21c of 11 January 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -329,6 +339,14 @@ my $USERNAME = getpwuid($<);
 
 my $ROOT_DIR = '/var/db/sigtree';
 my $SYSCONF_DIR = '/etc';
+
+# Pledge promises.
+my @READONLY_PROMISES = ('rpath');
+my @READWRITE_PROMISES = ('wpath', 'cpath', 'tmppath');
+my @CHANGE_ATTR_PROMISES = ('fattr');
+my @EXEC_PROMISES = ('exec', 'proc');
+my @FLOCK_PROMISE = ('flock');
+my @UNVEIL_PROMISE = ('unveil');
 
 # Return error codes for valid_setlist.
 my $SET_NAME_INVALID = 1;
@@ -388,15 +406,26 @@ my (%opts,         # Command line options.
     $use_signify,  # If signify should be used.
     $signify_pubkey, # signify public key file.
     $signify_seckey, # signify private key file.
+    $sigtree_uid,  # uid of _sigtree user.
+    $sigtree_gid,  # gid of _sigtree group.
     $use_immutable,# If system immutable flags should be used.
     $immutable_flag,# For BSD, which type of immutability to use.
+    $use_privsep,  # Use privilege separation.
     $verbose,      # If we should be verbose.
     );
 
 ### Main program.
 
 # Get/set options.
-getopts ('r:c:s:d:f:vhm', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+getopts ('r:c:s:d:f:vhmpV', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+
+# -V must be alone.
+if ($opts{'V'}) {
+    die "-V is mutually exclusive with other options.\n" if (keys (%opts) > 1);
+    die "-V is mutually exclusive with any commands.\n" if ($#ARGV >= 0);
+    print "$VERSION\n";
+    exit;
+}
 
 $root_dir = $opts{'r'} || $ROOT_DIR;
 $spec_spec = $HOSTNAME . '.spec';
@@ -436,10 +465,10 @@ else {
     $spec_dir_dir = $root_dir . '/specs';
 }
 if ($secondary_specs) {
-    $changed_file = $root_dir . '/' . $HOSTNAME . '.changedsec';
+    $changed_file = $spec_dir . '/' . $HOSTNAME . '.changedsec';
 }
 else {
-    $changed_file = $root_dir . '/' . $HOSTNAME . '.changed';
+    $changed_file = $spec_dir_dir . '/' . $HOSTNAME . '.changed';
 }
 
 $verbose = $opts{'v'} || 0;
@@ -454,8 +483,10 @@ if ($opts{'h'}) {
     print "-s set list (CSV)\n";
     print "-f num_child_procs\n";
     print "-m don't show macOS app dir content changes\n";
+    print "-p use privilege separation\n";
     print "-v verbose\n";
-    print "-h help and version\n";
+    print "-V show version (must be standalone option with no command)\n";
+    print "-h help and show version\n";
     print "Commands:\n";
     print "initialize: Initialize specifications for a set of trees.\n";
     print "initialize_specs: Initialize specification for the specification dir.\n";
@@ -507,7 +538,7 @@ if ($set) {
 	    die "The set name \"$sets[$arg_no]\" given with -s option can only be used with the \"initialize\" command.\n";
 	}
 	# Add 'new' set to all trees without specs.
-	&add_new_set_to_uninitialized_trees ($spec_dir);
+	add_new_set_to_uninitialized_trees ($spec_dir);
     }
     $something_to_do = 0;
     foreach $set (@sets) {
@@ -538,9 +569,8 @@ $fork_children = $opts{'f'} if (defined ($opts{'f'}));
 
 # Load Parallel::ForkManager if required.
 if ($fork_children) {
-    if (!eval { require Parallel::ForkManager; 1 }) {
+    require_module ('Parallel::ForkManager') or
 	die "Could not require Parallel::ForkManager. $@\n";
-    }
 }
 
 # Handle crypto_sigs options.
@@ -568,15 +598,13 @@ elsif ($config->{CRYPTO_SIGS} ne 'none') {
 # Load required modules.
 # Signify. ($use_pgp is also nonzero)
 if ($use_signify) {
-    if (!eval { require Signify; 1 }) {
+    require_module ('Signify') or
 	die "Could not require Signify. $@\n";
-    }
 }
 # GPG or PGP.
 elsif ($use_pgp) {
-    if (!eval { require PGP::Sign; 1 }) {
+    require_module ('PGP::Sign') or
 	die "Could not require PGP::Sign. $@\n";
-    }
 }
 
 # Handle immutability options.
@@ -600,7 +628,8 @@ if ($use_immutable) {
 # Don't use PGP or immutable flags if using secondary specs, unless
 # BSD's $BSD_USER_IMMUTABLE_FLAG is available.  (Using $BSD_USER_IMMUTABLE_FLAG
 # is a possibility for the changed file, as well, now, but has not yet
-# been implemented.)
+# been implemented. If implemented, then the check functions will
+# require the 'fattr' promise to be pledged.)
 if ($secondary_specs) {
     $use_pgp = 0;
     if ($use_immutable && ($immutable_flag eq $BSD_SYS_IMMUTABLE_FLAG ||
@@ -652,6 +681,34 @@ if ($use_pgp) {
     }
 }
 
+# Privilege separation part 1: verify that it can be done and
+# load required modules, but don't fork until after pledge/unveil.
+$use_privsep = $opts{'p'} || $config->{PRIVSEP} eq 'yes';
+if ($use_privsep) {
+    # verify that it's possible
+    $sigtree_uid = getpwnam ('_sigtree');
+    $sigtree_gid = getgrnam ('_sigtree');
+    if ($USERNAME ne 'root' || !defined ($sigtree_uid) || !defined ($sigtree_gid)) {
+	die "Cannot use privilege separation unless run as root and _sigtree user and group exist.\n";
+    }
+    # load required modules
+    require_module ('IO::FDPass')
+	or die "Could not require IO::FDPass. $@\n";
+    require_module ('Privileges::Drop')
+	or die "Could not require Privileges::Drop. $@\n";
+
+    # Try to load JSON (with fallback).
+    my $json_loaded = 0;
+    if (require_module ('JSON::MaybeXS', qw(encode_json decode_json))) {
+	$json_loaded = 1;
+    }
+    elsif (require_module ('JSON::PP', qw(encode_json decode_json))) {
+	$json_loaded = 1;
+    }
+
+    die "No JSON module available for privilege separation.\n" unless $json_loaded;
+}
+
 # If OpenBSD, use pledge and unveil.
 # This is occurring after config parsing but before all argument and
 # file validation, so it's not quite as narrowly specified as it could
@@ -660,9 +717,11 @@ if ($use_pgp) {
 # and could be more narrowly tailored for each based on need to access
 # all or a subset of trees or just what's in the sigtree root dir.
 if ($OSNAME eq 'openbsd') {
-    # fattr might not be necessary due to wpath; stdio is automatically
-    # included
-    pledge ('rpath', 'wpath', 'cpath', 'tmppath', 'fattr', 'exec', 'proc', 'flock', 'unveil') || die "Cannot pledge promises. $!\n";
+    # stdio is automatically included
+    pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
+	    @CHANGE_ATTR_PROMISES, @EXEC_PROMISES,
+	    @FLOCK_PROMISE, @UNVEIL_PROMISE) || die "Cannot pledge promises. $!\n";
+
     # Need rwc for sigtree files (and x for dirs). This doesn't work if $root_dir doesn't exist yet.
     unveil ($root_dir, 'rwxc');
     if (!-e $root_dir) {
@@ -714,20 +773,29 @@ if ($OSNAME eq 'openbsd') {
 }
 
 if ($ARGV[0] eq 'initialize') {
-    &initialize_sets ($config, $ALL, @sets);
+    initialize_sets ($config, $ALL, @sets);
 }
 elsif ($ARGV[0] eq 'initialize_specs') {
     die "The -s option cannot be used with initialize_specs.\n" if ($opts{'s'});
     die "The -f option cannot be used with initialize_specs.\n" if ($opts{'f'});
     $fork_children = 0;
-    &initialize_sets ($config, $SPECS_ONLY, @sets);
+    initialize_sets ($config, $SPECS_ONLY, @sets);
 }
 elsif ($ARGV[0] eq 'changes') {
     die "The -f option cannot be used with changes.\n" if ($opts{'f'});
-    &show_changes ($config, $no_macos_app_contents, @sets);
+    if ($^O eq 'openbsd') {
+	# Don't need anything else.
+	pledge (@READONLY_PROMISES) || die "Cannot pledge read-only promises. $!\n";
+    }
+    show_changes ($config, $no_macos_app_contents, @sets);
 }
 elsif ($ARGV[0] eq 'check') {
-    &check_sets ($config, $ALL, @sets);
+    if ($^O eq 'openbsd') {
+	# Don't need 'fattr' or 'unveil'.
+	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
+		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
+    }
+    check_sets ($config, $ALL, @sets);
 }
 elsif ($ARGV[0] eq 'check_file') {
     die "The -s option cannot be used with check_file.\n" if ($opts{'s'});
@@ -739,19 +807,45 @@ elsif ($ARGV[0] eq 'check_file') {
 	$file =~ s/^\.\///;
 	$file = $cwd . '/' . $file;
     }
-    &check_sets ($config, $SUBTREE_ONLY, $file);
+    if ($^O eq 'openbsd') {
+	# Don't need 'fattr' or 'unveil'.
+	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
+		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
+    }
+    check_sets ($config, $SUBTREE_ONLY, $file);
 }
 elsif ($ARGV[0] eq 'check_specs') {
     die "The -s option cannot be used with check_specs.\n" if ($opts{'s'});
     die "The -f option cannot be used with check_specs.\n" if ($opts{'f'});
-    &check_sets ($config, $SPECS_ONLY, @sets)
+    if ($^O eq 'openbsd') {
+	# Don't need 'fattr' or 'unveil'.
+	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
+		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
+    }
+    check_sets ($config, $SPECS_ONLY, @sets)
 }
 elsif ($ARGV[0] eq 'update') {
     die "The -f option cannot be used with update.\n" if ($opts{'f'});
-    &update_sets ($config, @sets);
+    update_sets ($config, @sets);
 }
 
 ### Subroutines.
+
+# Subroutine to assist in optional module importing.
+# (Also used in reportnew.)
+sub require_module {
+    my ($module, @imports) = @_;
+
+    if (!eval "require $module; 1") {
+        return 0;
+    }
+
+    if (@imports) {
+        $module->import (@imports);
+    }
+
+    return 1;
+}
 
 # Subroutine to initialize sets.  We initialize all trees that contain
 # any references to the sets specified--including exceptions that may
@@ -773,17 +867,17 @@ sub initialize_sets {
 	print "an inode change.  If you are at all uncertain, use the initialize\n";
 	print "command to re-initialize all of the specifications themselves.\n";
 
-	exit if (!&yes_or_no ('Proceed? '));
+	exit if (!yes_or_no ('Proceed? '));
 	
     }
 
-    &verify_required_dirs ($INITIALIZE);
+    verify_required_dirs ($INITIALIZE);
     
-    $pgp_passphrase = &get_pgp_passphrase if ($use_pgp);
+    $pgp_passphrase = get_pgp_passphrase() if ($use_pgp);
 
     # Remove any extraneous files from the specification directory.
     print "Removing extraneous files from specification dir.\n" if ($verbose);
-    &remove_extraneous_files ($config, $spec_dir_dir, $spec_dir, $verbose, $use_immutable);
+    remove_extraneous_files ($config, $spec_dir_dir, $spec_dir, $verbose, $use_immutable);
 
     if (!$specs_only) {
 	
@@ -848,14 +942,13 @@ sub initialize_sets {
 		$pm->start ($tree) and next;
 	    }
 	    
-	    $tree_spec_name = &path_to_spec ($tree);
+	    $tree_spec_name = path_to_spec ($tree);
 
 	    if ($use_immutable) {
-		&set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
-		&set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
-		&set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
+		set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
+		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
-		    &set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
+		    set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
 		}
 	    }
 	    if ($verbose) {
@@ -863,14 +956,14 @@ sub initialize_sets {
 		print ": start child" if ($fork_children);
 		print "\n";
 	    }
-	    &create_tree ($config, $TREE_ROOT, $tree, '.', '', "$spec_dir/$tree_spec_name");
+	    create_tree ($config, $TREE_ROOT, $tree, '.', '', "$spec_dir/$tree_spec_name");
 	    if ($use_pgp) {
-		&sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
+		sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
 	    }
 	    if ($use_immutable) {
-		&set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
 		if ($use_pgp) {
-		    &set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
+		    set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
 		}
 	    }
 
@@ -920,25 +1013,24 @@ sub initialize_sets {
 
     print "Initializing specification for specification dir.\n" if ($verbose);
     if ($use_immutable) {
-	&set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_OFF);
+	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_OFF);
 	if ($use_pgp) {
-	    &set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_OFF);
+	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_OFF);
 	}
     }
     # This must be done before the specification for the specification dir
     # is created, since changing flags involves inode modification.
     if ($use_immutable) {
-	&set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
-	&set_immutable_flag ($spec_dir_dir, $IMMUTABLE_ON);
+	set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
     }
-    &create_tree ($config, $TREE_ROOT, $spec_dir, '.', '', "$root_dir/$spec_spec");
+    create_tree ($config, $TREE_ROOT, $spec_dir, '.', '', "$root_dir/$spec_spec");
     if ($use_pgp) {
-	&sigtree_sign ("$root_dir/$spec_spec", $pgp_passphrase);
+	sigtree_sign ("$root_dir/$spec_spec", $pgp_passphrase);
     }
     if ($use_immutable) {
-	&set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_ON);
+	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_ON);
 	if ($use_pgp) {
-	    &set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_ON);
+	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_ON);
 	}
     }
 }
@@ -954,7 +1046,7 @@ sub create_tree {
     return if ($config->path_is_ignored ($tree, $path));
 
     if ($tree_root) {
-	if (!&writable_file ($spec_path)) {
+	if (!writable_file ($spec_path)) {
 	    print "Specification is not writable. Skipping. $spec_path\n";
 	    return;
 	}
@@ -969,7 +1061,7 @@ sub create_tree {
 	    if (!$tree_root) {
 		$full_path = $path . '/' . $file;
 	    }
-            &create_tree ($config, $SUBTREE, $tree, $full_path, $spec);
+            create_tree ($config, $SUBTREE, $tree, $full_path, $spec);
         }
     }
     if ($tree_root) {
@@ -1036,7 +1128,7 @@ sub show_changes {
     }
     elsif ($verbose) {
 	# Args are changedfile, verbose flag, write flag, no_macos_app_contents
-	&show_change_details ($changedfile, 0, 0, $no_macos_app_contents);
+	show_change_details ($changedfile, 0, 0, $no_macos_app_contents);
     }
 }
 
@@ -1058,7 +1150,7 @@ sub check_sets {
 
     $| = 1;
     
-    &verify_required_dirs ($CHECK);
+    verify_required_dirs ($CHECK);
 
     if ($specs_only == $SUBTREE_ONLY) {
 	$specs_only = 0;
@@ -1072,14 +1164,14 @@ sub check_sets {
     $changedfile->reset_changed_file;
 
     print "Checking for extraneous files in specification dir.\n" if ($verbose);
-    &display_extraneous_files ($config, $spec_dir, $verbose);
+    display_extraneous_files ($config, $spec_dir, $verbose);
 
     print "Checking to see if specification dir has changed.\n" if ($verbose);
     print "$spec_dir\n" if ($verbose);
     if ($use_pgp) {
-	&sigtree_verify ("$root_dir/$spec_spec");
+	sigtree_verify ("$root_dir/$spec_spec");
     }
-    &check_tree ($config, $TREE_ROOT, $spec_dir, '.', '', $changedfile, "$root_dir/$spec_spec");
+    check_tree ($config, $TREE_ROOT, $spec_dir, '.', '', $changedfile, "$root_dir/$spec_spec");
 
     print "\nChecking individual specifications." if ($verbose && !$specs_only);
     if ($subtree_only) {
@@ -1150,7 +1242,7 @@ sub check_sets {
 	    $changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
 	}
 	
-	$tree_spec_name = &path_to_spec ($tree);
+	$tree_spec_name = path_to_spec ($tree);
 	if (!-e "$spec_dir/$tree_spec_name") {
 	    print "\n" if ($verbose);
 	    print "Warning: Specification for tree $tree doesn't exist. You need to initialize it. Skipping.\n";
@@ -1165,10 +1257,10 @@ sub check_sets {
 	    }
 
 	    if ($use_pgp) {
-		&sigtree_verify ("$spec_dir/$tree_spec_name");
+		sigtree_verify ("$spec_dir/$tree_spec_name");
 	    }
 	    if (!$specs_only) {
-		&check_tree ($config, $TREE_ROOT, $tree, $path, '', $changedfile, "$spec_dir/$tree_spec_name");
+		check_tree ($config, $TREE_ROOT, $tree, $path, '', $changedfile, "$spec_dir/$tree_spec_name");
 		$changedfile->add_time ($tree);
 	    }
 	}
@@ -1190,7 +1282,7 @@ sub check_sets {
 	rmdir ($child_temp_dir);
     }
 
-    &show_change_details ($changedfile, $verbose, 1, $no_macos_app_contents);
+    show_change_details ($changedfile, $verbose, 1, $no_macos_app_contents);
 }
 
 # Subroutine to show details of the changed file.  Used by check and changes -v.
@@ -1319,7 +1411,7 @@ sub check_tree {
 	    if (!$tree_root) {
 	        $full_path = $path . '/' . $file;
             }
-            &check_tree ($config, $SUBTREE, $tree, $full_path, $spec, $changedfile);
+            check_tree ($config, $SUBTREE, $tree, $full_path, $spec, $changedfile);
 	}
     }
 
@@ -1329,7 +1421,7 @@ sub check_tree {
 	    if (!$tree_root) {
 	        $full_path = $path . '/' . $file;
             }
-            &check_tree ($config, $SUBTREE, $tree, $full_path, $spec, $changedfile);
+            check_tree ($config, $SUBTREE, $tree, $full_path, $spec, $changedfile);
         }
     }
 }
@@ -1348,7 +1440,7 @@ sub update_sets {
 	$keywords, $priority, %differences);
     my ($macos_OK_flag);
 
-    &verify_required_dirs ($UPDATE);
+    verify_required_dirs ($UPDATE);
 
     $changedfile = new ChangedFile ($changed_file);
 
@@ -1400,24 +1492,25 @@ sub update_sets {
     }
     die "Nothing changed in specified sets to update.\n" if (!$something_to_update);
 
-    $pgp_passphrase = &get_pgp_passphrase if ($use_pgp);
+    $pgp_passphrase = get_pgp_passphrase() if ($use_pgp);
 
     # Ugly hack, but it prevents a problem.
     @changed_trees = $changedfile->get_trees if ($removed_old_trees);
 
     foreach $tree (@changed_trees) {
-	$tree_spec_name = &path_to_spec ($tree);
+	$tree_spec_name = path_to_spec ($tree);
 	# Added $tree ne $spec_dir && so $spec_dir doesn't get treated as regular tree.
 	# $spec_dir is initialized separately below.
 	# This means changes to spec dir don't get updated, and they are in
 	# the changed_file. (But why wasn't it found above and handled?)
 	if ($tree ne $spec_dir && $config->tree_uses_sets ($tree, @sets)) {
 	    if ($use_immutable) {
-		&set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
-		&set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
-		&set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
+		# Keep unlocking $spec_dir_dir, but no longer lock it.
+		set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
+		set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
+		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
-		    &set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
+		    set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
 		}
 	    }
 	    if ($verbose &&
@@ -1486,12 +1579,12 @@ sub update_sets {
 	    $changedfile->delete_if_empty;
 
 	    if ($use_pgp) {
-		&sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
+		sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
 	    }
 	    if ($use_immutable) {
-		&set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
 		if ($use_pgp) {
-		    &set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
+		    set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
 		}
 	    }
 	}
@@ -1508,26 +1601,27 @@ sub update_sets {
     }
     print "Updating specification for specification dir.\n" if ($verbose);
     if ($use_immutable) {
-	&set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_OFF);
+	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_OFF);
 	if ($use_pgp) {
-	    &set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_OFF);
+	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_OFF);
 	}
     }
     # Update's the same as initialize in this respect.
     # This must be done before the specification for the specification dir
     # is created, since changing flags involves inode modification.
     if ($use_immutable) {
-	&set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
-	&set_immutable_flag ($spec_dir_dir, $IMMUTABLE_ON);
+	set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
+# Stop locking $spec_dir_dir.
+#	set_immutable_flag ($spec_dir_dir, $IMMUTABLE_ON);
     }
-    &create_tree ($config, $TREE_ROOT, $spec_dir, '', '', "$root_dir/$spec_spec");
+    create_tree ($config, $TREE_ROOT, $spec_dir, '', '', "$root_dir/$spec_spec");
     if ($use_pgp) {
-	&sigtree_sign ("$root_dir/$spec_spec", $pgp_passphrase);
+	sigtree_sign ("$root_dir/$spec_spec", $pgp_passphrase);
     }
     if ($use_immutable) {
-	&set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_ON);
+	set_immutable_flag ("$root_dir/$spec_spec", $IMMUTABLE_ON);
 	if ($use_pgp) {
-	    &set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_ON);
+	    set_immutable_flag ("$root_dir/$spec_spec.sig", $IMMUTABLE_ON);
 	}
     }
 }
@@ -1556,7 +1650,7 @@ sub update_sets {
 # those files are already set immutable, and so we abort if
 # the current secure level is too high.  It would be better to
 # actually check, but perl's stat/lstat don't return the BSD
-# file flags. [This is irrelevant, see &immutable_file sub!]
+# file flags. [This is irrelevant, see immutable_file sub!]
 # The same problem will exist for dirs, but in
 # those cases we'll just produce the "Operation not permitted"
 # error which will occur when we can't do what we need to do.
@@ -1626,20 +1720,22 @@ sub verify_required_dirs {
 	    # shortly be re-initializing the $spec_spec (and re-signing
 	    # it if PGP signatures are in use).  But if the directory
 	    # creation still fails, then we've created a problem.
+	    # UPDATE: Now leaving $spec_dir_dir mutable in all cases
+	    # going forward and putting the changed files and spec for
+	    # the specification dir in them. This also allows using
+	    # rsync to combine sigtree files from multiple hosts in one
+	    # directory and, in the future, to provide a way to check
+	    # remote hosts or check backups.
 	    if ($use_immutable) {
-		&set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
+		set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
 	    }
 
 	    if (!mkdir ($spec_dir, 0700)) {
-		if ($use_immutable) {
-		    &set_immutable_flag ($spec_dir_dir, $IMMUTABLE_ON);
-		}
 		die "$! $spec_dir\n";
 	    }
 	    else {
 		if ($use_immutable) {
-		    &set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
-		    &set_immutable_flag ($spec_dir_dir, $IMMUTABLE_ON);
+		    set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
 		}
 		print "Created host specification dir $spec_dir.\n";
 	    }
@@ -1703,7 +1799,7 @@ sub display_extraneous_files {
     my ($config, $spec_dir, $verbose) = @_;
     my (@extraneous_files, $file);
 
-    @extraneous_files = &_identify_extraneous_files ($config, $spec_dir);
+    @extraneous_files = _identify_extraneous_files ($config, $spec_dir);
     if ($#extraneous_files >= 0) {
 	print "The following extraneous files were found in the specification dir $spec_dir.\n";
 	foreach $file (@extraneous_files) {
@@ -1721,16 +1817,17 @@ sub remove_extraneous_files {
     my ($config, $spec_dir_dir, $spec_dir, $verbose, $use_immutable) = @_;
     my (@extraneous_files, $file);
 
-    @extraneous_files = &_identify_extraneous_files ($config, $spec_dir);
+    @extraneous_files = _identify_extraneous_files ($config, $spec_dir);
     if ($#extraneous_files >= 0) {
 	if ($use_immutable) {
-	    &set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
-	    &set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
+	    # Keep unlocking but don't re-lock it.
+	    set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
+	    set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
 	}
 
 	foreach $file (@extraneous_files) {
 	    if ($use_immutable) {
-		&set_immutable_flag ("$spec_dir/$file", $IMMUTABLE_OFF);
+		set_immutable_flag ("$spec_dir/$file", $IMMUTABLE_OFF);
 	    }
 	    if (unlink ("$spec_dir/$file")) {
 		print "$file removed.\n" if ($verbose);
@@ -1740,8 +1837,7 @@ sub remove_extraneous_files {
 	    }
 	}
 	if ($use_immutable) {
-	    &set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
-	    &set_immutable_flag ($spec_dir_dir, $IMMUTABLE_ON);
+	    set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
 	}
     }
     else {
@@ -1769,7 +1865,7 @@ sub _identify_extraneous_files {
 	foreach $file (@files) {
 	    $file_in_config = 0;
 	    foreach $tree (@trees) {
-		$tree_spec_name = &path_to_spec ($tree);
+		$tree_spec_name = path_to_spec ($tree);
 		$file_in_config = 1 if ($file eq $tree_spec_name ||
 					$file eq "$tree_spec_name.sig");
 	    } # trees (config) loop
@@ -1785,14 +1881,14 @@ sub writable_file {
     my ($file) = @_;
     my ($dir);
 
-    if (-w $file && ($SECURELEVEL == 0 || !&immutable_file ($file))) {
+    if (-w $file && ($SECURELEVEL == 0 || !immutable_file ($file))) {
 	return 1;
     }
     # If file doesn't exist, dir must be writable.  We don't
     # auto-create dirs, so this isn't a recursive function.
     elsif (!-e $file) {
 	$dir = File::Basename::dirname ($file);
-	if (-w $dir && ($SECURELEVEL == 0 || !&immutable_file ($dir))) {
+	if (-w $dir && ($SECURELEVEL == 0 || !immutable_file ($dir))) {
 	    return 1;
 	}
 	else {
@@ -1825,7 +1921,7 @@ sub immutable_file {
 	   (-e "$full_path") &&
 	   (!-l "$full_path") &&
 	   (!-c "$full_path") &&
-	   (!&_on_nonstd_fs ($full_path))) {
+	   (!_on_nonstd_fs ($full_path))) {
 	open (my $outfh, '-|', $LSATTR, $LSATTR_FLAGS_OPT, $full_path);
 	$flags = <$outfh>;
 	close ($outfh);
@@ -1922,7 +2018,7 @@ sub set_immutable_flag {
 	    system ($CHATTR, '-f', $flag, $path);
 	}
 
-	if (!$on && !&writable_file ($path)) {
+	if (!$on && !writable_file ($path)) {
 	    print "Unable to reset immutable flag on $path.\n";
 	    exit;
 	}
@@ -1956,7 +2052,7 @@ sub get_pgp_passphrase {
 	else {
 	    (my $fh, $temp_file) = tempfile ("/tmp/sigtree.XXXXXXXX");
 	}
-	&sigtree_pgp_sign ($temp_file, $pgp_passphrase); # can skip the wrapper
+	sigtree_pgp_sign ($temp_file, $pgp_passphrase); # can skip the wrapper
 	unlink ($temp_file);
 	unlink ("$temp_file.sig");
 	return ($pgp_passphrase);
@@ -1971,10 +2067,10 @@ sub sigtree_sign {
     my ($file, $pgp_passphrase) = @_;
 
     if ($use_signify) {
-	&sigtree_signify_sign ($file, $pgp_passphrase);
+	sigtree_signify_sign ($file, $pgp_passphrase);
     }
     else {
-	&sigtree_pgp_sign ($file, $pgp_passphrase);
+	sigtree_pgp_sign ($file, $pgp_passphrase);
     }
 }
 
@@ -1983,10 +2079,10 @@ sub sigtree_verify {
     my ($file) = @_;
 
     if ($use_signify) {
-	&sigtree_signify_verify ($file);
+	sigtree_signify_verify ($file);
     }
     else {
-	&sigtree_pgp_verify ($file);
+	sigtree_pgp_verify ($file);
     }
 }
 
@@ -2074,7 +2170,7 @@ sub sigtree_signify_sign {
 	return;
     }
 
-    @errors = &Signify::signify_error;
+    @errors = Signify::signify_error();
 
     if ($errors[0] =~ /^no readable file/) {
 	print "Could not read $file to create $PGP_or_GPG signature.\n";
@@ -2187,6 +2283,7 @@ sub new {
     $self->{SHA_DIGEST_BITS} = 0;
     $self->{MAX_CHILD_PROCS} = 0;
     $self->{DEFAULT_CHILD_PROCS} = 0;
+    $self->{PRIVSEP} = 0;
 
     bless $self, $class;
 
@@ -2350,7 +2447,20 @@ sub new {
 		    die "\"default_child_procs:\" field is set to a value higher than \"max_child_procs:\", line $line $config_file\nLine: $raw_line";
 		}	
 	    }
-	    
+	    elsif ($field eq 'privsep') {
+		if ($state != $GLOBAL_ATTRIBUTES) {
+		    die "A \"privsep:\" field is in the wrong section, line $line. $config_file\nLine: $raw_line";
+		}
+		if ($self->{PRIVSEP}) {
+		    die "A second \"privsep:\" field, line $line. $config_file\nLine: $raw_line";
+		}
+		if ($value eq 'yes' || $value eq 'no') {
+		    $self->{PRIVSEP} = $value;
+		}
+		else {
+		    die "\"privsep:\" field must be \"yes\" or \"no\", line $line. $config_file\nLine: $raw_line";
+		}
+	    }
 	    elsif ($field eq 'set') {
 		if ($state != $GLOBAL_ATTRIBUTES &&
 		    $state != $SET_DEFINITIONS) {
@@ -2487,7 +2597,7 @@ sub new {
 		$used_tree_paths{$path} = 1;
 
 		push (@{$self->{TREES}}, $path);
-		${$self->{TREE_SETS}}{$path} = &_set_array_to_set_list (@sets);
+		${$self->{TREE_SETS}}{$path} = _set_array_to_set_list (@sets);
 
                 $current_tree = $path;
 
@@ -2535,11 +2645,11 @@ sub new {
 
 		if ($field eq 'exception-tree') {
 		    $used_tree_exception_paths{"$current_tree/$path"} = 1;
-		    $self->{TREE_DIR_EXCEPTION_SETS}->{$current_tree}->{$path} = &_set_array_to_set_list (@sets);
+		    $self->{TREE_DIR_EXCEPTION_SETS}->{$current_tree}->{$path} = _set_array_to_set_list (@sets);
 		}
 		else {
 		    $used_exception_paths{"$current_tree/$path"} = 1;
-		    $self->{TREE_EXCEPTION_SETS}->{$current_tree}->{$path} = &_set_array_to_set_list (@sets);
+		    $self->{TREE_EXCEPTION_SETS}->{$current_tree}->{$path} = _set_array_to_set_list (@sets);
 		}
 		# Move the test for directory or existence here, after it's set up, so we can respect the "ignore" keyword.
 		if (!$self->path_is_ignored ($current_tree, $path)) {
@@ -2758,9 +2868,9 @@ sub add_new_set_to_uninitialized_trees {
     
     @trees = $config->all_trees;
     foreach $tree (@trees) {
-	$tree_spec_name = &path_to_spec ($tree);
+	$tree_spec_name = path_to_spec ($tree);
 	if (!-e "$spec_dir/$tree_spec_name") {
-	    &_add_set_to_tree ($tree, 'new');
+	    _add_set_to_tree ($tree, 'new');
 	}
     }
 }
@@ -2976,7 +3086,7 @@ sub new {
 	return $self;
     }
 
-    $self->{TYPE} = &_get_file_type ($full_path);
+    $self->{TYPE} = _get_file_type ($full_path);
 
     if (-l $full_path) {
 	$link_target = readlink ($full_path);
@@ -2993,11 +3103,13 @@ sub new {
 	    # Get actual target; if nonexistent, get best estimate.
 	    my $abs_link_target = abs_path ($link_target);
 	    if (!defined ($abs_link_target)) {
-		$abs_link_target = File::Spec->rel2abs ($link_target);
+		# Avoid use of cwd in File::Spec->rel2abs.
+		$base_dir = File::Basename::dirname ($full_path) if (!defined ($base_dir));
+		$abs_link_target = File::Spec->rel2abs ($link_target, $base_dir);
 	    }
 	    $link_target = $abs_link_target;
 	}
-	$self->{LINKTARGET_TYPE} = &_get_file_type ($link_target);
+	$self->{LINKTARGET_TYPE} = _get_file_type ($link_target);
 
 	$full_path = $link_target;
     }
@@ -3044,7 +3156,7 @@ sub new {
 	$self->{MTIME} = $mtime;
 	$self->{CTIME} = $ctime;
 
-	$self->{FLAGS} = &_get_file_flags ($full_path);
+	$self->{FLAGS} = _get_file_flags ($full_path);
     }
 
     bless $self, $class;
@@ -3121,7 +3233,7 @@ sub _get_file_flags {
     elsif (-e $CHATTR) { # Linux
 	if ((!-l $full_path) &&
 	    (!-c $full_path) &&
-	    (!&_on_nonstd_fs ($full_path))) {
+	    (!_on_nonstd_fs ($full_path))) {
 	    open (my $outfh, '-|', $LSATTR, $LSATTR_FLAGS_OPT, $full_path);
 	    $flags = <$outfh>;
 	    close ($outfh);
