@@ -465,7 +465,7 @@ else {
     $spec_dir_dir = $root_dir . '/specs';
 }
 if ($secondary_specs) {
-    $changed_file = $spec_dir . '/' . $HOSTNAME . '.changedsec';
+    $changed_file = $spec_dir_dir . '/' . $HOSTNAME . '.changedsec';
 }
 else {
     $changed_file = $spec_dir_dir . '/' . $HOSTNAME . '.changed';
