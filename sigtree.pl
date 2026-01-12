@@ -945,6 +945,8 @@ sub initialize_sets {
 	    $tree_spec_name = path_to_spec ($tree);
 
 	    if ($use_immutable) {
+		# Keep unlocking but do not re-lock.
+		set_immutable_flag ($spec_dir_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
