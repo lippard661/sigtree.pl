@@ -13,11 +13,14 @@ tree determines a numeric priority level and a set of attributes
 to be checked for changes.  The priority level is used for generating
 summary reports of changes; higher priority items are listed first.
 
-sigtree.pl uses pledge and unveil on OpenBSD.
+sigtree.pl uses pledge and unveil on OpenBSD, and can run with
+privilege separation if you create a _sigtree user and group and
+run it with -p or with "privsep: yes" in your config file.
 
 INSTALLATION
 
-sigtree.pl requires the following in order to work:
+sigtree.pl runs on OpenBSD, Linux (Debian/Proxmox), and macOS (at least),
+and requires the following in order to work:
 
 * Perl 5.
 * CPAN Perl modules Digest::SHA, Sys::Hostname, Getopt::Std, File::Basename,
@@ -26,6 +29,12 @@ sigtree.pl requires the following in order to work:
 * CPAN Perl module Digest::SHA3.
 * CPAN Perl module Parallel::ForkManager (1.19 w/OpenBSD or later).
 * On OpenBSD, uses OpenBSD::Pledge, OpenBSD::Unveil, and OpenBSD::MkTemp.
+* Privilege separation requires IO::Socket, IO::Handle, IO::Select,
+  IO::FDPass, Privileges::Drop, and either JSON::MaybeXS or JSON::PP.
+  Note that Privileges::Drop fails on macOS with the base perl installation
+  included with Tahoe 26, but works fine with the latest perl install with
+  Homebrew (or you can make a small patch to Privileges::Drop to make it
+  workaround a bug in perl 5.34.1).
 
 If signify signing is used (which is recommended), the following is also
 required:
@@ -36,7 +45,8 @@ required:
 If PGP signing is used, the following is also
 required:
 
-* PGP 5 or later, or GPG, or OpenBSD's signify, Signify.pm.
+* PGP 5 or later, or GPG, or OpenBSD's signify (or Linux's
+  openbsd-signify, or macOS's signify-osx), Signify.pm.
 * CPAN Perl module PGP::Sign (security/p5-PGP-Sign port in OpenBSD).
 * /bin/stty to turn off echoing when PGP passphrases are requested.
 
@@ -72,7 +82,9 @@ The Signify.pm perl module may be obtained from either
 The recommended location for sigtree.pl is in /usr/local/bin.  Sigtree
 configs go in /var/db/sigtree by default, but you can use any other
 location, so long as you specify that location with the -r (root dir)
-option to sigtree.pl.
+option to sigtree.pl. Sigtree-managed files are owned by root (even
+with privilege separation; the unprivileged _sigtree user does not
+have direct access).
 
 The default config file name is <hostname>.sigtree.conf in your root dir,
 but a different config file can be specified with the -c (config
@@ -89,6 +101,7 @@ lines in daily.local and weekly.local, respectively:
 
     host=`/bin/hostname -s`
     dayofweek=`/bin/date +"%a"'
+    changedfile="/var/db/sigtree/secondary/$host.changedsec"
     case $dayofweek in
         Wed) sigtreetest="daily,weekly"
 	     ;;
@@ -97,7 +110,7 @@ lines in daily.local and weekly.local, respectively:
     esac
     echo "Running sigtree $sigtreetest."
     /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest check | /usr/bin/mail -s "$sigtreetest $host secondary sigtree report" email-address
-    /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest update
+    test -f $changedfile && /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest update
 
 (For a weekly full test.)
 
@@ -126,9 +139,11 @@ Options:
 -s set list ("new" is synonymous with "uninitialized" and can be used with
              the "initialize" command; you can specify multiple sets
 	     separated by commas)
--v verbose
--f number of children to fork
+-f number of child processes (check, initialize)
 -m don't show macOS application contents (but still process them)
+-p use privilege separation
+-v verbose
+-V show version
 -h help and version
 Commands:
 initialize: Initialize specifications for a set of trees.
@@ -175,6 +190,7 @@ The global attributes section consists of the following:
     sha3_digest: 224|256|384|512
     max_child_procs: [default 5]
     default_child_procs: [default 4]
+    privsep: yes|no [default no]
 
 All of these fields may be omitted. If the pgpkeyid: alone is used,
 sigtree.pl will use GPG signatures on all specifications. It must

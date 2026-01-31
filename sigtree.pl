@@ -226,6 +226,22 @@
 # Modified 11 January 2026 by Jim Lippard to be more granular with pledge,
 #    stop locking the top specs dir ($spec_dir_dir), and move spec specs
 #    and changedfiles into specs and secondary.
+# Modified 18 January 2026 by Jim Lippard to move verify_required_dirs out
+#    of subroutines so it can occur before privilege separation, cleanup
+#    some option checking, and add PrivSep package.
+# Modified 24 January 2026 by Jim Lippard to add privileged parent code and
+#    modify immutable flag handling to work with privsep; fighting with Claude
+#    to properly update FileAttr for privilege separation without breaking anything.
+#    (Currently on revision 50 of Claude's designed changes and still finding
+#    errors and omissions.)
+# Modified 25-28 January 2026 by Jim Lippard, through version 83 of Claude
+#    design changes, some of which were really bad ideas that have been
+#    discarded (like passing entire file contents of specs and changed files
+#    through sockets instead of passing file handles).
+# Modified 29 January by Jim Lippard to replace Storable-based IPC
+#    protocol with JSON.
+# Modified 31 January by Jim Lippard to fix race condition in FD passing for Linux
+#    by modifying the protocol to force synchronization.
 
 ### Required packages.
 
@@ -254,6 +270,11 @@
 #   * /usr/bin/chattr (+i/-i)
 #   * /usr/bin/lsattr
 #   * /usr/bin/stat
+# If privilege separation is used:
+#   * JSON::MaybeXS or JSON::PP for IPC protocol
+#   * IO::Handle, IO::Select, IO::Socket
+#   * IO::FDPass
+#   * Privileges::Drop
 # Note that each of these dependencies is potentially a route that
 # could be exploited to subvert this program's intended function.
 #
@@ -273,6 +294,11 @@ use File::Basename;
 # File::Temp is much larger than OpenBSD::MkTemp.
 use if $^O ne "openbsd", "File::Temp", qw ( :mktemp tempfile );
 use Getopt::Std;
+# for privsep:
+#use IO::Handle;
+#use IO::Select;
+use IO::Socket;
+#use IO::Socket::UNIX; # not used unless reportnew subs are borrowed
 use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkstemp mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -308,7 +334,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.21c of 11 January 2026';
+my $VERSION = 'sigtree 1.22 of 30 January 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -347,6 +373,17 @@ my @CHANGE_ATTR_PROMISES = ('fattr');
 my @EXEC_PROMISES = ('exec', 'proc');
 my @FLOCK_PROMISE = ('flock');
 my @UNVEIL_PROMISE = ('unveil');
+my @PRIVSEP_PRIV_PROMISES = ('chown', 'sendfd');
+my @PRIVSEP_NONPRIV_PROMISES = ('recvfd');
+my @PRIVSEP_DROPPRIV_PROMISES = ('id', 'prot_exec');
+
+# Privsep global (not really constants).
+my @WORKER_SOCKETS; # Privileged parent array of child sockets.
+my $PRIVILEGED_PARENT_PID; # PID of privileged parent.
+our $MAIN_PRIV_SOCK; # Main socket to privileged parent from unprivileged process.
+my @ALLOWED_TREES; # List of trees privileged parent can access.
+our $use_privsep;  # Use privilege separation.
+our @EXISTING_SPECS; # Collected before privs dropped to replace !-e tests.
 
 # Return error codes for valid_setlist.
 my $SET_NAME_INVALID = 1;
@@ -388,36 +425,46 @@ my (%opts,         # Command line options.
     $command,      # Command to execute.
     $file,         # File to check (for check_file).
     $config_file,  # Config file to use.
-    $root_dir,     # Root dir to use.
-    $spec_dir_dir, # Directory containing specifications directories.
-    $spec_dir,     # Specifications dir to use.
-    $spec_spec,    # Specification for specifications dir.
-    $secondary_specs, # Are we using secondary specs? If so, no PGP/immutable.
-    $changed_file, # Changed specifications file to use.
-    $config,       # Config file object.
     $set,          # List of sets to use.
     @sets,         # List of sets being processed.
-    $fork_children,# number of children to fork.
-    $no_macos_app_contents, # don't show stuff that is inside an app directory.
     $arg_no,       # Used for returning error message on set list validation.
     $error,        # Ditto.
     $something_to_do, # Are any trees members of specified sets?
-    $use_pgp,      # If PGP, GPG, or signify should be used.
-    $use_signify,  # If signify should be used.
-    $signify_pubkey, # signify public key file.
-    $signify_seckey, # signify private key file.
-    $sigtree_uid,  # uid of _sigtree user.
-    $sigtree_gid,  # gid of _sigtree group.
-    $use_immutable,# If system immutable flags should be used.
-    $immutable_flag,# For BSD, which type of immutability to use.
-    $use_privsep,  # Use privilege separation.
-    $verbose,      # If we should be verbose.
+    $priv_flag,    # if running privileged.
+    $nonpriv_flag # if running nonprivileged.
+    );
+
+our ($root_dir,     # Root dir to use.
+     $spec_dir_dir, # Directory containing specifications directories.
+     $spec_dir,     # Specifications dir to use.
+     $spec_spec,    # Specification for specifications dir.
+     $secondary_specs, # Are we using secondary specs? If so, no PGP/immutable.
+     $changed_file, # Changed specifications file to use.
+     $config,       # Config file object.
+     $debug_flag,   # For debugging messages.
+     $fork_children,# number of children to fork.
+     $no_macos_app_contents, # don't show stuff that is inside an app directory.
+     $use_pgp,      # If PGP, GPG, or signify should be used.
+     $use_signify,  # If signify should be used.
+     $signify_pubkey, # signify public key file.
+     $signify_seckey, # signify private key file.
+     $sigtree_uid,  # uid of _sigtree user.
+     $sigtree_gid,  # gid of _sigtree group.
+     $use_immutable,# If system immutable flags should be used.
+     $immutable_flag,# For BSD, which type of immutability to use.
+     $verbose,      # If we should be verbose.
     );
 
 ### Main program.
 
+# Set umask.
+umask 077;
+
 # Get/set options.
-getopts ('r:c:s:d:f:vhmpV', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+getopts ('r:c:s:d:f:vhmpVD', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+
+# Debugging.
+$debug_flag = $opts{'D'} || 0;
 
 # -V must be alone.
 if ($opts{'V'}) {
@@ -509,14 +556,22 @@ if (!defined ($command) || ($command eq 'check_file' && $#ARGV != 1) ||
     die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
 }
 
-if ($ARGV[0] ne 'initialize' &&
-    $ARGV[0] ne 'initialize_specs' &&
-    $ARGV[0] ne 'changes' &&
-    $ARGV[0] ne 'check' &&
-    $ARGV[0] ne 'check_file' &&
-    $ARGV[0] ne 'check_specs' &&
-    $ARGV[0] ne 'update') {
-    die "Unknown command \"$ARGV[0]\".\n"
+# Additional option limits, and complain if not a known command.
+# No -s or -f.
+if ($command eq 'initialize_specs' ||
+    $command eq 'check_file' ||
+    $command eq 'check_specs') {
+    die "The -s option cannot be used with $command.\n" if ($opts{'s'});
+    die "The -f option cannot be used with $command.\n" if ($opts{'f'});
+}
+# No -f.
+elsif ($command eq 'changes' ||
+       $command eq 'update') {
+    die "The -f option cannot be used with $command.\n" if ($opts{'f'});
+}
+elsif ($command ne 'initialize' &&
+       $command ne 'check') {
+    die "Unknown command \"$command\".\n"
 }
 
 $config = new Config ($config_file);
@@ -692,21 +747,14 @@ if ($use_privsep) {
 	die "Cannot use privilege separation unless run as root and _sigtree user and group exist.\n";
     }
     # load required modules
+    require_module ('IO::Handle')
+	or die "Could not require IO::Handle. $@\n";
+    require_module ('IO::Select')
+	or die "Could not require IO::Select. $@\n";
     require_module ('IO::FDPass')
-	or die "Could not require IO::FDPass. $@\n";
+        or die "Could not require IO::FDPass. $@\n";
     require_module ('Privileges::Drop')
 	or die "Could not require Privileges::Drop. $@\n";
-
-    # Try to load JSON (with fallback).
-    my $json_loaded = 0;
-    if (require_module ('JSON::MaybeXS', qw(encode_json decode_json))) {
-	$json_loaded = 1;
-    }
-    elsif (require_module ('JSON::PP', qw(encode_json decode_json))) {
-	$json_loaded = 1;
-    }
-
-    die "No JSON module available for privilege separation.\n" unless $json_loaded;
 }
 
 # If OpenBSD, use pledge and unveil.
@@ -717,10 +765,13 @@ if ($use_privsep) {
 # and could be more narrowly tailored for each based on need to access
 # all or a subset of trees or just what's in the sigtree root dir.
 if ($OSNAME eq 'openbsd') {
+    my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
+		    @CHANGE_ATTR_PROMISES, @EXEC_PROMISES,
+		    @FLOCK_PROMISE, @UNVEIL_PROMISE);
+    push (@promises, @PRIVSEP_PRIV_PROMISES, @PRIVSEP_NONPRIV_PROMISES,
+	  @PRIVSEP_DROPPRIV_PROMISES) if ($use_privsep);
     # stdio is automatically included
-    pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
-	    @CHANGE_ATTR_PROMISES, @EXEC_PROMISES,
-	    @FLOCK_PROMISE, @UNVEIL_PROMISE) || die "Cannot pledge promises. $!\n";
+    pledge (@promises) || die "Cannot pledge initial promises. $!\n";
 
     # Need rwc for sigtree files (and x for dirs). This doesn't work if $root_dir doesn't exist yet.
     unveil ($root_dir, 'rwxc');
@@ -772,62 +823,133 @@ if ($OSNAME eq 'openbsd') {
     unveil ();
 }
 
-if ($ARGV[0] eq 'initialize') {
+# Some additional options checking, and now verify (and potentially create)
+# required directories before privilege separation. 'changes' will abort if
+# there's no changed file and doesn't do this check.
+if ($command eq 'initialize' ||
+    $command eq 'initialize_specs') {
+    verify_required_dirs ($INITIALIZE);
+
+    # Remove any extraneous files from the specification directory.
+    print "Removing extraneous files from specification dir.\n" if ($verbose);
+    remove_extraneous_files ($config, $spec_dir_dir, $spec_dir, $verbose, $use_immutable);
+}
+elsif ($command eq 'check' ||
+       $command eq 'check_file' ||
+       $command eq 'check_specs') {
+    verify_required_dirs ($CHECK);
+
+    # Check existence of file with check_file. But don't abort, as if
+    # it previously existed we'll report that in the check.
+    if ($command eq 'check_file') {
+	print "File does not exist. $file\n" if (!-e $file);
+	if ($file =~ /^\.\// || $file !~ /^\//) {
+	    require Cwd;
+	    my $cwd = Cwd::cwd();
+	    $file =~ s/^\.\///;
+	    $file = $cwd . '/' . $file;
+	}
+    }
+}
+elsif ($command eq 'update') {
+    verify_required_dirs ($UPDATE);
+}
+
+# Assemble list of existing specs prior to dropping privileges since file
+# test operators won't work with privilege separation.
+# Doing this AFTER any required dirs might have been created.
+if ($use_privsep) {
+    @EXISTING_SPECS = _identify_extraneous_files ($config, $spec_dir, 1);
+    push (@EXISTING_SPECS, $changed_file) if (-e $changed_file);
+}
+
+# Set $fork_children = 0 for commands that don't use it.
+$fork_children = 0 if ($command ne 'initialize' && $command ne 'check');
+
+# Privilege separation, part 2.
+if ($use_privsep) {
+    # Fork priv/nonpriv and re-do pledges accordingly.
+
+    # Build list of allowed trees for privileged parent.
+    @ALLOWED_TREES = $config->all_trees();
+    push (@ALLOWED_TREES, $spec_dir) if $spec_dir;
+    push (@ALLOWED_TREES, $root_dir) if $root_dir;
+
+    # Set up main privileged socket and worker sockets and fork
+    # between privileged parent and unprivileged child.
+    ($PRIVILEGED_PARENT_PID, my $worker_socks_ref, $MAIN_PRIV_SOCK) =
+	setup_privsep_per_worker ($fork_children);
+
+    @WORKER_SOCKETS = @$worker_socks_ref;
+
+    # At this point we're now an unprivileged child process.
+    # Re-pledge to remove @UNVEIL_PROMISE,
+    # @PRIVSEP_PRIV_PROMISES, and @PRIVSEP_DROPPRIV_PROMISES.
+    # Also removing @CHANGE_ATTR_PROMISES. Need @EXEC_PROMISES
+    # if using pgp for initialize and update operations.
+    if ($^O eq 'openbsd') {
+	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
+			@EXEC_PROMISES, @FLOCK_PROMISE,
+			@PRIVSEP_NONPRIV_PROMISES);
+	# stdio is automatically included
+	pledge (@promises) || die "Cannot pledge child nonpriv promises. $!\n";
+    }
+
+    # If no additional workers, FileAttr needs to use the main
+    # privileged socket instead of a worker one.
+    # FileAttr needs to use the main privileged socket when used
+    # from the unprivileged parent of the worker processes.
+    # Each worker will change this for themselves.
+    $FileAttr::PRIV_IPC = $MAIN_PRIV_SOCK;
+}
+
+if ($command eq 'initialize') {
     initialize_sets ($config, $ALL, @sets);
 }
-elsif ($ARGV[0] eq 'initialize_specs') {
-    die "The -s option cannot be used with initialize_specs.\n" if ($opts{'s'});
-    die "The -f option cannot be used with initialize_specs.\n" if ($opts{'f'});
-    $fork_children = 0;
+elsif ($command eq 'initialize_specs') {
     initialize_sets ($config, $SPECS_ONLY, @sets);
 }
-elsif ($ARGV[0] eq 'changes') {
-    die "The -f option cannot be used with changes.\n" if ($opts{'f'});
+elsif ($command eq 'changes') {
     if ($^O eq 'openbsd') {
-	# Don't need anything else.
-	pledge (@READONLY_PROMISES) || die "Cannot pledge read-only promises. $!\n";
+	# Now need special treatment with privsep.
+	my @promises = (@READONLY_PROMISES, @FLOCK_PROMISE);
+	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
+	pledge (@promises) || die "Cannot pledge read-only promises. $!\n";
     }
     show_changes ($config, $no_macos_app_contents, @sets);
 }
-elsif ($ARGV[0] eq 'check') {
+elsif ($command eq 'check') {
     if ($^O eq 'openbsd') {
-	# Don't need 'fattr' or 'unveil'.
-	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
-		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
+	# Don't need 'fattr' (@CHANGE_ATTR_PROMISES),
+	# or 'unveil' (@UNVEIL_PROMISE)
+	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
+			@EXEC_PROMISES, @FLOCK_PROMISE);
+	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
+	pledge (@promises) || die "Cannot pledge check promises. $!\n";
     }
     check_sets ($config, $ALL, @sets);
 }
-elsif ($ARGV[0] eq 'check_file') {
-    die "The -s option cannot be used with check_file.\n" if ($opts{'s'});
-    die "The -f option cannot be used with check_file.\n" if ($opts{'f'});
-    print "File does not exist. $file\n" if (!-e $file);
-    if ($file =~ /^\.\// || $file !~ /^\//) {
-	require Cwd;
-	my $cwd = Cwd::cwd();
-	$file =~ s/^\.\///;
-	$file = $cwd . '/' . $file;
-    }
+elsif ($command eq 'check_file') {
     if ($^O eq 'openbsd') {
-	# Don't need 'fattr' or 'unveil'.
-	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
-		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
+	# Don't need 'fattr' (@CHANGE_ATTR_PROMISES), 'unveil' (@UNVEIL_PROMISE).
+	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
+			@EXEC_PROMISES, @FLOCK_PROMISE);
+	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
+	pledge (@promises) || die "Cannot pledge check promises. $!\n";
     }
-    $fork_children = 0;
     check_sets ($config, $SUBTREE_ONLY, $file);
 }
-elsif ($ARGV[0] eq 'check_specs') {
-    die "The -s option cannot be used with check_specs.\n" if ($opts{'s'});
-    die "The -f option cannot be used with check_specs.\n" if ($opts{'f'});
+elsif ($command eq 'check_specs') {
     if ($^O eq 'openbsd') {
-	# Don't need 'fattr' or 'unveil'.
-	pledge (@READONLY_PROMISES, @READWRITE_PROMISES,
-		@EXEC_PROMISES, @FLOCK_PROMISE) || die "Cannot pledge check promises. $!\n";
+	# Don't need 'fattr' (@CHANGE_ATTR_PROMISES), 'unveil' (@UNVEIL_PROMISE),
+	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
+			@EXEC_PROMISES, @FLOCK_PROMISE);
+	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
+	pledge (@promises) || die "Cannot pledge check promises. $!\n";
     }
-    $fork_children = 0;
     check_sets ($config, $SPECS_ONLY, @sets)
 }
-elsif ($ARGV[0] eq 'update') {
-    die "The -f option cannot be used with update.\n" if ($opts{'f'});
+elsif ($command eq 'update') {
     update_sets ($config, @sets);
 }
 
@@ -873,19 +995,18 @@ sub initialize_sets {
 	
     }
 
-    verify_required_dirs ($INITIALIZE);
-    
     $pgp_passphrase = get_pgp_passphrase() if ($use_pgp);
 
-    # Remove any extraneous files from the specification directory.
-    print "Removing extraneous files from specification dir.\n" if ($verbose);
-    remove_extraneous_files ($config, $spec_dir_dir, $spec_dir, $verbose, $use_immutable);
-
     if (!$specs_only) {
-	
-	if (-e $changed_file) {
+
+	if ((!$use_privsep && -e $changed_file) ||
+	    ($use_privsep && grep { $_ eq $changed_file } @EXISTING_SPECS)) {
 	    $changed_file_exists = 1;
 	    $changedfile = new ChangedFile ($changed_file);
+	    unless ($changedfile) {
+		warn "Failed to load changed file, treating it as if it doesn't exist.\n";
+		$changed_file_exists = 0;
+	    }
 	    $changed_specs = $changedfile->tree_present ($spec_dir);
 	    if ($verbose) {
 		print "A changed file exists.  We will remove any trees we initialize from it.\n";
@@ -899,6 +1020,15 @@ sub initialize_sets {
 	# changed file any trees that are no longer in the config.
 	@trees = $config->all_trees;
 
+	foreach $tree (@trees) {
+	    push (@specified_trees, $tree) if ($config->tree_uses_sets ($tree, @sets));
+	}
+	# Don't fork unnecessarily.
+	if ($#specified_trees < $fork_children) {
+	    $fork_children = $#specified_trees;
+	    $fork_children = 0 if ($#specified_trees == 1);
+	}
+
 	# Split this up among children. This children will produce some
 	# output if verbose but don't need to coordinate with the parent
 	# like in check_sets.
@@ -910,12 +1040,11 @@ sub initialize_sets {
 					      $child_temp_dir);
 	}
 
-	foreach $tree (@trees) {
-	    push (@specified_trees, $tree) if ($config->tree_uses_sets ($tree, @sets));
-	}
-	
+	my $worker_id = 0;
 	foreach $tree (@specified_trees) {
 	    if ($fork_children) {
+		# Really only used for privsep.
+		my $current_worker_id = $worker_id++ % $fork_children;
 		$pm->run_on_finish (
 		    sub {
 			my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tree_ref) = @_;
@@ -942,11 +1071,30 @@ sub initialize_sets {
 		    );
 		
 		$pm->start ($tree) and next;
+
+		# In a new worker child process, switch the socket to
+		# the worker and close the others.
+		if ($use_privsep) {
+		    # Set socket we use.
+		    $FileAttr::PRIV_IPC = $WORKER_SOCKETS[$current_worker_id];
+		    # Close sockets we don't need.
+		    close $MAIN_PRIV_SOCK;
+		    for my $idx (0..$#WORKER_SOCKETS) {
+			close $WORKER_SOCKETS[$idx] if $idx != $current_worker_id;
+		    }
+		}
 	    }
 	    
 	    $tree_spec_name = path_to_spec ($tree);
 
-	    if ($use_immutable) {
+	    if ($use_privsep && $use_immutable) {
+		PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, $spec_dir, $IMMUTABLE_OFF);
+		PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
+		if ($use_pgp) {
+		    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
+		}
+	    }
+	    elsif ($use_immutable) {
 		set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
@@ -962,7 +1110,13 @@ sub initialize_sets {
 	    if ($use_pgp) {
 		sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
 	    }
-	    if ($use_immutable) {
+	    if ($use_privsep && $use_immutable) {
+		PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		if ($use_pgp) {
+		    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
+		}
+	    }
+	    elsif ($use_immutable) {
 		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
 		if ($use_pgp) {
 		    set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
@@ -1009,12 +1163,18 @@ sub initialize_sets {
 		$changedfile->delete ($tree) if (!grep (/^$tree$/, @trees));
 	    }
 	}
-	$changedfile->store_changedfile;
-	$changedfile->delete_if_empty;
+	$changedfile->store_changedfile();
+	$changedfile->delete_if_empty();
     }
 
     print "Initializing specification for specification dir.\n" if ($verbose);
-    if ($use_immutable) {
+    if ($use_privsep && $use_immutable) {
+	PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
+	if ($use_pgp) {
+	    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
+	}
+    }
+    elsif ($use_immutable) {
 	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
 	if ($use_pgp) {
 	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
@@ -1022,14 +1182,23 @@ sub initialize_sets {
     }
     # This must be done before the specification for the specification dir
     # is created, since changing flags involves inode modification.
-    if ($use_immutable) {
+    if ($use_privsep && $use_immutable) {
+	PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, $spec_dir, $IMMUTABLE_ON);
+    }
+    elsif ($use_immutable) {
 	set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
     }
     create_tree ($config, $TREE_ROOT, $spec_dir, '.', '', "$spec_dir_dir/$spec_spec");
     if ($use_pgp) {
 	sigtree_sign ("$spec_dir_dir/$spec_spec", $pgp_passphrase);
     }
-    if ($use_immutable) {
+    if ($use_privsep && $use_immutable) {
+	PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
+	if ($use_pgp) {
+	    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
+	}
+    }
+    elsif ($use_immutable) {
 	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
 	if ($use_pgp) {
 	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
@@ -1052,7 +1221,14 @@ sub create_tree {
 	    print "Specification is not writable. Skipping. $spec_path\n";
 	    return;
 	}
+	# With privsep, the actual writability will be determined when
+	# we try to open the spec, if it fails, request_open will return
+	# undef and we'll get an error there.
 	($spec, $fileattr) = new Spec ($tree);
+	unless ($spec && $fileattr) {
+	    print "Failed to load spec for $tree, skipping.\n";
+	    return;
+	}
     }
     else {
 	$fileattr = $spec->add ($tree, $path);
@@ -1077,11 +1253,15 @@ sub show_changes {
     my ($changedfile, $displayed_something, @changed_trees, $tree,
 	@times, @users, @paths, @attrs, $time, $user, $path, $attr);
 
-    if (!-e $changed_file) {
+    if ((!$use_privsep && !-e $changed_file) ||
+	($use_privsep && !grep { $_ eq $changed_file } @EXISTING_SPECS)) {
 	die "There is no changed file.\n";
     }
 
     $changedfile = new ChangedFile ($changed_file);
+    unless ($changedfile) {
+	die "Failed to load changed file: $changed_file\n";
+    }
 
     $displayed_something = 0;
 
@@ -1143,17 +1323,26 @@ sub show_changes {
 # that isn't in the sets, we still check its subtree because it may
 # have some other exceptions in its subtree that are in the specified
 # sets (we only make note of/do actual comparisons on such exceptions).
+#
+# I think this is still accurate with modifications to reduce the
+# number of trees checked, and is the opposite of what is suggested
+# in the comments in the sample config file.
+#
+# The original intention was that sets with only descriptions were
+# intended for use with -s and sets with keywords were intended for
+# identifying attributes to check and for exceptions, but not for use with
+# -s. They do in fact work with -s, and now if you use -s root, it
+# will only check /root.
 sub check_sets {
     my ($config, $specs_only, @sets) = @_;
-    my ($subtree_only, $changedfile, @trees, $tree, $quoted_tree, $tree_spec_name,
+    my ($subtree_only, $changedfile, @specified_trees,
+	@trees, $tree, $quoted_tree, $tree_spec_name,
 	@changed_sets, $set, $priority, $keywords, $description, $path);
     # used for Parallel::ForkManager
     my ($pm, $child_temp_dir, $child_temp_file, $child_changedfile);
 
     $| = 1;
     
-    verify_required_dirs ($CHECK);
-
     if ($specs_only == $SUBTREE_ONLY) {
 	$specs_only = 0;
 	$subtree_only = 1;
@@ -1161,6 +1350,9 @@ sub check_sets {
     }
 
     $changedfile = new ChangedFile ($changed_file);
+    unless ($changed_file) {
+	die "Failed to load changed file: $changed_file\n";
+    }
 
     # Clear the current contents of the changed file.
     $changedfile->reset_changed_file;
@@ -1198,6 +1390,16 @@ sub check_sets {
 	$path = '.';
     }
 
+    # Make check behave like initialize.
+    foreach $tree (@trees) {
+	push (@specified_trees, $tree) if ($config->tree_uses_sets ($tree, @sets));
+    }
+    # Don't fork unnecessarily.
+    if ($#specified_trees < $fork_children) {
+	$fork_children = $#specified_trees;
+	$fork_children = 0 if ($#specified_trees == 1);
+    }
+
     if ($fork_children) {
 	# create $child_temp_dir with mktemp
 	$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
@@ -1206,9 +1408,12 @@ sub check_sets {
 					     $child_temp_dir);
     }
 
-    foreach $tree (@trees) {
-	
+    my $worker_id = 0;
+    foreach $tree (@specified_trees) {
 	if ($fork_children) {
+	    # Really only used for privsep.
+	    my $current_worker_id = $worker_id++ % $fork_children;
+	    print "DEBUG: [MAIN] worker ID: $worker_id, cwID: $current_worker_id\n" if ($main::debug_flag);
 	    $pm->run_on_finish (
 		sub {
 		    my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tempfile_ref) = @_;
@@ -1217,8 +1422,13 @@ sub check_sets {
 			$child_temp_file = ${$tempfile_ref};
 			# Retrieve from stored.
 			$child_changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
-			# Merge into main one.
-			$changedfile->merge ($child_changedfile);
+			if ($child_changedfile) {
+			    # Merge into main one.
+			    $changedfile->merge ($child_changedfile);
+			}
+			else {
+			    warn "Failed to load child changed file: $child_temp_dir/$child_temp_file\n";
+			}
 			# Remove the file.
 			unlink ("$child_temp_dir/$child_temp_file");
 		    }
@@ -1231,6 +1441,18 @@ sub check_sets {
 		);
 	    
 	    $pm->start ($tree) and next;
+
+	    # In a new worker child process, switch the socket to
+	    # the worker and close the others.	    
+	    if ($use_privsep) {
+		# Set socket we use.
+		$FileAttr::PRIV_IPC = $WORKER_SOCKETS[$current_worker_id];
+		# Close sockets we don't need.
+		close $MAIN_PRIV_SOCK;
+		for my $idx (0..$#WORKER_SOCKETS) {
+		    close $WORKER_SOCKETS[$idx] if $idx != $current_worker_id;
+		}
+	    }
 	    
 	    # Create unique $child_temp_file in $child_temp_dir.
 	    if ($^O eq 'openbsd') {
@@ -1242,10 +1464,14 @@ sub check_sets {
 	    $child_temp_file = File::Basename::basename ($child_temp_file);
 	    # Use temp file for location of changedfile.
 	    $changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
+	    unless ($changedfile) {
+		die "Failed to create temp changed file in child: $child_temp_dir/$child_temp_file\n";
+	    }
 	}
 	
 	$tree_spec_name = path_to_spec ($tree);
-	if (!-e "$spec_dir/$tree_spec_name") {
+	if ((!$use_privsep && !-e "$spec_dir/$tree_spec_name") ||
+	    ($use_privsep && !grep { $_ eq $tree_spec_name } @EXISTING_SPECS)) {
 	    print "\n" if ($verbose);
 	    print "Warning: Specification for tree $tree doesn't exist. You need to initialize it. Skipping.\n";
 	}
@@ -1300,7 +1526,12 @@ sub show_change_details {
     if ($total_changes == 0 && $total_additions == 0 && $total_deletions == 0) {
 	print "\n" if ($verbose);
 	print "No changes found.\n";
-	$changedfile->delete_if_empty if ($write_flag);
+	# Only if it previously existed and is empty; the new changes haven't been
+	# stored yet.
+	$changedfile->delete_if_empty if ($write_flag &&
+					  ((!$use_privsep && -e $changed_file) ||
+					   ($use_privsep &&
+					    grep { $_ eq $changed_file } @EXISTING_SPECS)));
     }
     else {
 	print "\n" if ($verbose);
@@ -1366,6 +1597,10 @@ sub check_tree {
 
     if ($tree_root) {
 	($spec, $fileattr) = new Spec ($tree, $spec_path);
+	unless ($spec && $fileattr) {
+	    print "Failed to load spec for $tree, skipping.\n";
+	    return;
+	}
 	if ($verbose) {
 	    ($host, $time, $user) = $spec->get_info;
 	    $time = localtime ($time);
@@ -1442,9 +1677,10 @@ sub update_sets {
 	$keywords, $priority, %differences);
     my ($macos_OK_flag);
 
-    verify_required_dirs ($UPDATE);
-
     $changedfile = new ChangedFile ($changed_file);
+    unless ($changedfile) {
+	die "Failed to load changed file: $changed_file\n";
+    }
 
     @changed_trees = $changedfile->get_trees;
     $something_to_update = 0;
@@ -1471,12 +1707,8 @@ sub update_sets {
 	    #	    return;
 	    print "Will attempt to update all changed trees.\n";
 	    $something_to_update = 1;
-	    # Need to remove the spec dir from the list.
-	    $changedfile->delete($tree);
-	    # Save changes (deletions).
-	    $changedfile->store_changedfile;
-	    # And delete the changed file if it's now empty.
-	    $changedfile->delete_if_empty;
+	    # Need to remove the spec dir from the list, but do it after other changes,
+	    # not here.
 	}
 	elsif (!grep (/^$tree$/, @config_trees)) {
 	    print "Warning: changed file contains tree \"$tree\" which is not in config. Removing from changed file.\n";
@@ -1506,7 +1738,14 @@ sub update_sets {
 	# This means changes to spec dir don't get updated, and they are in
 	# the changed_file. (But why wasn't it found above and handled?)
 	if ($tree ne $spec_dir && $config->tree_uses_sets ($tree, @sets)) {
-	    if ($use_immutable) {
+	    if ($use_privsep && $use_immutable) {
+		PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, $spec_dir, $IMMUTABLE_OFF);
+		PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
+		if ($use_pgp) {
+		    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
+		}
+	    }
+	    elsif ($use_immutable) {
 		set_immutable_flag ($spec_dir, $IMMUTABLE_OFF);
 		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
@@ -1527,7 +1766,11 @@ sub update_sets {
 	    }
 
 	    ($spec, $fileattr) = new Spec ($tree, "$spec_dir/$tree_spec_name");
-
+	    unless ($spec && $fileattr) {
+		print "Failed to load spec for $tree, skipping.\n";
+		return;
+	    }
+	    
 	    @changed_paths = $changedfile->get_paths ($tree);
 	    foreach $changed_path (@changed_paths) {
 		if ($changed_path eq '.') {
@@ -1581,7 +1824,13 @@ sub update_sets {
 	    if ($use_pgp) {
 		sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
 	    }
-	    if ($use_immutable) {
+	    if ($use_privsep && $use_immutable) {
+		PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		if ($use_pgp) {
+		    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
+		}
+	    }
+	    elsif ($use_immutable) {
 		set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
 		if ($use_pgp) {
 		    set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
@@ -1591,16 +1840,26 @@ sub update_sets {
     }
     # This will always get hit if there are changes to the spec_dir, since
     # we skipped it above.
-    if (-e $changed_file) {
+    if ((!$use_privsep && -e $changed_file) ||
+	($use_privsep && grep { $_ eq $changed_file } @EXISTING_SPECS)) {	
 	@changed_trees = $changedfile->get_trees;
-	if ($verbose) {
+	# Filter out spec_dir.
+	@changed_trees = grep { $_ ne $spec_dir } @changed_trees;
+	
+	if ($verbose && @changed_trees) {
 	    print "There are still changed files in other sets to be updated.\n";
 	    print "Trees remaining:\n";
 	    print "@changed_trees\n";
 	}
     }
     print "Updating specification for specification dir.\n" if ($verbose);
-    if ($use_immutable) {
+    if ($use_privsep && $use_immutable) {
+	PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
+	if ($use_pgp) {
+	    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
+	}
+    }
+    elsif ($use_immutable) {
 	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
 	if ($use_pgp) {
 	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
@@ -1609,18 +1868,35 @@ sub update_sets {
     # Update's the same as initialize in this respect.
     # This must be done before the specification for the specification dir
     # is created, since changing flags involves inode modification.
-    if ($use_immutable) {
+    if ($use_privsep && $use_immutable) {
+	PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, $spec_dir, $IMMUTABLE_ON);
+    }
+    elsif ($use_immutable) {
 	set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
     }
     create_tree ($config, $TREE_ROOT, $spec_dir, '', '', "$spec_dir_dir/$spec_spec");
     if ($use_pgp) {
 	sigtree_sign ("$spec_dir_dir/$spec_spec", $pgp_passphrase);
     }
-    if ($use_immutable) {
+    if ($use_privsep && $use_immutable) {
+	PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
+	if ($use_pgp) {
+	    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
+	}
+    }
+    elsif ($use_immutable) {
 	set_immutable_flag ("$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
 	if ($use_pgp) {
 	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
 	}
+    }
+
+    if ($changedfile->tree_present ($spec_dir)) {
+	$changedfile->delete($spec_dir);
+	# Save changes (deletions).
+	$changedfile->store_changedfile;
+	# And delete the changed file if it's now empty.
+	$changedfile->delete_if_empty;
     }
 }
 
@@ -1679,10 +1955,8 @@ sub verify_required_dirs {
     elsif (!-r $root_dir) {
 	die "Root dir is not readable. $root_dir\n";
     }
-    elsif ($caller != $CHECK && !-w $root_dir) {
-	die "Root dir is not writable. $root_dir\n";
-    }
-
+    # No longer check for whether $root_dir is writeable since we don't
+    # put files directly there anymore.
     if (!-e $spec_dir_dir) {
 	if ($caller == $INITIALIZE) {
 	    if (!mkdir ($spec_dir_dir, 0700)) {
@@ -1690,6 +1964,8 @@ sub verify_required_dirs {
 	    }
 	    else {
 		print "Created main specification dir $spec_dir_dir.\n";
+		chown (0, 0, $spec_dir_dir);
+		chmod (0700, $spec_dir_dir)
 	    }
 	}
 	else {
@@ -1732,10 +2008,12 @@ sub verify_required_dirs {
 		die "$! $spec_dir\n";
 	    }
 	    else {
+		print "Created host specification dir $spec_dir.\n";
+		chown (0, 0, $spec_dir);
+		chmod (0700, $spec_dir);
 		if ($use_immutable) {
 		    set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
 		}
-		print "Created host specification dir $spec_dir.\n";
 	    }
 	}
 	else {
@@ -1842,11 +2120,14 @@ sub remove_extraneous_files {
 }
 
 # Subroutine to identify files in the specification dir that
-# are not in the configuration.
+# are not in the configuration. (Or conversely with the
+# nonextranous flag.)
 sub _identify_extraneous_files {
-    my ($config, $spec_dir) = @_;
+    my ($config, $spec_dir, $nonextraneous) = @_;
     my (@files, $file, @trees, $tree, $tree_spec_name,
 	$file_in_config, @extraneous_files);
+
+    $nonextraneous = 0 if (!defined ($nonextraneous));
 
     # While this code *could* look at the specification for the specification
     # dir, instead of reading out the files, that would be a historical
@@ -1865,7 +2146,7 @@ sub _identify_extraneous_files {
 		$file_in_config = 1 if ($file eq $tree_spec_name ||
 					$file eq "$tree_spec_name.sig");
 	    } # trees (config) loop
-	    push (@extraneous_files, $file) if (!$file_in_config);
+	    push (@extraneous_files, $file) if (!$file_in_config ^ $nonextraneous);
 	} # files (spec_dir) loop
 	return (@extraneous_files);
     } # can read dir
@@ -1876,6 +2157,10 @@ sub _identify_extraneous_files {
 sub writable_file {
     my ($file) = @_;
     my ($dir);
+
+    # If using privilege separation, skip the check and just return error
+    # on failure of priv open for write.
+    return 1 if ($use_privsep);
 
     if (-w $file && ($SECURELEVEL == 0 || !immutable_file ($file))) {
 	return 1;
@@ -1897,58 +2182,30 @@ sub writable_file {
 }
 
 # Subroutine to determine if a file is immutable.
-# Code borrowed from _get_file_flags in FileAttr method. [Perhaps
-# in some earlier version, there's now less resemblance.]
+# Now uses _get_file_flags in FileAttr method directly.
+# Could use privs if necessary on that call, but shouldn't
+# be.
 sub immutable_file {
     my ($full_path) = @_;
     my ($flags, $perms, $nlinks, $uid, $gid, $file);
 
-    if ((-e $CHFLAGS) && (-e "$full_path")) {
-	open (my $outfh, '-|', $LIST_FLAGS_CMD, $LIST_FLAGS_OPT, $full_path);
-	$flags = <$outfh>;
-	close ($outfh);
-	chomp ($flags) if (defined ($flags));
-	($perms, $nlinks, $uid, $gid, $flags) = split (/\s+/, $flags);
-	if ($flags =~ /$BSD_SYS_IMMUTABLE_FLAG/ || $flags =~ /$BSD_USER_IMMUTABLE_FLAG/) {
-	    return 1;
-	}
+    $flags = FileAttr::_get_file_flags ($full_path);
+
+    return 0 if ($flags eq '<undefined>' ||
+		 $flags eq 'none');
+
+    if ((-e $CHFLAGS) &&
+	($flags =~ /$BSD_SYS_IMMUTABLE_FLAG/ ||
+	 $flags =~ /$BSD_USER_IMMUTABLE_FLAG/)) {
+	return 1;
     }
     elsif ((-e $LSATTR) &&
-	   (-e "$full_path") &&
-	   (!-l "$full_path") &&
-	   (!-c "$full_path") &&
-	   (!_on_nonstd_fs ($full_path))) {
-	open (my $outfh, '-|', $LSATTR, $LSATTR_FLAGS_OPT, $full_path);
-	$flags = <$outfh>;
-	close ($outfh);
-	chomp ($flags) if (defined ($flags));
-	($flags) = split (/\s+/, $flags);
-	if ($flags =~ /i/) {
-	    return 1;
-	}
+	   $flags =~ /i/) {
+	return 1;
     }
 
     # If immutable flags aren't supported or aren't found.
     return 0;
-}
-
-# Subroutine to tell if a file is on a fuse or msdos filesystem (where
-# Linux lsattr won't work). (This code is in two places, with
-# immutable_file and with _get_file_flags in the FileAttr module,
-# keep them consistent.)
-sub _on_nonstd_fs {
-    my ($file) = @_;
-    my $fs_type;
-
-    open (my $outfh, '-|', $STAT, '-f', '-c', '%T', $file);
-    $fs_type = <$outfh>;
-    close ($outfh);
-    chomp ($fs_type) if (defined ($fs_type));
-    return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
-		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
-		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc' ||
-		 $fs_type eq 'devpts');
-#    return 1 if ($fs_type ne 'ext2/ext3');
 }
 
 # Subroutine to ask a yes or no question.
@@ -2062,7 +2319,13 @@ sub get_pgp_passphrase {
 sub sigtree_sign {
     my ($file, $pgp_passphrase) = @_;
 
-    if ($use_signify) {
+    if ($use_privsep) {
+	PrivSep::request_sign_file ($MAIN_PRIV_SOCK,
+				    $file, $pgp_passphrase,
+				    $use_signify,
+				    $signify_seckey);
+    }
+    elsif ($use_signify) {
 	sigtree_signify_sign ($file, $pgp_passphrase);
     }
     else {
@@ -2074,7 +2337,13 @@ sub sigtree_sign {
 sub sigtree_verify {
     my ($file) = @_;
 
-    if ($use_signify) {
+    if ($use_privsep) {
+	PrivSep::request_verify_signature ($MAIN_PRIV_SOCK,
+					   $file,
+					   $use_signify,
+					   $signify_pubkey);
+    }
+    elsif ($use_signify) {
 	sigtree_signify_verify ($file);
     }
     else {
@@ -2224,8 +2493,486 @@ sub path_to_spec {
     return ($string);
 }
 
+### Privilege separation subroutines (main program, also see separate PrivSep package below).
+
+###############################################################################
+# PRIVILEGE SEPARATION SETUP
+###############################################################################
+sub setup_privsep_per_worker {
+    my ($num_workers) = @_;
+    
+    # We need to create socketpairs BEFORE forking privileged parent
+    # Create one for each worker PLUS one for main unprivileged parent
+    my @parent_socks;
+    my @worker_socks;
+    my ($main_parent_sock, $main_worker_sock);
+    
+    # Main process socket (for managing spec files, immutable flags, etc.)
+    socketpair($main_parent_sock, $main_worker_sock,
+              AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or die "socketpair for main: $!";
+    
+    $main_parent_sock->autoflush(1);
+    $main_worker_sock->autoflush(1);
+    
+    # Worker sockets (for file scanning) - only if needed
+    if ($num_workers > 0) {
+	for my $i (0..$num_workers-1) {
+	    socketpair(my $parent_sock, my $worker_sock,
+		       AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+		or die "socketpair $i: $!";
+        
+	    $parent_sock->autoflush(1);
+	    $worker_sock->autoflush(1);
+        
+	    push @parent_socks, $parent_sock;
+	    push @worker_socks, $worker_sock;
+	}
+    }
+    
+    # Fork the privileged parent
+    my $priv_pid = fork();
+    die "fork privileged parent: $!" unless defined $priv_pid;
+    
+    if ($priv_pid == 0) {
+        # PRIVILEGED PARENT PROCESS
+        # This process stays as root
+        
+        # Close worker ends (we don't need them)
+        close $main_worker_sock;
+        close $_ for @worker_socks;
+
+	if ($^O eq 'openbsd') {
+	    # Re-pledge, removing @UNVEIL_PROMISE, @PRIVSEP_NONPRIV_PROMISES,
+	    # and @PRIVSEP_DROPPRIV_PROMISES.
+	    my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
+			    @CHANGE_ATTR_PROMISES, @EXEC_PROMISES,
+			    @FLOCK_PROMISE, @PRIVSEP_PRIV_PROMISES);
+	    # stdio is automatically included
+	    # If command is "changes", the privileged parent is still needed
+	    # but can be read-only--no need to write files, change attributes,
+	    # flock, or execute external commands.
+	    if ($command eq 'changes') {
+		@promises = (@READONLY_PROMISES, @PRIVSEP_PRIV_PROMISES);
+	    }
+	    
+	    pledge (@promises) || die "Cannot pledge privileged parent promises. $!\n";
+	}
+        
+        # Run privileged request handler with all parent sockets
+        privileged_parent_multiplex ($main_parent_sock, @parent_socks);
+        
+        # Should never get here unless all workers exit
+        exit 0;
+    }
+    
+    # MAIN PROCESS (will drop privileges)
+    # Close parent ends (we don't need them)
+    close $main_parent_sock;
+    close $_ for @parent_socks;
+
+    # Drop privileges NOW.
+    # Will fail on macOS with perl 5.34.1 unless patched.
+    Privileges::Drop::drop_uidgid ($sigtree_uid, $sigtree_gid);
+    
+    # Return privileged parent PID, worker sockets, and main socket
+    return ($priv_pid, \@worker_socks, $main_worker_sock);
+}
+
+# Subroutine for privileged parent.
+sub privileged_parent_multiplex {
+    my (@socks) = @_;
+    
+    print "DEBUG: [PRIVILEGED PARENT] Starting with " . scalar(@socks) . " channels\n" if ($main::debug_flag);
+    print "DEBUG: [PRIVILEGED PARENT] (1 main + " . (scalar(@socks)-1) . " workers)\n" if ($main::debug_flag);
+    
+    my $select = IO::Select->new(@socks);
+    my $request_count = 0;
+    
+    # Main loop: wait for requests from any worker
+    while (my @ready = $select->can_read()) {
+        
+        for my $sock (@ready) {
+            my $request = PrivSep::recv_request($sock);
+            
+            if (!$request) {
+                # Worker closed its socket (exited)
+                print "[PRIVILEGED PARENT] Channel disconnected\n" if ($main::debug_flag);
+                $select->remove($sock);
+                close $sock;
+                next;
+            }
+            
+            $request_count++;
+
+            # Handle the privileged request
+            my $response = handle_privileged_request($request);
+
+	    # If response includes a filehandle, take it and delete
+	    # it from the response.
+	    my ($response_filehandle, $response_fd_to_send);
+	    $response_fd_to_send = undef;
+	    if ($response->{_filehandle}) {
+		$response_filehandle = $response->{_filehandle};
+		$response_fd_to_send = $response->{_fd_to_send};
+		delete $response->{_filehandle};
+		delete $response->{_fd_to_send};
+	    }
+            
+            # Send response back to the SAME socket
+            PrivSep::send_response($sock, $response);
+            
+            # If response includes a file descriptor to send, send it now
+            if (defined $response_fd_to_send) {
+		# Wait for child to acknowledge it's ready to receive FD
+		# (unnecessary for OpenBSD, required for Linux).
+		warn "[DEBUG] [PRIVILEGED PARENT] Waiting for ACK before sending FD\n" if ($main::debug_flag);
+		my $ack_buf;
+		my $n = read ($sock, $ack_buf, 3);
+
+		unless ($n == 3 && $ack_buf eq 'ACK') {
+		    warn "[PRIVILEGED PARENT] Failed to receive ACK for FD transfer (got '$ack_buf', $n bytes)\n";
+		    close $response_filehandle;
+		    next;
+		}
+
+		# Now send the FD
+                IO::FDPass::send(fileno($sock), $response_fd_to_send);
+                
+                # Close our copy of the filehandle (child now has it)
+                close $response_filehandle;
+            }
+        }
+        
+        # Exit when all workers have disconnected
+        last unless $select->count();
+    }
+    
+    print "DEBUG: [PRIVILEGED PARENT] Handled $request_count requests. Exiting.\n" if ($main::debug_flag);
+}
+
+sub handle_privileged_request {
+    my ($request) = @_;
+    
+    my $type = $request->{type};
+    my $path = $request->{path};
+
+    my @TREE_REQUESTS = ('OPEN', 'STAT', 'READDIR', 'READLINK',
+			 'IMMUTABLE_GET');
+    my @SIGTREE_FILE_REQUESTS = ('IMMUTABLE_SET', 'DELETE_FILE',
+				 'SIGN_FILE', 'VERIFY_SIGNATURE');
+
+    print "DEBUG: [PRIVILEGED PARENT] Received request $type $path\n" if ($main::debug_flag);
+
+    # Validate path for all tree requests OR sigtree file requests.
+    if (grep { $_ eq $type } @TREE_REQUESTS) {
+	unless (is_allowed_path($path)) {	   
+	    return { error => "Path not in allowed trees: $path" };
+	}
+    }
+
+    # Validate path for all sigtree file requests.
+    if (grep { $_ eq $type } @SIGTREE_FILE_REQUESTS) {
+	unless (is_sigtree_managed_file($path)) {
+	    return { error => "Not a sigtree-managed file: $path" };
+	}
+    }
+    
+    if ($type eq 'OPEN') {
+        return handle_open_request($request);
+    }
+    elsif ($type eq 'STAT') {
+        return handle_stat_request($request);
+    }
+    elsif ($type eq 'READDIR') {
+        return handle_readdir_request($request);
+    }
+    elsif ($type eq 'READLINK') {
+        return handle_readlink_request($request);
+    }
+    elsif ($type eq 'IMMUTABLE_GET') {
+        return handle_immutable_get_request($request);
+    }
+    elsif ($type eq 'IMMUTABLE_SET') {
+        return handle_immutable_set_request($request);
+    }
+    elsif ($type eq 'DELETE_FILE') {
+        return handle_delete_file_request($request);
+    }
+    elsif ($type eq 'SIGN_FILE') {
+        return handle_sign_file_request($request);
+    }
+    elsif ($type eq 'VERIFY_SIGNATURE') {
+        return handle_verify_signature_request($request);
+    }
+    else {
+        return { error => "Unknown request type: $type" };
+    }
+}
+
+# Privileged read for any file in trees or sigtree-managed files,
+# write for sigtree-managed files
+sub handle_open_request {
+    my ($request) = @_;
+    my ($fh);
+    my $path = $request->{path};
+    my $mode = $request->{mode} || '<'; # Default to read
+
+    # Validate mode
+    unless ($mode eq '<' || $mode eq '>') {
+	return { error => "Invalid mode: $mode (only '<' or '>' allowed)" };
+    }
+
+    # For write mode, validate it's a sigtree-managed file
+    if ($mode eq '>') {
+	unless (is_sigtree_managed_file($path)) {
+	    return { error => "Not a sigtree-managed file: $path" };
+	}
+    }
+    
+    # Open file as root
+    unless (open($fh, $mode, $path)) {
+        return { error => "$! ($path)" };
+    }
+    
+    # Get the file descriptor number
+    my $fd = fileno($fh);
+    # IMPORTANT: We don't include the filehandle in the response
+    # because Storable can't serialize it. We just return success
+    # and send the FD separately after the response.
+    return { 
+        success => 1,
+        _fd_to_send => $fd,
+        _filehandle => $fh,  # Keep handle alive, but won't be serialized
+    };
+}
+
+sub handle_stat_request {
+    my ($request) = @_;
+    my $path = $request->{path};
+    
+    my @stat = lstat($path);
+    
+    unless (@stat) {
+        return { error => "$! ($path)" };
+    }
+    
+    return {
+        success => 1,
+        dev => $stat[0],
+        ino => $stat[1],
+        mode => $stat[2],
+        nlink => $stat[3],
+        uid => $stat[4],
+        gid => $stat[5],
+        rdev => $stat[6],
+        size => $stat[7],
+        atime => $stat[8],
+        mtime => $stat[9],
+        ctime => $stat[10],
+        blksize => $stat[11],
+        blocks => $stat[12],
+    };
+}
+
+sub handle_readdir_request {
+    my ($request) = @_;
+    my ($dh);
+    my $path = $request->{path};
+    
+    unless (opendir($dh, $path)) {
+        return { error => "$! ($path)" };
+    }
+    
+    my @entries = grep { !/^\.\.?$/ } readdir($dh);
+    closedir $dh;
+    
+    return {
+        success => 1,
+        entries => \@entries
+    };
+}
+
+sub handle_readlink_request {
+    my ($request) = @_;
+    my $path = $request->{path};
+    
+    my $target = readlink($path);
+
+    unless (defined $target) {
+        return { error => "$! ($path)" };
+    }
+
+    # Canonicalize while we have privileges.
+    my $canonical_target = FileAttr::_canonicalize_link_target ($path, $target);
+
+    # Get link target file type.
+    my @stat = stat ($canonical_target);
+    my $mode = $stat[2];
+    my $linktarget_type = FileAttr::_get_file_type ($mode);
+    
+    return {
+        success => 1,
+        target => $canonical_target,
+	target_type => $linktarget_type
+    };
+}
+
+# Claude wrote this to use immutable_file, which returns 1 or 0,
+# instead of what is actually needed, which is getting the
+# actual file flags string.
+sub handle_immutable_get_request {
+    my ($request) = @_;
+    my $path = $request->{path};
+    
+    my $file_flags = FileAttr::_get_file_flags ($path, 0);
+    
+    return {
+        success => 1,
+        flags => $file_flags
+    };
+}
+
+sub handle_immutable_set_request {
+    my ($request) = @_;
+    my $path = $request->{path};
+    my $immutable = $request->{immutable};
+    
+    # Call existing set_immutable_flag function
+    set_immutable_flag($path, $immutable);
+    
+    return { success => 1 };
+}
+
+sub handle_delete_file_request {
+    my ($request) = @_;
+    my $path = $request->{path};
+    
+    unless (unlink($path)) {
+        return { error => "Cannot delete: $! ($path)" };
+    }
+    
+    return { success => 1 };
+}
+
+sub handle_sign_file_request {
+    my ($request) = @_;
+    my $file = $request->{path};
+    my $pgp_passphrase = $request->{passphrase};
+    my $use_signify = $request->{use_signify};
+    my $signify_seckey = $request->{signify_seckey};
+    
+    # Call the appropriate signing function
+    eval {
+        if ($use_signify) {
+            main::sigtree_signify_sign($file, $pgp_passphrase, $signify_seckey);
+        } else {
+            main::sigtree_pgp_sign($file, $pgp_passphrase);
+        }
+    };
+    
+    if ($@) {
+        return { error => "Signing failed: $@" };
+    }
+    
+    # Ensure .sig file is root-owned
+    my $sig_file = "$file.sig";
+    if (-e $sig_file) {
+        chown(0, 0, $sig_file);
+    }
+    
+    return { success => 1 };
+}
+
+sub handle_verify_signature_request {
+    my ($request) = @_;
+    my $file = $request->{path};
+    my $use_signify = $request->{use_signify};
+    my $signify_pubkey = $request->{signify_pubkey};
+    
+    # Call the appropriate verification function
+    my $result;
+    eval {
+        if ($use_signify) {
+            $result = main::sigtree_signify_verify($file, $signify_pubkey);
+        } else {
+            $result = main::sigtree_pgp_verify($file);
+        }
+    };
+    
+    if ($@) {
+        return { error => "Verification failed: $@" };
+    }
+    
+    return { 
+        success => 1,
+        verified => $result,
+    };
+}
+
+sub is_sigtree_managed_file {
+    my ($path) = @_;
+    
+    # Only allow writes to:
+    # - Spec files in $spec_dir (per-host)
+    # - Spec spec file in $spec_dir_dir
+    # - Changed files in $spec_dir_dir (*.changed, *.changedsec)
+    # - NOT arbitrary files in $root_dir (no longer used for changed files)
+    
+    # Check if path is in spec_dir (per-host specs)
+    if (defined $spec_dir) {
+        return 1 if $path =~ m{^\Q$spec_dir\E/};
+        return 1 if $path eq $spec_dir;
+    }
+    
+    # Check if path is in spec_dir_dir (shared parent for multi-host)
+    if (defined $spec_dir_dir) {
+        # Allow the directory itself
+        return 1 if $path eq $spec_dir_dir;
+        
+        # Allow spec spec file (e.g., hostname.spec(sec) in spec_dir_dir)
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.spec$};
+	return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.specsec$};
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.sig$};
+        
+        # Allow changed files in spec_dir_dir
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changed$};
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changedsec$};
+    }
+    
+    # Also explicitly check for the spec files
+    if (defined ($spec_dir)) {
+	return 1 if $path =~ m{^\Q$spec_dir\E/.*\.spec$};
+	return 1 if $path =~ m{^\Q$spec_dir\E/.*\.sig$};
+    }
+    
+    return 0;
+}
+
+# Is it in the configured trees OR in the sigtree files?
+sub is_allowed_path {
+    my ($path) = @_;
+    
+    # Path must be absolute
+    return 0 unless $path =~ m{^/};
+    
+    # Check against configured trees (loaded from config)
+    # Get this from the global $config object
+    # Note: This function runs in privileged parent, so it needs
+    # access to the tree list. Pass it during setup.
+    
+    for my $tree (@ALLOWED_TREES) {
+        return 1 if $path =~ m{^\Q$tree\E(/|$)};
+    }
+    
+    return 0;
+}
+
+### END Privilege separation subroutines (main program, also see separate PrivSep package below).
 
 ### Config package.
+
+# Runs privileged and would require some changes to run unprivileged.
 
 # Methods to handle config file object.
 package Config;
@@ -3009,7 +3756,7 @@ sub primary_set_for_path {
     my $self = shift;
     my $class = ref ($self) || $self;
     my ($tree, $path) = @_;
-    my ($path_set_list);
+    my ($path_set_list, @sets);
 
     # If it's in the root dir, it's in the sigtree set.
     # This is special-cased because the root dir and spec dirs can't be
@@ -3048,23 +3795,494 @@ sub tree_for_path {
 
 ### End Config package.
 
+### PrivSep package.
+# Subroutines for privilege separation, so most of sigtree.pl can run
+# under nonprivileged user and group _sigtree, with required privileged
+# operations run as root.
+# Some of these subroutines, as noted, are directly duplicated from
+# reportnew.
+#
+###############################################################################
+# IPC PROTOCOL (LENGTH-PREFIXED MESSAGES)
+# These are generic functions used by both main process and FileAttr
+###############################################################################
+package PrivSep;
+
+# Try to load JSON (with fallback)
+my $json_loaded = 0;
+BEGIN {
+    if (eval { require JSON::MaybeXS; JSON::MaybeXS->import(qw(encode_json decode_json)); 1 }) {
+        $json_loaded = 1;
+    }
+    elsif (eval { require JSON::PP; JSON::PP->import(qw(encode_json decode_json)); 1 }) {
+        $json_loaded = 1;
+    }
+    else {
+        die "No JSON module available (need JSON::MaybeXS or JSON::PP)\n";
+    }
+}
+
+# Subroutine to send request from nonprivileged to privileged side.
+sub send_request {
+    my ($sock, $request) = @_;
+
+    print "DEBUG: [UNPRIV] Sending $request->{type} $request->{path}\n" if ($main::debug_flag);    
+    my $json = encode_json($request);
+    my $len = pack('N', length($json));
+    
+    # Write length + data atomically
+    print $sock $len . $json;
+    $sock->flush();
+}
+
+# Subroutine to receive a request on the privileged side.
+sub recv_request {
+    my ($sock) = @_;
+    my $MAX_REQUEST_LENGTH = 1024 * 1024;
+    # Previously was 10MB (10_000_000)
+    
+    # Read 4-byte length
+    my $len_packed;
+    my $bytes_read = read($sock, $len_packed, 4);
+    
+    return undef unless $bytes_read == 4;
+    
+    my $len = unpack('N', $len_packed);
+    
+    # Sanity check
+    return undef if $len > $MAX_REQUEST_LENGTH;  # 10MB max
+    
+    # Read data
+    my $json = '';
+    while (length($json) < $len) {
+        my $chunk;
+        my $remaining = $len - length($json);
+        my $n = read($sock, $chunk, $remaining);
+        
+        return undef unless $n > 0;
+        $json .= $chunk;
+    }
+    
+    my $request = eval { decode_json($json) };
+    if ($@) {
+        warn "JSON decode error in recv_request: $@\n";
+        return undef;
+    }
+    
+    return $request;
+}
+
+# Subroutine to send a response from the privileged side.
+sub send_response {
+    my ($sock, $response) = @_;
+
+    my $json = encode_json($response);
+    my $len = pack('N', length($json));
+    
+    print $sock $len . $json;
+    $sock->flush();
+}
+
+# Subroutine to receive a response on the nonprivileged side.
+sub recv_response {
+    my ($sock) = @_;
+    my $MAX_REQUEST_LENGTH = 1024 * 1024;
+    
+    # Read 4-byte length
+    my $len_packed;
+    my $bytes_read = read($sock, $len_packed, 4);
+    
+    return undef unless $bytes_read == 4;
+    
+    my $len = unpack('N', $len_packed);
+    return undef if $len > $MAX_REQUEST_LENGTH;
+    
+    # Read data
+    my $json = '';
+    while (length($json) < $len) {
+        my $chunk;
+        my $remaining = $len - length($json);
+        my $n = read($sock, $chunk, $remaining);
+        
+        return undef unless $n > 0;
+        $json .= $chunk;
+    }
+    
+    my $response = eval { decode_json($json) };
+    if ($@) {
+        warn "JSON decode error in recv_response: $@\n";
+        return undef;
+    }
+    
+    return $response;
+}
+
+###############################################################################
+# HIGH-LEVEL REQUEST FUNCTIONS
+# These can be called from anywhere with appropriate socket
+###############################################################################
+
+sub request_stat {
+    my ($sock, $path) = @_;
+    
+    my $request = {
+        type => 'STAT',
+        path => $path,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        warn "Privileged stat failed: $response->{error}\n";
+        return ();
+    }
+    
+    return (
+        $response->{dev},
+        $response->{ino},
+        $response->{mode},
+        $response->{nlink},
+        $response->{uid},
+        $response->{gid},
+        $response->{rdev},
+        $response->{size},
+        $response->{atime},
+        $response->{mtime},
+        $response->{ctime},
+        $response->{blksize},
+        $response->{blocks},
+    );
+}
+
+# Request a privileged file open.
+sub request_open {
+    my ($sock, $path, $mode) = @_;
+    $mode //= '<'; # Default to read
+    
+    my $request = {
+        type => 'OPEN',
+        path => $path,
+	mode => $mode,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+	if ($mode eq '>') {
+	    warn "Cannot write to $path: $response->{error}\n";
+	}
+	else {
+	    warn "Privileged open failed: $response->{error}\n";
+	}
+	return undef;
+    }
+
+    # Explicit for Linux.
+    if ($response->{success}) {
+	warn "DEBUG: Sending ACK for FD transfer\n" if ($main::debug_flag);
+	# Send ACK to tell parent we're ready to receive FD (needed for Linux).
+	print $sock "ACK";
+	$sock->flush();
+	
+	# Now receive file descriptor from privileged parent
+	my $fd = IO::FDPass::recv(fileno($sock));
+    
+	if (!defined $fd || $fd < 0) {
+	    warn "Failed to receive file descriptor for $path\n";
+	    return undef;
+	}
+    
+	# Convert file descriptor to Perl filehandle
+	# Use appropriate mode for fdopen
+	my $fdopen_mode = $mode eq '>' ? '>&=' : '<&=';
+	open(my $fh, $fdopen_mode, $fd) or do {
+	    warn "Failed to fdopen received descriptor: $!\n";
+	    require POSIX;
+	    POSIX::close($fd); # Clean up orphaned fd.
+	    return undef;
+	};
+    
+	return $fh;
+    }
+
+    # Neither success nor error.
+    die "Protocol error: OPEN response has neither success nor error.\n";
+}
+
+sub request_readdir {
+    my ($sock, $path) = @_;
+    
+    my $request = {
+        type => 'READDIR',
+        path => $path,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        warn "Privileged readdir failed: $response->{error}\n";
+        return [];
+    }
+    
+    return $response->{entries};
+}
+
+sub request_readlink {
+    my ($sock, $path) = @_;
+    
+    my $request = {
+        type => 'READLINK',
+        path => $path,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        warn "Privileged readlink failed: $response->{error}\n";
+        return undef;
+    }
+    
+    return ($response->{target}, $response->{target_type});;
+}
+
+sub request_immutable_get {
+    my ($sock, $path) = @_;
+    
+    my $request = {
+        type => 'IMMUTABLE_GET',
+        path => $path,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        warn "Privileged immutable check failed: $response->{error}\n";
+        return undef;
+    }
+    
+    return $response->{flags};
+}
+
+sub request_immutable_set {
+    my ($sock, $path, $immutable) = @_;
+    
+    my $request = {
+        type => 'IMMUTABLE_SET',
+        path => $path,
+        immutable => $immutable,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        die "Failed to set immutable flag on $path: $response->{error}\n";
+    }
+    
+    return 1;
+}
+
+sub request_write_file {
+    my ($sock, $path, $content, $mode) = @_;
+    
+    my $request = {
+        type => 'WRITE_FILE',
+        path => $path,
+        content => $content,
+        mode => $mode,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        die "Failed to write file $path: $response->{error}\n";
+    }
+    
+    return 1;
+}
+
+sub request_read_file {
+    my ($sock, $path) = @_;
+    
+    my $request = {
+        type => 'READ_FILE',
+        path => $path,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        warn "Failed to read file $path: $response->{error}\n";
+        return undef;
+    }
+    
+    return $response->{content};
+}
+
+sub request_delete_file {
+    my ($sock, $path) = @_;
+    
+    my $request = {
+        type => 'DELETE_FILE',
+        path => $path,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        warn "Failed to delete file $path: $response->{error}\n";
+        return 0;
+    }
+    
+    return 1;
+}
+
+sub request_sign_file {
+    my ($sock, $file, $pgp_passphrase, $use_signify, $signify_seckey) = @_;
+    
+    my $request = {
+        type => 'SIGN_FILE',
+        path => $file,
+        passphrase => $pgp_passphrase,
+        use_signify => $use_signify,
+        signify_seckey => $signify_seckey,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        die "Failed to sign file $file: $response->{error}\n";
+    }
+    
+    return 1;
+}
+
+sub request_verify_signature {
+    my ($sock, $file, $use_signify, $signify_pubkey) = @_;
+    
+    my $request = {
+        type => 'VERIFY_SIGNATURE',
+        path => $file,
+        use_signify => $use_signify,
+        signify_pubkey => $signify_pubkey,
+    };
+    
+    send_request($sock, $request);
+    my $response = recv_response($sock);
+    
+    if ($response->{error}) {
+        warn "Failed to verify signature for $file: $response->{error}\n";
+        return 0;
+    }
+    
+    return $response->{verified};
+}
+
+1;
+### End PrivSep package.
+
 ### FileAttr package.
 
 # Methods to get information about an individual file, compare
 # a file's attributes against an existing spec, etc.
 package FileAttr;
 
-use Cwd qw( abs_path );
+use Cwd qw( abs_path ); # used in _canonicalize_link_target
+use Errno qw( EACCES EPERM );
+use Fcntl ':mode'; # For S_IRUSR, S_IRGRP, S_IROTH, etc.
+use File::Basename;
 use File::Spec;
 
+our $PRIV_IPC;
+our %DIR_ACCESS_CACHE;
+
+## Subroutines for privilege separation. Written by Claude.
+
+# Check if mode bits allow world read
+sub is_world_readable {
+    my ($mode) = @_;
+    return ($mode & S_IROTH) ? 1 : 0;
+}
+
+# Check if mode bits allow world execute (for directories)
+sub is_world_executable {
+    my ($mode) = @_;
+    return ($mode & S_IXOTH) ? 1 : 0;
+}
+
+# Check if we can access parent directory unprivileged
+# Returns: (can_access, parent_mode)
+sub can_access_parent_unprivileged {
+    my ($path) = @_;
+    
+    my $dir = dirname($path);
+    
+    # Check cache first. Cache is not updated; permissions could change
+    # during run.
+    if (exists $DIR_ACCESS_CACHE{$dir}) {
+        return ($DIR_ACCESS_CACHE{$dir}, undef);
+    }
+    
+    # Try to stat parent directory unprivileged
+    my @parent_stat = lstat($dir);
+    
+    if (!@parent_stat) {
+        # Can't stat parent unprivileged - need privileges
+        $DIR_ACCESS_CACHE{$dir} = 0;
+        return (0, undef);
+    }
+    
+    my $parent_mode = $parent_stat[2];
+    
+    # Check if parent is world-accessible (read + execute for directories)
+    if (!is_world_readable($parent_mode) || !is_world_executable($parent_mode)) {
+        $DIR_ACCESS_CACHE{$dir} = 0;
+        return (0, $parent_mode);
+    }
+    
+    $DIR_ACCESS_CACHE{$dir} = 1;
+    return (1, $parent_mode);
+}
+
+# Check if we (as unprivileged user) can read this path
+# For files: need world read AND parent directory accessible
+# For directories: need world read AND execute AND parent accessible
+sub can_access_unprivileged {
+    my ($path, $mode, $is_dir) = @_;
+
+    # Check the immediate path permissions
+    if ($is_dir) {
+        return 0 unless is_world_readable($mode) && is_world_executable($mode);
+    } else {
+        return 0 unless is_world_readable($mode);
+    }
+    
+    # Also need to check parent directory permissions
+    my ($parent_accessible, $parent_mode) = can_access_parent_unprivileged($path);
+    return $parent_accessible;
+}
+
+## END Subroutines for privilege separation.
+
 # Method to create a new FileAttr record.
+# $special means it doesn't exist (either an old file deleted
+# or a new file created).
 sub new {
     my $class = shift;
     my ($tree, $path, $sha_digest, $special) = @_;
     my ($sha_version, $sha_bits);
     my ($full_path, $base_dir, $link_target, $self, $ctx, $digest,
-	$dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size,
-	$atime, $mtime, $ctime, $blksize, $blocks, $flags);
+	$flags);
+    my ($parent_accessible, $parent_mode, @stat, $stat_failed);
 
     $self->{TREE} = $tree;
     if ($path eq '.') {
@@ -3082,128 +4300,375 @@ sub new {
 	return $self;
     }
 
-    $self->{TYPE} = _get_file_type ($full_path);
+    ($parent_accessible, $parent_mode) = can_access_parent_unprivileged ($full_path);
 
-    if (-l $full_path) {
-	$link_target = readlink ($full_path);
+    $stat_failed = 0;
+
+    # stat directly if not using privilege separation.
+    if (!$main::use_privsep) {
+	@stat = lstat ($full_path);
+	$stat_failed = 1 unless @stat;
+    }
+    elsif ($parent_accessible) {
+	# Parent is accessible, try to stat unprivileged.
+	@stat = lstat ($full_path);
+
+	if (!@stat && ($! == EACCES || $! == EPERM)) {
+	    # Unexpected - parent is accessible but we can't stat.
+	    # Fall back to privileged.
+	    @stat = PrivSep::request_stat ($PRIV_IPC, $full_path);
+	    $stat_failed = 1 unless @stat;
+	}
+	elsif (!@stat) {
+	    # Other error (likely ENDENT - file doesn't exist)
+	    $stat_failed = 1;
+	}
+    }
+    else {
+	# Parent not accessible, must use privileged stat.
+	@stat = PrivSep::request_stat ($PRIV_IPC, $full_path);
+	$stat_failed = 1 unless @stat;
+    }
+
+    if ($stat_failed) {
+	# File doesn't exist - mark as nonexistent.
+	$self->{TYPE} = 'nonexistent';
+	bless $self, $class;
+	return $self;
+    }
+
+    # Populate $self with stat info.
+#    $self->{DEV} = $stat[0]; # unused
+#    $self->{INO} = $stat[1]; # unused
+    $self->{MODE} = $stat[2];
+    $self->{NLINK} = $stat[3];
+    $self->{UID} = $stat[4];
+    $self->{GID} = $stat[5];
+#    $self->{RDEV} = $stat[6]; # unused
+    $self->{SIZE} = $stat[7];
+#    $self->{ATIME} = $stat[8]; # unused
+    $self->{MTIME} = $stat[9];
+    $self->{CTIME} = $stat[10];
+#    $self->{BLKSIZE} = $stat[11]; # unused
+#    $self->{BLOCKS} = $stat[12]; # unused
+
+    my $mode = $stat[2];
+
+    # Now we know the mode bits - use them to decide if we need privileges for reading
+    # file content (even if we could stat it).
+    # If privsep is disabled, we never "need" privileges.
+    my $need_priv = $main::use_privsep && !can_access_unprivileged ($full_path, $mode, S_ISDIR ($mode));
+
+    # Determine file type and get type-specific data.
+    $self->{TYPE} = _get_file_type ($mode);
+    
+    if ($self->{TYPE} eq 'file') {
+	# Get SHA digest if requested.
+	if ($sha_digest) {
+	    $self->{SHADIGEST} = _get_sha_digest ($full_path, $sha_digest, $need_priv);
+	}
+    }
+    elsif ($self->{TYPE} eq 'dir') {
+	# Get directory contents.
+	$self->{FILES} = _get_dir_contents ($full_path, $need_priv);
+    }
+    elsif ($self->{TYPE} eq 'link') {
+	# Claude has lost $self->{LINKTARGET_TYPE} which could require privs.
+	# (and could be another link)
+	my ($link_target, $linktarget_type) = _get_link_target ($full_path, $need_priv);
+
+	# Canonicalize target to absolute path. Done in privileged parent
+	# if privsep is enabled, or locally if disabled.
+	if (!$main::use_privsep && defined ($link_target)) {
+	    # Without privsep we have full access and canonicalize here.
+	    $link_target = _canonicalize_link_target ($full_path, $link_target);
+	    $linktarget_type = _get_local_linktarget_type ($link_target);
+	}
+	# With privsep, the privileged parent already canonicalized it and
+	# returned the link target type.
 	$self->{LINK} = $link_target;
-
-	# Need absolute path to be able to obtain other information about the
-	# target.
-	if (substr ($link_target, 0, 1) ne '/') {
-	    # Basedir could be a directory within $tree, not $tree itself.
-	    $base_dir = File::Basename::dirname ($full_path);
-	    $link_target = File::Spec->catfile ($base_dir, $link_target);
-	}
-	if ($link_target =~ /\.\./) {
-	    # Get actual target; if nonexistent, get best estimate.
-	    my $abs_link_target = abs_path ($link_target);
-	    if (!defined ($abs_link_target)) {
-		# Avoid use of cwd in File::Spec->rel2abs.
-		$base_dir = File::Basename::dirname ($full_path) if (!defined ($base_dir));
-		$abs_link_target = File::Spec->rel2abs ($link_target, $base_dir);
-	    }
-	    $link_target = $abs_link_target;
-	}
-	$self->{LINKTARGET_TYPE} = _get_file_type ($link_target);
-
-	$full_path = $link_target;
+	$self->{LINKTARGET_TYPE} = $linktarget_type;
     }
 
-    if (-e $full_path) {
-	if (-f $full_path) {
-	    if ($sha_digest =~ /-/) {
-		($sha_version, $sha_bits) = split (/-/, $sha_digest);
-		if (open (FILE, '<', $full_path)) {
-		    if ($sha_version == 2) {
-			$ctx = Digest::SHA->new($sha_bits);
-		    }
-		    elsif ($sha_version == 3) {
-			$ctx = Digest::SHA3->new($sha_bits);
-		    }
-		    else {
-			die "Internal error: SHA version unknown. $sha_version";
-		    }
-		    $ctx->addfile(*FILE);
-		    $digest = $ctx->hexdigest;
-		    $self->{SHADIGEST} = $digest if (defined ($digest));
-		    close (FILE);
-		}
-	    }
-	    else {
-		    $self->{SHADIGEST} = '<undefined>';
-	    }
-	}
-	elsif (-d $full_path) {
-	    if (opendir (DIR, $full_path)) {
-		@{$self->{FILES}} = grep (!/^\.{1,2}$/, readdir (DIR));
-		closedir (DIR);
-	    }
-	}
-
-	($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size,
-	 $atime, $mtime, $ctime, $blksize, $blocks) = lstat $full_path;
-
-	$self->{MODE} = $mode;
-	$self->{NLINK} = $nlink;
-	$self->{UID} = $uid;
-	$self->{GID} = $gid;
-	$self->{SIZE} = $size;
-	$self->{MTIME} = $mtime;
-	$self->{CTIME} = $ctime;
-
-	$self->{FLAGS} = _get_file_flags ($full_path);
-    }
+    # Get immutable flags if supported (may need privilege).
+    $self->{FLAGS} = _get_file_flags ($full_path, $need_priv);
 
     bless $self, $class;
     return $self;
 }
 
-# Internal method to assign file type.
+# Internal method to get file type.
 sub _get_file_type {
-    my ($full_path) = @_;
-    my ($type);
+    my ($mode) = @_;
 
-    # Check for link is done first, to avoid falsely identifying a link to
-    # a nonexistent target as nonexistent rather than a link.
-    if (-l $full_path) {
-	$type = 'link';
+    return 'nonexistent' if (!defined ($mode));
+
+    return 'file' if (S_ISREG ($mode));
+
+    return 'dir' if (S_ISDIR ($mode));
+
+    return 'link' if (S_ISLNK ($mode));
+
+    return 'block device' if (S_ISBLK ($mode));
+
+    return 'char device' if (S_ISCHR ($mode));
+
+    return 'fifo' if (S_ISFIFO ($mode));
+
+    return 'socket' if (S_ISSOCK ($mode));
+
+    return '<undefined>';
+}
+
+# Internal method to canonicalize link targets.
+sub _canonicalize_link_target {
+    my ($full_path, $link_target) = @_;
+    my ($base_dir);
+
+    # Need absolute path to be able to obtain other information about the target.
+    if (substr ($link_target, 0, 1) ne '/') {
+	# Basedir could be a directory within $tree, not $tree itself.
+	$base_dir = File::Basename::dirname ($full_path);
+	$link_target = File::Spec->catfile ($base_dir, $link_target);
     }
-    elsif (!-e $full_path) {
-	$type = 'nonexistent';
+
+    if ($link_target =~ /\.\./) {
+	# Get actual target; if nonexistent, get best estimate
+	my $abs_link_target = abs_path ($link_target);
+
+	if (!defined ($abs_link_target)) {
+	    # Avoid use of cwd in File::Spec->rel2abs
+	    $base_dir = File::Basename::dirname ($full_path) if (!defined ($base_dir));
+	    $abs_link_target = File::Spec->rel2abs ($link_target, $base_dir);
+	}
+	$link_target = $abs_link_target;
+    }
+
+    return $link_target;
+}
+
+# Internal method to get SHA digest. Claude rewrote this and lost the SHA3 support, so
+# I rewrote it again.
+sub _get_sha_digest {
+    my ($full_path, $sha_digest, $need_priv) = @_;
+    my ($fh, $sha_version, $sha_bits, $digest);
+
+    # Determine which SHA digest to use.
+    if ($sha_digest =~ /-/) {
+	($sha_version, $sha_bits) = split (/-/, $sha_digest);
     }
     else {
-	if (-p $full_path) {
-	    $type = 'fifo';
-	}
-	elsif (-S $full_path) {
-	    $type = 'socket';
-	}
-	elsif (-b $full_path) {
-	    $type = 'block device';
-	}
-	elsif (-c $full_path) {
-	    $type = 'char device';
-	}
-	elsif (-f $full_path) {
-	    $type = 'file';
-	}
-	elsif (-d $full_path) {
-	    $type = 'dir';
-	}
-	else {
-	    $type = '<undefined>';
-	}
+	return '<undefined>';
+    }
+    
+    # If privsep is disabled, always open directly
+    if (!$main::use_privsep) {
+        if (!open ($fh, '<', $full_path)) {
+            return undef;
+        }
+    }
+    elsif ($need_priv) {
+        # Request file descriptor from privileged parent
+        $fh = PrivSep::request_open ($FileAttr::PRIV_IPC, $full_path);
+        return undef unless $fh;
+    }
+    else {
+        # Try to open unprivileged
+        if (!open ($fh, '<', $full_path)) {
+            # Unexpected - mode said we could read but we can't
+            # Fall back to privileged
+            $fh = PrivSep::request_open($FileAttr::PRIV_IPC, $full_path);
+            return undef unless $fh;
+        }
+    }
+    
+    # Now compute digest from the filehandle
+    # This is the CPU-intensive work, done unprivileged
+    if ($sha_version == 2) {
+	$digest = Digest::SHA->new ($sha_bits);
+    }
+    elsif ($sha_version == 3) {
+	$digest = Digest::SHA3->new ($sha_bits);
+    }
+    else {
+	# Should not happen, screened out in config parsing.
+	die "Internal error: ShA version unknown. $sha_version\n";
     }
 
-    return ($type);
+    $digest->addfile ($fh);
+    close $fh;
+
+    return $digest->hexdigest;
+}
+
+# Internal method to get directory contents. Written by Claude.
+sub _get_dir_contents {
+    my ($full_path, $need_priv) = @_;
+    
+    # If privsep disabled, always try directly
+    if (!$main::use_privsep) {
+        if (opendir (my $dh, $full_path)) {
+            my @entries = grep { !/^\.\.?$/ } readdir($dh);
+            closedir $dh;
+            return \@entries;
+        }
+        return [];
+    }
+    
+    if ($need_priv) {
+        # Go straight to privileged
+        return PrivSep::request_readdir ($FileAttr::PRIV_IPC, $full_path);
+    }
+    else {
+        # Try unprivileged
+        if (opendir (my $dh, $full_path)) {
+            my @entries = grep { !/^\.\.?$/ } readdir($dh);
+            closedir  $dh;
+            return \@entries;
+        } else {
+            # Unexpected failure - fall back to privileged
+            return PrivSep::request_readdir ($FileAttr::PRIV_IPC, $full_path);
+        }
+    }
+}
+
+# Internal method to get link target. Written by Claude.
+# Modified to also return link target type.
+sub _get_link_target {
+    my ($full_path, $need_priv) = @_;
+    my ($target, $mode, $type);
+    
+    # If privsep disabled, always try directly
+    if (!$main::use_privsep) {
+	$target = readlink ($full_path);
+	return ($target, undef); # type will be determined by caller
+    }
+    
+    if ($need_priv) {
+        # Go straight to privileged
+        # Privileged parent will canonicalize the target and return type.
+	($target, $type) = PrivSep::request_readlink ($FileAttr::PRIV_IPC, $full_path);
+        return ($target, $type);
+    }
+    else {
+        # Try unprivileged
+        $target = readlink($full_path);
+        
+        if (!defined $target && ($! == EACCES || $! == EPERM)) {
+            # Fall back to privileged
+            # Privileged parent will canonicalize the target
+            ($target, $type) = PrivSep::request_readlink ($FileAttr::PRIV_IPC, $full_path);
+	    return ($target, $type);
+        }
+	elsif (defined $target) {
+            # We got it unprivileged, but need to canonicalize it ourselves
+            # However, if canonicalization requires accessing restricted dirs,
+            # we need to do it privileged. Try it, and if it fails, request
+            # privileged readlink which will canonicalize with full access.
+            my $canonical = _try_canonicalize_link_target ($full_path, $target);
+            if (defined $canonical) {
+		$type = _try_get_linktarget_type ($canonical);
+		if (defined ($type)) {
+		    # Got both canonical path and type
+		    return ($canonical, $type);
+		}
+		else {
+		    # Could canonicalize but not get type - need privileged access.
+		    ($target, $type) = PrivSep::request_readlink ($FileAttr::PRIV_IPC, $full_path);
+		    return ($target, $type);
+		}
+            }
+	    else {
+                # Canonicalization failed - need privileged access
+                ($target, $type) = PrivSep::request_readlink ($FileAttr::PRIV_IPC, $full_path);
+		return ($target, $type);
+            }
+        }
+
+        return (undef, undef);
+    }
+}
+
+# Internal method to get link target type without priv separation.
+sub _get_local_linktarget_type {
+    my ($target_path) = @_;
+
+    # stat (not lstat) to follow the link target.
+    my @stat = stat ($target_path);
+
+    return 'nonexistent' unless @stat;
+
+    my $mode = $stat[2];
+
+    return _get_file_type ($mode);
+}
+
+# Internal method to get link target type.
+sub _try_get_linktarget_type {
+    my ($target_path) = @_;
+
+    # Try to stat the link target.
+    # If we hit permission errors, return under to indicate we need privileged
+    # help.
+
+    my @stat = stat ($target_path);
+
+    if (!@stat) {
+	# Could be nonexistent or permission denied.
+	# If EACCES/EPERM, we need privileged help.
+	if ($! == EACCES || $! == EPERM) {
+	    return undef;
+	}
+	return 'nonexistent';
+    }
+
+    my $mode = $stat[2];
+
+    return _get_file_type ($mode);
+}
+
+# Internal method to try link target canonicalization but return undef on permissions errors.
+sub _try_canonicalize_link_target {
+    my ($full_path, $link_target) = @_;
+    
+    # Try to canonicalize, but return undef if we hit permission errors
+    # This indicates we need privileged help
+    
+    my ($base_dir, $abs_link_target);
+    
+    if (substr($link_target, 0, 1) ne '/') {
+        $base_dir = File::Basename::dirname($full_path);
+        $link_target = File::Spec->catfile($base_dir, $link_target);
+    }
+    
+    if ($link_target =~ /\.\./) {
+        use Cwd qw(abs_path);
+        $abs_link_target = abs_path($link_target);
+        
+        if (!defined($abs_link_target)) {
+            # Could be because target doesn't exist, or permission denied
+            # Try rel2abs which doesn't require filesystem access
+            $base_dir = File::Basename::dirname($full_path) if (!defined($base_dir));
+            $abs_link_target = File::Spec->rel2abs($link_target, $base_dir);
+            
+            # This might have succeeded, or might be incomplete
+            # We can't tell, so return it
+        }
+        $link_target = $abs_link_target;
+    }
+    
+    return $link_target;
 }
 
 # Internal method to obtain file flags.  This is icky, I'd like to get them
-# from lstat.
+# from lstat. Now supports privsep.
 sub _get_file_flags {
-    my ($full_path) = @_;
+    my ($full_path, $need_priv) = @_;
     my ($flags, $perms, $nlinks, $uid, $gid);
+
+    if ($main::use_privsep && $need_priv) {
+	return PrivSep::request_immutable_get ($FileAttr::PRIV_IPC, $full_path);
+    }
 
     if (-e $CHFLAGS) {
 	if (-e "$full_path") {
@@ -3250,9 +4715,9 @@ sub _get_file_flags {
 }
 
 # Subroutine to tell if a file is on a fuse or msdos filesystem (where
-# Linux lsattr won't work). (This code is in two places, with
-# immutable_file and with _get_file_flags in the FileAttr module,
-# keep them consistent.)
+# Linux lsattr won't work). (This code was in two places, here in FileAttr
+# and also above with immutable_file, which now calls FileAttr's _get_file_flags
+# instead.)
 sub _on_nonstd_fs {
     my ($file) = @_;
     my $fs_type;
@@ -3659,9 +5124,11 @@ sub display {
 ### Spec package.
 
 # Methods to store information for an entire tree in a specification.
+# new/add/get call FileAttr->new which requires $use_privsep global
+# variable from main program.
 package Spec;
 
-use Storable qw(lock_retrieve lock_store);
+use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore_fd);
 
 # Method to create new spec or restore one from a saved file.
 sub new {
@@ -3675,7 +5142,26 @@ sub new {
 	${$self->{FILEATTR}}{$tree} = $fileattr;
     }
     else {
-	$self = lock_retrieve ($spec_path);
+	if ($main::use_privsep) {
+	    # Requires privileged read.
+	    my $fh = PrivSep::request_open ($FileAttr::PRIV_IPC, $spec_path);
+	    if ($fh) {
+		# Use fd_retrieve to read from the filehand.e
+		$self = fd_retrieve ($fh);
+		close ($fh);
+	    }
+	    else {
+		warn "Failed to open spec file via privep: $spec_path\n";
+		return (undef, undef);
+	    }
+	}
+	else {
+	    $self = lock_retrieve ($spec_path);
+	    unless ($self) {
+		warn "Failed to retrieve spec file: $spec_path\n";
+		return (undef, undef);
+	    }
+	}
 	$fileattr = ${$self->{FILEATTR}}{$tree};
         if (!defined ($fileattr)) {
 	    print "Unable to retrieve fileattr for tree $tree from specification. $spec_path\nContinuing. Try re-initializing the specification if necessary.\n";
@@ -3767,7 +5253,20 @@ sub store_spec {
     $self->{TIME} = time();
     $self->{USER} = $USERNAME;
 
-    lock_store ($self, $spec_path);
+    if ($main::use_privsep) {
+	# Request privileged open for writing
+	my $fh = PrivSep::request_open ($FileAttr::PRIV_IPC,
+					$spec_path,
+					'>');
+	unless ($fh) {
+	    die "Failed to open spec file for writing via privsep: $spec_path\n";
+	}
+	nstore_fd ($self, $fh) or die "Failed to store spec to $spec_path: $!\n";
+	close ($fh);
+    }
+    else {
+	lock_nstore ($self, $spec_path) or die "Failed to store spec to $spec_path: $!\n";
+    }
 }
 
 # Method to return hostname and creation time for a spec.
@@ -3792,9 +5291,14 @@ sub get_info {
 # (But we don't want to also store the original FileAttr, too...)
 # This will be necessary for adding the feature of being able to look
 # only at new changes since the last check.
+#
+# There is a primary and secondary changed file, as well as child
+# changed files created by check in the /tmp dir. The first two require
+# privileges to read and write but the /tmp ones are owned by the
+# unprivileged child process.
 package ChangedFile;
 
-use Storable qw(lock_retrieve lock_store);
+use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore_fd);
 
 # Method to create a new changed file or read in its contents,
 # and reset counters for check.
@@ -3804,28 +5308,50 @@ sub new {
     my ($changed_file) = @_;
 
     # Might be a zero-length temp file.
-    if (-e $changed_file && !-z $changed_file) {
-	$self = lock_retrieve ($changed_file);
-	# If it's a changedfile from before sigtree-1.19.
-	if (!defined ($self->{CHANGEDFILE})) {
-	    $self->{CHANGEDFILE} = $changed_file;
+    if ((!$main::use_privsep && -e $changed_file && !-z $changed_file) ||
+	($main::use_privsep && grep { $_ eq $changed_file } @EXISTING_SPECS)) {
+	my $is_temp_file = ($changed_file =~ m{^/tmp/});
+
+	if ($main::use_privsep && !$is_temp_file) {
+	    # Main changed file, requires privileged read.
+	    my $fh = PrivSep::request_open ($FileAttr::PRIV_IPC,
+					    $changed_file);
+	    if ($fh) {
+		$self = fd_retrieve ($fh);
+		close ($fh);
+		unless ($self) {
+		    warn "Failed to retrieve changed file from $changed_file\n";
+		    $self = _initialize_empty_changedfile ($changed_file);
+		}
+	    }
+	}
+	else {
+	    $self = lock_retrieve ($changed_file);
 	}
     }
     else {
-	$self = ();
-
-	$self->{CHANGEDFILE} = $changed_file;
-	$self->{CHANGES} = ();
-	$self->{ADDITIONS} = ();
-	$self->{DELETIONS} = (); 
-	$self->{SET_TO_PATH_ADD} = (); 
-	$self->{SET_TO_PATH_DEL} = (); 
-	$self->{SET_TO_PATH_CHANGE} = (); 
-	$self->{SET_TO_PATH_CH_ATTR} = ();
-	$self->{PATH} = ();	
+	$self = _initialize_empty_changedfile ($changed_file);
     }
 
     bless $self, $class;
+    return $self;
+}
+
+# Helper method to initialize empty changedfile components.
+sub _initialize_empty_changedfile {
+    my ($changed_file) = @_;
+    my $self = {};
+    
+    $self->{CHANGEDFILE} = $changed_file;
+    $self->{CHANGES} = {};
+    $self->{ADDITIONS} = {};
+    $self->{DELETIONS} = {}; 
+    $self->{SET_TO_PATH_ADD} = {}; 
+    $self->{SET_TO_PATH_DEL} = {}; 
+    $self->{SET_TO_PATH_CHANGE} = {}; 
+    $self->{SET_TO_PATH_CH_ATTR} = {};
+    $self->{PATH} = {};
+    
     return $self;
 }
 
@@ -4153,18 +5679,42 @@ sub delete_if_empty {
     my (@trees);
 
     @trees = keys (%{$self->{PATH}});
-    if ($#trees == -1) {
-	unlink ($self->{CHANGEDFILE});
+    if ($#trees < 0) {
+	my $is_temp_file = ($self->{CHANGEDFILE} =~ m{^/tmp/});
+
+	if ($main::use_privsep && !$is_temp_file) {
+	    # Main changed file - needs privileged delete
+	    PrivSep::request_delete_file ($FileAttr::PRIV_IPC,
+					  $self->{CHANGEDFILE});
+	}
+	else {
+	    unlink ($self->{CHANGEDFILE});
+	}
     }
 }
 
-# Method to store changed file.
+# Method to store changed file. Stores even if empty.
 sub store_changedfile {
     my $self = shift;
-    my ($temp_file) = @_;
     my $class = ref ($self) || $self;
 
-    lock_store ($self, $self->{CHANGEDFILE});
+    my $is_temp_file = ($self->{CHANGEDFILE} =~ m{^/tmp/});
+
+    if ($main::use_privsep && !$is_temp_file) {
+	# Main changed file - requires privileged write.
+	my $fh = PrivSep::request_open ($FileAttr::PRIV_IPC,
+					$self->{CHANGEDFILE},
+					'>');
+	unless ($fh) {
+	    die "Failed to open changed file for writing via privsep: $self->{CHANGEDFILE}\n";
+	}
+	nstore_fd ($self, $fh);
+	close ($fh);
+    }
+    else {
+	lock_nstore ($self, $self->{CHANGEDFILE})
+	    or die "Failed to store changed file: $!\n";
+    }
 }
 
 1;

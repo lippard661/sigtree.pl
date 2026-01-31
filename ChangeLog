@@ -1,3 +1,6 @@
+31 January 2026: 1.22: Privilege separation and cleanup, better
+	error handling. Privsep off by default and not yet fully
+	tested on all platforms.
 11 January 2026: 1.21c: Some cleanup, more granular use of pledge,
 	stop locking the main specdir, move changedfile and spec spec
 	location in preparation for privsep implementation.
