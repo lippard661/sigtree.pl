@@ -1,3 +1,6 @@
+1 February 2026: 1.22a: Fix bugs in child changed file handling in
+	privilege separation case, remove unnecessary locking,
+	add FD passing ACK timeout.
 31 January 2026: 1.22: Privilege separation and cleanup, better
 	error handling. Privsep off by default and not yet fully
 	tested on all platforms.

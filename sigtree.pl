@@ -238,10 +238,13 @@
 #    design changes, some of which were really bad ideas that have been
 #    discarded (like passing entire file contents of specs and changed files
 #    through sockets instead of passing file handles).
-# Modified 29 January by Jim Lippard to replace Storable-based IPC
+# Modified 29 January 2026 by Jim Lippard to replace Storable-based IPC
 #    protocol with JSON.
-# Modified 31 January by Jim Lippard to fix race condition in FD passing for Linux
+# Modified 31 January 2026 by Jim Lippard to fix race condition in FD passing for Linux
 #    by modifying the protocol to force synchronization.
+# Modified 1 February 2026 by Jim Lippard to add FD passing ACK timeout and fix bugs
+#    in child changed file handling, removing unnecessary locking for the child
+#    changed files.
 
 ### Required packages.
 
@@ -334,7 +337,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.22 of 30 January 2026';
+my $VERSION = 'sigtree 1.22a of 1 February 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1495,9 +1498,22 @@ sub check_sets {
 
 	if ($fork_children) {
 	    # Store the changedfile.
-	    $changedfile->store_changedfile;
+	    eval {
+		$changedfile->store_changedfile;
+	    };
+	    if ($@) {
+		warn "FATAL: Child $tree failed to store changed file: $@\n";
+		$pm->finish (1); # Exit with error code.
+	    }
+	    # Verify file was written.
+	    unless (-e "$child_temp_dir/$child_temp_file" && -r "$child_temp_dir/$child_temp_file") {
+		warn "FATAL: Child $tree changed file missing or unreadable.\n";
+		$pm->finish (1);
+	    }
 	    # Report child finish if verbose.
-	    print "$tree: finish child\n" if ($verbose);
+	    print "$tree: finish child" if ($verbose);
+	    print " (stored $child_temp_file)" if ($verbose && $main::debug_flag);
+	    print "\n" if ($verbose);
 	    # Return the filename.
 	    $pm->finish (0, \$child_temp_file);
 	}
@@ -2628,10 +2644,21 @@ sub privileged_parent_multiplex {
 		# (unnecessary for OpenBSD, required for Linux).
 		warn "[DEBUG] [PRIVILEGED PARENT] Waiting for ACK before sending FD\n" if ($main::debug_flag);
 		my $ack_buf;
-		my $n = read ($sock, $ack_buf, 3);
+		# Timeout for OpenBSD.
+		eval {
+		    local $SIG{ALRM} = sub { die "ACK timeout\n"; };
+		    alarm (5); # 5 second timeout
+		    my $n = read ($sock, $ack_buf, 3);
+		    alarm (0);
 
-		unless ($n == 3 && $ack_buf eq 'ACK') {
-		    warn "[PRIVILEGED PARENT] Failed to receive ACK for FD transfer (got '$ack_buf', $n bytes)\n";
+		    unless ($n == 3 && $ack_buf eq 'ACK') {
+			warn "[PRIVILEGED PARENT] Failed to receive ACK for FD transfer (got '$ack_buf', $n bytes)\n";
+			close $response_filehandle;
+			next;
+		    }
+		};
+		if ($@) {
+		    warn "[PRIVILEGED PARENT] ACK timeout or error: $@\n";
 		    close $response_filehandle;
 		    next;
 		}
@@ -5298,7 +5325,7 @@ sub get_info {
 # unprivileged child process.
 package ChangedFile;
 
-use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore_fd);
+use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore nstore_fd retrieve);
 
 # Method to create a new changed file or read in its contents,
 # and reset counters for check.
@@ -5307,11 +5334,13 @@ sub new {
     my ($self);
     my ($changed_file) = @_;
 
+    my $is_temp_file = ($changed_file =~ m{^/tmp/});
     # Might be a zero-length temp file.
-    if ((!$main::use_privsep && -e $changed_file && !-z $changed_file) ||
-	($main::use_privsep && grep { $_ eq $changed_file } @EXISTING_SPECS)) {
-	my $is_temp_file = ($changed_file =~ m{^/tmp/});
+    my $should_read = ((!$main::use_privsep && -e $changed_file && !-z $changed_file) ||
+		       ($main::use_privsep && $is_temp_file && -e $changed_file && !-z $changed_file) ||
+		       ($main::use_privsep && !$is_temp_file && grep { $_ eq $changed_file } @EXISTING_SPECS));
 
+    if ($should_read) {
 	if ($main::use_privsep && !$is_temp_file) {
 	    # Main changed file, requires privileged read.
 	    my $fh = PrivSep::request_open ($FileAttr::PRIV_IPC,
@@ -5324,6 +5353,10 @@ sub new {
 		    $self = _initialize_empty_changedfile ($changed_file);
 		}
 	    }
+	}
+	elsif ($is_temp_file) {
+	    # No locking on child temp files.
+	    $self = retrieve ($changed_file);
 	}
 	else {
 	    $self = lock_retrieve ($changed_file);
@@ -5710,6 +5743,11 @@ sub store_changedfile {
 	}
 	nstore_fd ($self, $fh);
 	close ($fh);
+    }
+    elsif ($is_temp_file) {
+	# No locking.
+	nstore ($self, $self->{CHANGEDFILE})
+	    or die "Failed to store child changed file: $!\n";
     }
     else {
 	lock_nstore ($self, $self->{CHANGEDFILE})
