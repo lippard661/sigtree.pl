@@ -242,8 +242,8 @@
 #    protocol with JSON.
 # Modified 31 January 2026 by Jim Lippard to fix race condition in FD passing for Linux
 #    by modifying the protocol to force synchronization.
-# Modified 1 February 2026 by Jim Lippard to add FD passing ACK timeout and fix bugs
-#    in child changed file handling, removing unnecessary locking for the child
+# Modified 1 February 2026 by Jim Lippard to add FD passing ACK timeout for Linux and
+#    fix bugs in child changed file handling, removing unnecessary locking for the child
 #    changed files.
 
 ### Required packages.
@@ -2640,27 +2640,29 @@ sub privileged_parent_multiplex {
             
             # If response includes a file descriptor to send, send it now
             if (defined $response_fd_to_send) {
-		# Wait for child to acknowledge it's ready to receive FD
-		# (unnecessary for OpenBSD, required for Linux).
-		warn "[DEBUG] [PRIVILEGED PARENT] Waiting for ACK before sending FD\n" if ($main::debug_flag);
-		my $ack_buf;
-		# Timeout for OpenBSD.
-		eval {
-		    local $SIG{ALRM} = sub { die "ACK timeout\n"; };
-		    alarm (5); # 5 second timeout
-		    my $n = read ($sock, $ack_buf, 3);
-		    alarm (0);
-
-		    unless ($n == 3 && $ack_buf eq 'ACK') {
-			warn "[PRIVILEGED PARENT] Failed to receive ACK for FD transfer (got '$ack_buf', $n bytes)\n";
+		if ($^O eq 'linux') {
+		    # Wait for child to acknowledge it's ready to receive FD
+		    # (unnecessary for OpenBSD, required for Linux).
+		    warn "[DEBUG] [PRIVILEGED PARENaT] Waiting for ACK before sending FD\n" if ($main::debug_flag);
+		    my $ack_buf;
+		    # Timeout for OpenBSD.
+		    eval {
+			local $SIG{ALRM} = sub { die "ACK timeout\n"; };
+			alarm (5); # 5 second timeout
+			my $n = read ($sock, $ack_buf, 3);
+			alarm (0);
+			
+			unless ($n == 3 && $ack_buf eq 'ACK') {
+			    warn "[PRIVILEGED PARENT] Failed to receive ACK for FD transfer (got '$ack_buf', $n bytes)\n";
+			    close $response_filehandle;
+			    next;
+			}
+		    };
+		    if ($@) {
+			warn "[PRIVILEGED PARENT] ACK timeout or error: $@\n";
 			close $response_filehandle;
 			next;
 		    }
-		};
-		if ($@) {
-		    warn "[PRIVILEGED PARENT] ACK timeout or error: $@\n";
-		    close $response_filehandle;
-		    next;
 		}
 
 		# Now send the FD
@@ -4006,12 +4008,14 @@ sub request_open {
 	return undef;
     }
 
-    # Explicit for Linux.
     if ($response->{success}) {
-	warn "DEBUG: Sending ACK for FD transfer\n" if ($main::debug_flag);
-	# Send ACK to tell parent we're ready to receive FD (needed for Linux).
-	print $sock "ACK";
-	$sock->flush();
+	# Explicit ACK for Linux.
+	if ($^O eq 'linux') {
+	    warn "DEBUG: Sending ACK for FD transfer\n" if ($main::debug_flag);
+	    # Send ACK to tell parent we're ready to receive FD (needed for Linux).
+	    print $sock "ACK";
+	    $sock->flush();
+	}
 	
 	# Now receive file descriptor from privileged parent
 	my $fd = IO::FDPass::recv(fileno($sock));
