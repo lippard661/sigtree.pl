@@ -245,6 +245,8 @@
 # Modified 1 February 2026 by Jim Lippard to add FD passing ACK timeout for Linux and
 #    fix bugs in child changed file handling, removing unnecessary locking for the child
 #    changed files.
+# Modified 1 February 2026 to fix the actual underlying FD passing problem which was
+#    improper assignment of worker sockets.
 
 ### Required packages.
 
@@ -291,6 +293,7 @@
 
 require 5.004;
 use strict;
+use feature 'state';
 use Digest::SHA;
 use Digest::SHA3;
 use File::Basename;
@@ -619,7 +622,7 @@ else {
 # Handle -f option. Placed here to allow a config option for
 # max and default child counts vs. the hard coded ones.
 if ($opts{'f'}) {
-    die "-f option is greater than max number of child processes ($config->{$MAX_CHILD_PROCS}).\n" if ($opts{'f'} > $config->{MAX_CHILD_PROCS});
+    die "-f option is greater than max number of child processes ($config->{MAX_CHILD_PROCS}).\n" if ($opts{'f'} > $config->{MAX_CHILD_PROCS});
 }
 
 $fork_children = $config->{DEFAULT_CHILD_PROCS};
@@ -768,6 +771,7 @@ if ($use_privsep) {
 # and could be more narrowly tailored for each based on need to access
 # all or a subset of trees or just what's in the sigtree root dir.
 if ($OSNAME eq 'openbsd') {
+    # All the initial promises.
     my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
 		    @CHANGE_ATTR_PROMISES, @EXEC_PROMISES,
 		    @FLOCK_PROMISE, @UNVEIL_PROMISE);
@@ -890,6 +894,8 @@ if ($use_privsep) {
     # @PRIVSEP_PRIV_PROMISES, and @PRIVSEP_DROPPRIV_PROMISES.
     # Also removing @CHANGE_ATTR_PROMISES. Need @EXEC_PROMISES
     # if using pgp for initialize and update operations.
+    # 'flock' required for main changed file but not for child
+    # ones, child workers could drop it.
     if ($^O eq 'openbsd') {
 	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
 			@EXEC_PROMISES, @FLOCK_PROMISE,
@@ -914,6 +920,7 @@ elsif ($command eq 'initialize_specs') {
 }
 elsif ($command eq 'changes') {
     if ($^O eq 'openbsd') {
+	# 'flock' required for changed file.
 	# Now need special treatment with privsep.
 	my @promises = (@READONLY_PROMISES, @FLOCK_PROMISE);
 	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
@@ -925,6 +932,7 @@ elsif ($command eq 'check') {
     if ($^O eq 'openbsd') {
 	# Don't need 'fattr' (@CHANGE_ATTR_PROMISES),
 	# or 'unveil' (@UNVEIL_PROMISE)
+	# 'flock' required for changed file.
 	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
 			@EXEC_PROMISES, @FLOCK_PROMISE);
 	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
@@ -935,6 +943,7 @@ elsif ($command eq 'check') {
 elsif ($command eq 'check_file') {
     if ($^O eq 'openbsd') {
 	# Don't need 'fattr' (@CHANGE_ATTR_PROMISES), 'unveil' (@UNVEIL_PROMISE).
+	# 'flock' required for changed file.
 	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
 			@EXEC_PROMISES, @FLOCK_PROMISE);
 	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
@@ -945,6 +954,7 @@ elsif ($command eq 'check_file') {
 elsif ($command eq 'check_specs') {
     if ($^O eq 'openbsd') {
 	# Don't need 'fattr' (@CHANGE_ATTR_PROMISES), 'unveil' (@UNVEIL_PROMISE),
+	# 'flock' required for changed file.
 	my @promises = (@READONLY_PROMISES, @READWRITE_PROMISES,
 			@EXEC_PROMISES, @FLOCK_PROMISE);
 	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
@@ -1032,6 +1042,10 @@ sub initialize_sets {
 	    $fork_children = 0 if ($#specified_trees == 1);
 	}
 
+	# Track available worker slots
+	my @available_workers = (0 .. $fork_children - 1);  # Initially all available
+	my %worker_in_use;  # Track which workers are busy
+
 	# Split this up among children. This children will produce some
 	# output if verbose but don't need to coordinate with the parent
 	# like in check_sets.
@@ -1041,37 +1055,73 @@ sub initialize_sets {
 	    chomp ($child_temp_dir);
 	    $pm = Parallel::ForkManager->new ($fork_children,
 					      $child_temp_dir);
-	}
 
-	my $worker_id = 0;
-	foreach $tree (@specified_trees) {
-	    if ($fork_children) {
-		# Really only used for privsep.
-		my $current_worker_id = $worker_id++ % $fork_children;
-		$pm->run_on_finish (
-		    sub {
-			my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tree_ref) = @_;
-			my ($child_tree);
-			if (defined ($tree_ref) || defined ($ident)) {
-			    if (defined ($tree_ref)) {
-				$child_tree = ${$tree_ref};
-			    }
-			    else {
-				print "Warning: using ident $ident instead of tree ref for child $pid.\n";
-				$child_tree = $ident;
-			    }
-			    # Need to do this check again, only remove if it was in a specified set.
-			    if ($config->tree_uses_sets ($child_tree, @sets) &&
-				$changed_file_exists && $changedfile->tree_present ($child_tree)) {
-				$changedfile->delete ($child_tree);
-			    }
-			}
-			else {
-			    # child failed
-			    print "Warning: child pid $pid did not return a tree name or ident, exit code $exit_code.\n";
+	    # Set up handler for when each child finishes.
+	    $pm->run_on_finish (
+		sub {
+		    my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tree_ref) = @_;
+		    my ($child_tree);
+		    
+		    # The ident is the tree name
+		    # Look up which worker this tree was using
+		    my $finished_worker_id = delete $worker_in_use{$ident};
+        
+		    if (defined $finished_worker_id) {
+			# Return this worker to available pool
+			push @available_workers, $finished_worker_id;
+            
+			if ($main::debug_flag) {
+			    print "DEBUG: [MAIN] Worker $finished_worker_id finished tree $ident (PID $pid)\n";
+			    print "DEBUG: [MAIN] Worker $finished_worker_id now available\n";
+			    print "DEBUG: [MAIN] Available workers: " . join(", ", sort @available_workers) . "\n";
 			}
 		    }
-		    );
+			
+		    if (defined ($tree_ref) || defined ($ident)) {
+			if (defined ($tree_ref)) {
+			    $child_tree = ${$tree_ref};
+			}
+			else {
+			    print "Warning: using ident $ident instead of tree ref for child $pid.\n";
+			    $child_tree = $ident;
+			}
+			# Need to do this check again, only remove if it was in a specified set.
+			if ($config->tree_uses_sets ($child_tree, @sets) &&
+			    $changed_file_exists && $changedfile->tree_present ($child_tree)) {
+			    $changedfile->delete ($child_tree);
+			}
+		    }
+		    else {
+			# child failed
+			print "Warning: child pid $pid did not return a tree name or ident, exit code $exit_code.\n";
+		    }
+		}
+		);
+	}
+
+	foreach $tree (@specified_trees) {
+	    if ($fork_children) {
+		# Wait for an available worker slot
+		while (!@available_workers) {
+		    # Reap finished children to trigger run_on_finish callback
+		    # which returns workers to @available_workers
+		    $pm->reap_finished_children();
+		    # Short sleep to avoid busy-waiting
+		    select(undef, undef, undef, 0.1);
+		}
+		
+		# Get next available worker ID
+		my $current_worker_id = shift @available_workers;
+        
+		# Track that this tree is using this worker
+		$worker_in_use{$tree} = $current_worker_id;
+        
+		if ($main::debug_flag) {
+		    print "DEBUG: [MAIN] Assigning tree $tree to worker $current_worker_id\n";
+		    print "DEBUG: [MAIN] Available workers: " . join(", ", sort @available_workers) . "\n";
+		    print "DEBUG: [MAIN] Workers in use: " . 
+			join(", ", map { "$_=>$worker_in_use{$_}" } sort keys %worker_in_use) . "\n";
+		}
 		
 		$pm->start ($tree) and next;
 
@@ -1082,8 +1132,12 @@ sub initialize_sets {
 		    $FileAttr::PRIV_IPC = $WORKER_SOCKETS[$current_worker_id];
 		    # Close sockets we don't need.
 		    close $MAIN_PRIV_SOCK;
+		    
+		    # Don't close other worker sockets - just mark them unusable
 		    for my $idx (0..$#WORKER_SOCKETS) {
-			close $WORKER_SOCKETS[$idx] if $idx != $current_worker_id;
+			if ($idx != $current_worker_id) {
+			    $WORKER_SOCKETS[$idx] = undef;
+			}
 		    }
 		}
 	    }
@@ -1402,58 +1456,109 @@ sub check_sets {
 	$fork_children = $#specified_trees;
 	$fork_children = 0 if ($#specified_trees == 1);
     }
-
+    
+    # Track available worker slots
+    my @available_workers = (0 .. $fork_children - 1);  # Initially all available
+    my %worker_in_use;  # Track which workers are busy
+    
     if ($fork_children) {
 	# create $child_temp_dir with mktemp
 	$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
 	chomp ($child_temp_dir);
 	$pm = Parallel::ForkManager->new ($fork_children,
-					     $child_temp_dir);
-    }
+					  $child_temp_dir);
 
-    my $worker_id = 0;
-    foreach $tree (@specified_trees) {
-	if ($fork_children) {
-	    # Really only used for privsep.
-	    my $current_worker_id = $worker_id++ % $fork_children;
-	    print "DEBUG: [MAIN] worker ID: $worker_id, cwID: $current_worker_id\n" if ($main::debug_flag);
-	    $pm->run_on_finish (
-		sub {
-		    my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tempfile_ref) = @_;
-		    if (defined ($tempfile_ref)) {
-			# Get the returned filename.
-			$child_temp_file = ${$tempfile_ref};
-			# Retrieve from stored.
-			$child_changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
-			if ($child_changedfile) {
-			    # Merge into main one.
-			    $changedfile->merge ($child_changedfile);
-			}
-			else {
-			    warn "Failed to load child changed file: $child_temp_dir/$child_temp_file\n";
-			}
-			# Remove the file.
-			unlink ("$child_temp_dir/$child_temp_file");
-		    }
-		    else {
-			# child failed
-			# what's the recovery here?
-			print "Warning: child $pid ($ident) did not return a changedfile, exit code $exit_code.\n";
+	# Set up handler for when each child finishes.
+	$pm->run_on_finish (
+	    sub {
+		my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $tempfile_ref) = @_;
+
+		# The ident is the tree name
+		# Look up which worker this tree was using
+		my $finished_worker_id = delete $worker_in_use{$ident};
+        
+		if (defined $finished_worker_id) {
+		    # Return this worker to available pool
+		    push @available_workers, $finished_worker_id;
+            
+		    if ($main::debug_flag) {
+			print "DEBUG: [MAIN] Worker $finished_worker_id finished tree $ident (PID $pid)\n";
+			print "DEBUG: [MAIN] Worker $finished_worker_id now available\n";
+			print "DEBUG: [MAIN] Available workers: " . join(", ", sort @available_workers) . "\n";
 		    }
 		}
-		);
+        
+		if (defined ($tempfile_ref)) {
+		    # Get the returned filename.
+		    $child_temp_file = ${$tempfile_ref};
+		    # Retrieve from stored.
+		    $child_changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
+		    if ($child_changedfile) {
+			# Merge into main one.
+			$changedfile->merge ($child_changedfile);
+		    }
+		    else {
+			warn "Failed to load child changed file: $child_temp_dir/$child_temp_file\n";
+		    }
+		    # Remove the file.
+		    unlink ("$child_temp_dir/$child_temp_file");
+		}
+		else {
+		    # child failed
+		    # what's the recovery here?
+		    print "Warning: child $pid ($ident) did not return a changedfile, exit code $exit_code.\n";
+		}
+	    }
+	    );
+    }
+
+    foreach $tree (@specified_trees) {
+	if ($fork_children) {
+	    # Wait for an available worker slot
+	    while (!@available_workers) {
+		# Reap finished children to trigger run_on_finish callback
+		# which returns workers to @available_workers
+		$pm->reap_finished_children();
+		# Short sleep to avoid busy-waiting
+		select(undef, undef, undef, 0.1);
+	    }
+        
+	    # Get next available worker ID
+	    my $current_worker_id = shift @available_workers;
+	    
+	    # Track that this tree is using this worker
+	    $worker_in_use{$tree} = $current_worker_id;
+        
+	    if ($main::debug_flag) {
+		print "DEBUG: [MAIN] Assigning tree $tree to worker $current_worker_id\n";
+		print "DEBUG: [MAIN] Available workers: " . join(", ", sort @available_workers) . "\n";
+		print "DEBUG: [MAIN] Workers in use: " . 
+		    join(", ", map { "$_=>$worker_in_use{$_}" } sort keys %worker_in_use) . "\n";
+	    }
 	    
 	    $pm->start ($tree) and next;
 
 	    # In a new worker child process, switch the socket to
 	    # the worker and close the others.	    
 	    if ($use_privsep) {
+		warn "CHILD: [PID $$] checking tree $tree, using worker socket $current_worker_id\n" if ($main::debug_flag);
+		
 		# Set socket we use.
 		$FileAttr::PRIV_IPC = $WORKER_SOCKETS[$current_worker_id];
+
+		# Verify we got the right socker.
+		warn "CHILD: PID $$ FileAttr::PRIV_IPC = " . fileno($FileAttr::PRIV_IPC) . "\n" if ($main::debug_flag);
+
+		# Clear this array entry so Perl doesn't auto-close it later
+		$WORKER_SOCKETS[$current_worker_id] = undef;
+
 		# Close sockets we don't need.
 		close $MAIN_PRIV_SOCK;
 		for my $idx (0..$#WORKER_SOCKETS) {
-		    close $WORKER_SOCKETS[$idx] if $idx != $current_worker_id;
+		    if ($idx != $current_worker_id) {
+			warn "CHILD: [PID $$] closing worker socket $idx (fd " . fileno($WORKER_SOCKETS[$idx]) . ")\n" if ($main::debug_flag);
+			close $WORKER_SOCKETS[$idx];
+		    }
 		}
 	    }
 	    
@@ -1510,6 +1615,16 @@ sub check_sets {
 		warn "FATAL: Child $tree changed file missing or unreadable.\n";
 		$pm->finish (1);
 	    }
+
+	    # debug this seems dumb
+	    if ($main::debug_flag) {
+		warn "DEBUG: [PID $$] About to call pm->finish for tree $tree\n";
+		if ($use_privsep) {
+		    my $sock_fd = fileno($FileAttr::PRIV_IPC);
+		    warn "DEBUG: [PID $$] Socket fd=$sock_fd\n";
+		}
+	    }
+	    
 	    # Report child finish if verbose.
 	    print "$tree: finish child" if ($verbose);
 	    print " (stored $child_temp_file)" if ($verbose && $main::debug_flag);
@@ -2604,7 +2719,7 @@ sub privileged_parent_multiplex {
     
     my $select = IO::Select->new(@socks);
     my $request_count = 0;
-    
+
     # Main loop: wait for requests from any worker
     while (my @ready = $select->can_read()) {
         
@@ -2620,9 +2735,17 @@ sub privileged_parent_multiplex {
             }
             
             $request_count++;
-
+	    
             # Handle the privileged request
             my $response = handle_privileged_request($request);
+
+	    # DEBUG: Show what we're sending and to whom
+	    if ($main::debug_flag) {
+		warn "[PRIV] [PID $$] Sending response to socket fd " . fileno($sock) . 
+		    " for request type=$request->{type} path=" . ($request->{path} || 'none') . "\n";
+		warn "[PRIV] [PID $$] Response: success=" . ($response->{success} || 'none') . 
+		    " error=" . ($response->{error} || 'none') . "\n";
+	    }
 
 	    # If response includes a filehandle, take it and delete
 	    # it from the response.
@@ -2640,18 +2763,17 @@ sub privileged_parent_multiplex {
             
             # If response includes a file descriptor to send, send it now
             if (defined $response_fd_to_send) {
+		# ACK protocol only on Linux.
 		if ($^O eq 'linux') {
-		    # Wait for child to acknowledge it's ready to receive FD
-		    # (unnecessary for OpenBSD, required for Linux).
-		    warn "[DEBUG] [PRIVILEGED PARENaT] Waiting for ACK before sending FD\n" if ($main::debug_flag);
+		    warn "[DEBUG] [PRIVILEGED PARENT] Waiting for ACK before sending FD\n" if ($main::debug_flag);
 		    my $ack_buf;
-		    # Timeout for OpenBSD.
+		    # Timeout.
 		    eval {
 			local $SIG{ALRM} = sub { die "ACK timeout\n"; };
 			alarm (5); # 5 second timeout
-			my $n = read ($sock, $ack_buf, 3);
+			my $n = sysread ($sock, $ack_buf, 3);
 			alarm (0);
-			
+		    
 			unless ($n == 3 && $ack_buf eq 'ACK') {
 			    warn "[PRIVILEGED PARENT] Failed to receive ACK for FD transfer (got '$ack_buf', $n bytes)\n";
 			    close $response_filehandle;
@@ -2666,17 +2788,17 @@ sub privileged_parent_multiplex {
 		}
 
 		# Now send the FD
-                IO::FDPass::send(fileno($sock), $response_fd_to_send);
-                
-                # Close our copy of the filehandle (child now has it)
-                close $response_filehandle;
-            }
-        }
-        
+		IO::FDPass::send(fileno($sock), $response_fd_to_send);
+
+		# Close our copy of the filehandle (child now has it)
+		close $response_filehandle;
+	    }
+	}
+
         # Exit when all workers have disconnected
         last unless $select->count();
     }
-    
+
     print "DEBUG: [PRIVILEGED PARENT] Handled $request_count requests. Exiting.\n" if ($main::debug_flag);
 }
 
@@ -3855,13 +3977,39 @@ BEGIN {
 sub send_request {
     my ($sock, $request) = @_;
 
-    print "DEBUG: [UNPRIV] Sending $request->{type} $request->{path}\n" if ($main::debug_flag);    
+    # Add unique ID for debugging
+    state $req_id = 0;
+    $request->{_req_id} = ++$req_id;
+    
+    print "DEBUG: [CHILD] [PID $$] Sending request #$req_id  type=$request->{type} $request->{path}\n" if ($main::debug_flag);    
     my $json = encode_json($request);
     my $len = pack('N', length($json));
-    
-    # Write length + data atomically
-    print $sock $len . $json;
-    $sock->flush();
+
+    if ($main::debug_flag) {
+        warn "DEBUG: [CHILD] send_request [PID $$]: json_len=" . length($json) . 
+	    " packed_len_hex=" . unpack('H*', $len) . "\n";
+    }
+
+    my $data = $len . $json;
+    my $total = length ($data);
+    my $written = 0;
+
+    if ($main::debug_flag) {
+        warn "DEBUG: [CHILD] send_request [PID $$]: total_bytes=$total (4 + " . length($json) . ")\n";
+    }
+
+    while ($written < $total) {
+	my $n = syswrite ($sock, $data, $total - $written, $written);
+	if (!defined $n) {
+	    warn "send_request: syswrite failed: $!\n";
+	    return;
+	}
+	$written += $n;
+    }
+
+    if ($main::debug_flag) {
+        warn "DEBUG: [CHILD] send_request: actually wrote $written bytes\n";
+    }
 }
 
 # Subroutine to receive a request on the privileged side.
@@ -3872,7 +4020,7 @@ sub recv_request {
     
     # Read 4-byte length
     my $len_packed;
-    my $bytes_read = read($sock, $len_packed, 4);
+    my $bytes_read = sysread($sock, $len_packed, 4);
     
     return undef unless $bytes_read == 4;
     
@@ -3884,9 +4032,9 @@ sub recv_request {
     # Read data
     my $json = '';
     while (length($json) < $len) {
-        my $chunk;
+        my $chunk = '';
         my $remaining = $len - length($json);
-        my $n = read($sock, $chunk, $remaining);
+        my $n = sysread($sock, $chunk, $remaining);
         
         return undef unless $n > 0;
         $json .= $chunk;
@@ -3907,40 +4055,101 @@ sub send_response {
 
     my $json = encode_json($response);
     my $len = pack('N', length($json));
-    
-    print $sock $len . $json;
-    $sock->flush();
+
+    my $data = $len . $json;
+    my $total = length ($data);
+    my $written = 0;
+
+    while ($written < $total) {
+	my $n = syswrite ($sock, $data, $total - $written, $written);
+	if (!defined $n) {
+	    warn "send_response: syswrite failed: $!\n";
+	    return;
+	}
+	$written += $n;
+    }
 }
 
 # Subroutine to receive a response on the nonprivileged side.
 sub recv_response {
     my ($sock) = @_;
     my $MAX_REQUEST_LENGTH = 1024 * 1024;
-    
+
+    if ($main::debug_flag) {
+        warn "DEBUG: recv_response [PID $$] ENTERED, socket fd=" . fileno($sock) . "\n";
+    }
+
     # Read 4-byte length
     my $len_packed;
-    my $bytes_read = read($sock, $len_packed, 4);
+    my $bytes_read = sysread($sock, $len_packed, 4);
     
-    return undef unless $bytes_read == 4;
+    if ($bytes_read != 4) {
+        warn "recv_response [PID $$]: Failed to read length prefix (got $bytes_read bytes)\n";
+        return undef;
+    }
     
     my $len = unpack('N', $len_packed);
-    return undef if $len > $MAX_REQUEST_LENGTH;
+
+    # Sanity check: JSON responses should be at least 2 bytes (e.g., "{}")
+    # and reasonably sized (under 1MB)
+    if ($len < 2) {
+	warn "recv_response [PID $$]: Suspiciously small length ($len)\n";
+	warn "  Length bytes (hex): " . unpack('H*', $len_packed) . "\n";
+	return undef;
+    }
+
+    if ($len > $MAX_REQUEST_LENGTH) {
+	warn "recv_response [PID $$]: Response too large ($len bytes)\n";
+	return undef;
+    }
     
     # Read data
     my $json = '';
     while (length($json) < $len) {
-        my $chunk;
+        my $chunk = '';
         my $remaining = $len - length($json);
-        my $n = read($sock, $chunk, $remaining);
-        
-        return undef unless $n > 0;
+        my $n = sysread($sock, $chunk, $remaining);
+
+	if (!defined $n || $n <= 0) {
+            warn "recv_response [PID $$]: Read failed or EOF (read returned " . (defined $n ? $n : 'undef') . ")\n";
+            warn "  Expected $len bytes, got " . length($json) . " so far\n";
+            return undef;
+        }
+
         $json .= $chunk;
+    }
+
+    # VERIFY: We read exactly $len bytes, no more
+    if (length($json) != $len) {
+	warn "FATAL [PID $$]: recv_response read " . length($json) . " bytes but expected $len!\n";
+	die "Socket corruption detected\n";
+    }
+
+    # Debug: show what we're trying to decode
+    if ($main::debug_flag) {
+        my $preview = substr($json, 0, 100);
+        warn "DEBUG: recv_response [PID $$]: Received $len bytes, first 100 chars: $preview\n";
     }
     
     my $response = eval { decode_json($json) };
     if ($@) {
-        warn "JSON decode error in recv_response: $@\n";
+        warn "JSON decode error in recv_response [PID $$]: $@\n";
+        
+        # Show what we actually received
+        my $hex_preview = unpack('H*', substr($json, 0, 32));
+        my $char_preview = substr($json, 0, 32);
+        $char_preview =~ s/([^[:print:]])/sprintf("\\x%02x", ord($1))/ge;
+        
+        warn "  Length field said: $len bytes\n";
+        warn "  Actually received: " . length($json) . " bytes\n";
+        warn "  First 32 bytes (hex): $hex_preview\n";
+        warn "  First 32 bytes (escaped): $char_preview\n";
+        
         return undef;
+    }
+
+    if ($main::debug_flag && $response->{_req_id}) {
+	warn "DEBUG: [PID $$] Received response for request #$response->{_req_id}\n";
     }
     
     return $response;
@@ -4009,22 +4218,33 @@ sub request_open {
     }
 
     if ($response->{success}) {
-	# Explicit ACK for Linux.
+	# ACK protocol only on Linux.
 	if ($^O eq 'linux') {
 	    warn "DEBUG: Sending ACK for FD transfer\n" if ($main::debug_flag);
 	    # Send ACK to tell parent we're ready to receive FD (needed for Linux).
-	    print $sock "ACK";
-	    $sock->flush();
+	    my $n = syswrite ($sock, 'ACK', 3);
+	    if ($n != 3) {
+		warn "Failed to send ACK: " . ($! || 'short write') . "\n";
+	    }
 	}
 	
 	# Now receive file descriptor from privileged parent
 	my $fd = IO::FDPass::recv(fileno($sock));
-    
+
+	warn "DEBUG: [PID $$] After recv FD, got fd=$fd for $path\n" if ($main::debug_flag);
+
 	if (!defined $fd || $fd < 0) {
-	    warn "Failed to receive file descriptor for $path\n";
+	    warn "Failed to receive file descriptor for $path [PID $$]\n";
 	    return undef;
 	}
-    
+
+	# OpenBSD: Verify socket is still readable
+	if ($^O eq 'openbsd' && $main::debug_flag) {
+	    my $select = IO::Select->new($sock);
+	    my $readable = $select->can_read(0) ? "YES" : "NO";
+	    warn "DEBUG: [PID $$] After FD recv, socket readable: $readable\n";
+	}
+
 	# Convert file descriptor to Perl filehandle
 	# Use appropriate mode for fdopen
 	my $fdopen_mode = $mode eq '>' ? '>&=' : '<&=';
@@ -4039,7 +4259,7 @@ sub request_open {
     }
 
     # Neither success nor error.
-    die "Protocol error: OPEN response has neither success nor error.\n";
+    die "Protocol error: OPEN response has neither success nor error. [PID $$]\n";
 }
 
 sub request_readdir {
