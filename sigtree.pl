@@ -247,6 +247,9 @@
 #    changed files.
 # Modified 1 February 2026 to fix the actual underlying FD passing problem which was
 #    improper assignment of worker sockets.
+# Modified 4 February 2026 to properly handle nonprinting characters in file
+#    and directory names with privilege separation. Add strict/warnings for
+#    each package.
 
 ### Required packages.
 
@@ -280,6 +283,7 @@
 #   * IO::Handle, IO::Select, IO::Socket
 #   * IO::FDPass
 #   * Privileges::Drop
+#   * MIME::Base64
 # Note that each of these dependencies is potentially a route that
 # could be exploited to subvert this program's intended function.
 #
@@ -305,6 +309,7 @@ use Getopt::Std;
 #use IO::Select;
 use IO::Socket;
 #use IO::Socket::UNIX; # not used unless reportnew subs are borrowed
+use MIME::Base64 qw( encode_base64 decode_base64 );
 use Sys::Hostname;
 use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkstemp mkdtemp );
 use if $^O eq "openbsd", "OpenBSD::Pledge";
@@ -340,7 +345,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.22a of 1 February 2026';
+my $VERSION = 'sigtree 1.22b of 4 February 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -2937,10 +2942,13 @@ sub handle_readdir_request {
     
     my @entries = grep { !/^\.\.?$/ } readdir($dh);
     closedir $dh;
+
+    # Base64 encode each entry to handle non-UTF8 filenames
+    my @entries_b64 = map { encode_base64 ($_, '') } @entries;
     
     return {
         success => 1,
-        entries => \@entries
+        entries => \@entries_b64
     };
 }
 
@@ -2961,10 +2969,11 @@ sub handle_readlink_request {
     my @stat = stat ($canonical_target);
     my $mode = $stat[2];
     my $linktarget_type = FileAttr::_get_file_type ($mode);
-    
+
+    # Base64 encode target to handle non-UTF8
     return {
         success => 1,
-        target => $canonical_target,
+        target_b64 => encode_base64 ($canonical_target, ''),
 	target_type => $linktarget_type
     };
 }
@@ -3127,6 +3136,9 @@ sub is_allowed_path {
 
 # Methods to handle config file object.
 package Config;
+
+use strict;
+use warnings;
 
 # Parse a config file, report any errors, create a config object.
 # Config file has three sections:
@@ -3959,6 +3971,10 @@ sub tree_for_path {
 ###############################################################################
 package PrivSep;
 
+use strict;
+use warnings;
+use MIME::Base64;
+
 # Try to load JSON (with fallback)
 my $json_loaded = 0;
 BEGIN {
@@ -3980,8 +3996,14 @@ sub send_request {
     # Add unique ID for debugging
     state $req_id = 0;
     $request->{_req_id} = ++$req_id;
-    
-    print "DEBUG: [CHILD] [PID $$] Sending request #$req_id  type=$request->{type} $request->{path}\n" if ($main::debug_flag);    
+
+    print "DEBUG: [CHILD] [PID $$] Sending request #$req_id  type=$request->{type} $request->{path}\n" if ($main::debug_flag);
+
+    # Base64 encode path.
+    if (exists $request->{path}) {
+	$request->{path_b64} = encode_base64 ($request->{path}, ''); # '' no newlines
+	delete $request->{path};
+    }
     my $json = encode_json($request);
     my $len = pack('N', length($json));
 
@@ -4044,6 +4066,12 @@ sub recv_request {
     if ($@) {
         warn "JSON decode error in recv_request: $@\n";
         return undef;
+    }
+
+    # Base64-decode path
+    if (exists $request->{path_b64}) {
+	$request->{path} = decode_base64 ($request->{path_b64});
+	delete $request->{path_b64};
     }
     
     return $request;
@@ -4277,8 +4305,10 @@ sub request_readdir {
         warn "Privileged readdir failed: $response->{error}\n";
         return [];
     }
-    
-    return $response->{entries};
+
+    # Base64 decode each entry.
+    my @decoded = map { decode_base64 ($_) } @{$response->{entries_b64}};
+    return \@decoded;
 }
 
 sub request_readlink {
@@ -4296,8 +4326,9 @@ sub request_readlink {
         warn "Privileged readlink failed: $response->{error}\n";
         return undef;
     }
-    
-    return ($response->{target}, $response->{target_type});;
+
+    # Base64 decode target
+    return (decode_base64 ($response->{target_b64}), $response->{target_type});;
 }
 
 sub request_immutable_get {
@@ -4447,6 +4478,8 @@ sub request_verify_signature {
 # a file's attributes against an existing spec, etc.
 package FileAttr;
 
+use strict;
+use warnings;
 use Cwd qw( abs_path ); # used in _canonicalize_link_target
 use Errno qw( EACCES EPERM );
 use Fcntl ':mode'; # For S_IRUSR, S_IRGRP, S_IROTH, etc.
@@ -5379,6 +5412,8 @@ sub display {
 # variable from main program.
 package Spec;
 
+use strict;
+use warnings;
 use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore_fd);
 
 # Method to create new spec or restore one from a saved file.
@@ -5549,6 +5584,8 @@ sub get_info {
 # unprivileged child process.
 package ChangedFile;
 
+use strict;
+use warnings;
 use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore nstore_fd retrieve);
 
 # Method to create a new changed file or read in its contents,

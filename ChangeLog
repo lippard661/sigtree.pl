@@ -1,3 +1,5 @@
+4 February 2026: 1.22b: Fix privsep handling of files with non-UTF8
+	characters. Add strict/warnings for each package.
 1 February 2026: 1.22a: Fix bugs in child changed file handling in
 	privilege separation case, remove unnecessary locking,
 	add FD passing ACK timeout for Linux. Fix bug in worker

@@ -30,7 +30,8 @@ and requires the following in order to work:
 * CPAN Perl module Parallel::ForkManager (1.19 w/OpenBSD or later).
 * On OpenBSD, uses OpenBSD::Pledge, OpenBSD::Unveil, and OpenBSD::MkTemp.
 * Privilege separation requires IO::Socket, IO::Handle, IO::Select,
-  IO::FDPass, Privileges::Drop, and either JSON::MaybeXS or JSON::PP.
+  IO::FDPass, MIME::Base64, Privileges::Drop, and either JSON::MaybeXS
+  or JSON::PP.
   Note that Privileges::Drop fails on macOS with the base perl installation
   included with Tahoe 26, but works fine with the latest perl install with
   Homebrew (or you can make a small patch to Privileges::Drop to make it
