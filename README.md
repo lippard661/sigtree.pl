@@ -1,5 +1,5 @@
 # sigtree.pl
-Perl script to do file integrity monitoring for *BSD, Linux, macOS. Optionally uses privilege separation.
+Perl script to do file integrity monitoring for *BSD, Linux, macOS. Optionally uses privilege separation (with user _sigtree, group _sigtree).
 
 This is version 1.22b of 4 February 2026 from https://www.discord.org/lippard/software/
 
