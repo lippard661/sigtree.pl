@@ -6,3 +6,4 @@ sigtree.pl                      The sigtree.pl code itself
 sigtree.conf                    A sample config file
 macOS.sigtree.conf              Config file for Macintosh
 linux.sigtree.conf              Config file for Linux
+gpg-noagent			Shell script to allow GPG2 signing with privsep

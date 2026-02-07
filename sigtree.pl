@@ -252,8 +252,8 @@
 #    each package.
 # Modified 7 February 2026 by Jim Lippard to correct references to $MAIN_PRIV_SOCK to use
 #    $FileAttr::PRIV_IPC, remove warning if directory or file is missing in
-#    request_stat as that is normal and expected. Fix the getting of PGP
-#    passphrase and test signing for privsep case.
+#    request_stat as that is normal and expected. Make GPG signing work with
+#    privsep despite lack of tty.
 
 ### Required packages.
 
@@ -357,6 +357,7 @@ my $ROOT_PGP_PATH = '/root/.pgp';
 my $ROOT_GPG_PATH = '/root/.gnupg';
 my $PGP_COMMAND = '/usr/local/bin/pgp';
 my $GPG_COMMAND = '/usr/local/bin/gpg';
+my $GPG_NOAGENT = '/usr/local/bin/gpg-noagent';
 my $SIGTREE_SIGNIFY_PUBKEY = '/etc/signify/sigtree.pub';
 my $SIGTREE_SIGNIFY_SECKEY = '/etc/signify/sigtree.sec';
 
@@ -814,6 +815,10 @@ if ($OSNAME eq 'openbsd') {
 	}
 	else {
 	    unveil ($PGP::Sign::PGPPATH, 'rx');
+	    if ($use_privsep) {
+		unveil ($BINSH, 'rx');
+		unveil ($GPG_NOAGENT, 'rx');
+	    }
 	    if ($PGP_or_GPG eq 'PGP') {
 		unveil ($ROOT_PGP_PATH, 'rw');
 		unveil ($PGP_COMMAND, 'rx');
@@ -890,6 +895,12 @@ if ($use_privsep) {
     @ALLOWED_TREES = $config->all_trees();
     push (@ALLOWED_TREES, $spec_dir) if $spec_dir;
     push (@ALLOWED_TREES, $root_dir) if $root_dir;
+
+    # GPG2+ with gpg-agent doesn't work with privsep (no TTY in privileged parent)
+   # Force GPG1 mode which prompts directly for passphrase BEFORE forking
+   if ($use_pgp && $PGP_or_GPG eq 'GPG') {
+       $PGP_or_GPG = 'GPG1';
+   }
 
     # Set up main privileged socket and worker sockets and fork
     # between privileged parent and unprivileged child.
@@ -2681,6 +2692,12 @@ sub setup_privsep_per_worker {
         # Close worker ends (we don't need them)
         close $main_worker_sock;
         close $_ for @worker_socks;
+
+	if ($use_pgp) {
+	    # Use GPG wrapper that runs in batch mode without TTY
+	    $PGP::Sign::PGPS = $PGP::Sign::PGPS; # Avoid "used only once" warning
+	    $PGP::Sign::PGPS = $GPG_NOAGENT;
+	}
 
 	if ($^O eq 'openbsd') {
 	    # Re-pledge, removing @UNVEIL_PROMISE, @PRIVSEP_NONPRIV_PROMISES,

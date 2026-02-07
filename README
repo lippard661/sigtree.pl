@@ -36,6 +36,8 @@ and requires the following in order to work:
   included with Tahoe 26, but works fine with the latest perl install with
   Homebrew (or you can make a small patch to Privileges::Drop to make it
   workaround a bug in perl 5.34.1).
+  Note also that GPG2 signing with privsep requires use of provided
+  gpg-noagent shell script.
 
 If signify signing is used (which is recommended), the following is also
 required:
