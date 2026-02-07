@@ -251,7 +251,8 @@
 #    and directory names with privilege separation. Add strict/warnings for
 #    each package.
 # Modified 7 February 2026 by Jim Lippard to correct references to $MAIN_PRIV_SOCK to use
-#    $FileAttr::PRIV_IPC.
+#    $FileAttr::PRIV_IPC, remove warning if directory or file is missing in
+#    request_stat as that is normal and expected.
 
 ### Required packages.
 
@@ -4202,7 +4203,10 @@ sub request_stat {
     my $response = recv_response($sock);
     
     if ($response->{error}) {
-        warn "Privileged stat failed: $response->{error}\n";
+	# Do not warn for expected error for missing files (ENOENT)
+	unless ($response->{error} =~ /No such file or directory/) {
+	    warn "Privileged stat failed: $response->{error}\n";
+	}
         return ();
     }
     
