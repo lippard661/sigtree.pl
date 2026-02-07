@@ -896,11 +896,17 @@ if ($use_privsep) {
     push (@ALLOWED_TREES, $spec_dir) if $spec_dir;
     push (@ALLOWED_TREES, $root_dir) if $root_dir;
 
-    # GPG2+ with gpg-agent doesn't work with privsep (no TTY in privileged parent)
-   # Force GPG1 mode which prompts directly for passphrase BEFORE forking
-   if ($use_pgp && $PGP_or_GPG eq 'GPG') {
-       $PGP_or_GPG = 'GPG1';
-   }
+    # GPG2+ with gpg-agent doesn't work with privsep
+    # (no TTY in privileged parent)
+    # Force GPG1 mode which prompts directly for passphrase BEFORE forking
+    # (Note: if the GPG vs. GPG1 logic is ever used for anything else,
+    # this can safely be removed; at present it is only used to determine
+    # the method for obtaining the passphrase (not using gpg-agent as is
+    # default for GPG2), but the get_pgp_passphrase subroutine also checks
+    # $use_privsep so this is redundant.)
+    if ($use_pgp && $PGP_or_GPG eq 'GPG') {
+	$PGP_or_GPG = 'GPG1';
+    }
 
     # Set up main privileged socket and worker sockets and fork
     # between privileged parent and unprivileged child.
@@ -2430,12 +2436,19 @@ sub set_immutable_flag {
 }
 
 # Subroutine to get PGP passphrase.
+# Must prompt for password if using GPG (GPG2) and privsep, as privileged
+# process has no tty.
 sub get_pgp_passphrase {
     my ($pgp_passphrase, $current_tty, $temp_file);
 
-    if ($PGP_or_GPG eq 'PGP' || $PGP_or_GPG eq 'GPG1' || $PGP_or_GPG eq 'signify') {
+    if ($PGP_or_GPG eq 'PGP' ||
+	$PGP_or_GPG eq 'GPG1' ||
+	($PGP_or_GPG eq 'GPG' && $main::use_privsep) ||
+	$PGP_or_GPG eq 'signify') {
+	# Always show actual crypto system name
+	my $display_name = ($PGP_or_GPG eq 'GPG1' || $PGP_or_GPG eq 'GPG') ? 'GPG' : $PGP_or_GPG;
 	system ($STTY, '-echo');
-	print "$PGP_or_GPG Passphrase: ";
+	print "$display_name Passphrase: ";
 	$pgp_passphrase = <STDIN>;
 	print "\n";
 	system ($STTY, 'echo');
