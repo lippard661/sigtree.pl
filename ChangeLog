@@ -1,3 +1,4 @@
+7 February 2026: 1.22c: Fix privsep references to $MAIN_PRIV_SOCK.
 4 February 2026: 1.22b: Fix privsep handling of files with non-UTF8
 	characters. Add strict/warnings for each package.
 1 February 2026: 1.22a: Fix bugs in child changed file handling in

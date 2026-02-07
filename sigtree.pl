@@ -245,11 +245,13 @@
 # Modified 1 February 2026 by Jim Lippard to add FD passing ACK timeout for Linux and
 #    fix bugs in child changed file handling, removing unnecessary locking for the child
 #    changed files.
-# Modified 1 February 2026 to fix the actual underlying FD passing problem which was
+# Modified 1 February 2026 by Jim Lippard to fix the actual underlying FD passing problem which was
 #    improper assignment of worker sockets.
-# Modified 4 February 2026 to properly handle nonprinting characters in file
+# Modified 4 February 2026 by Jim Lippard to properly handle nonprinting characters in file
 #    and directory names with privilege separation. Add strict/warnings for
 #    each package.
+# Modified 7 February 2026 by Jim Lippard to correct references to $MAIN_PRIV_SOCK to use
+#    $FileAttr::PRIV_IPC.
 
 ### Required packages.
 
@@ -345,7 +347,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.22b of 4 February 2026';
+my $VERSION = 'sigtree 1.22c of 7 February 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1875,10 +1877,10 @@ sub update_sets {
 	# the changed_file. (But why wasn't it found above and handled?)
 	if ($tree ne $spec_dir && $config->tree_uses_sets ($tree, @sets)) {
 	    if ($use_privsep && $use_immutable) {
-		PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, $spec_dir, $IMMUTABLE_OFF);
-		PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
+		PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, $spec_dir, $IMMUTABLE_OFF);
+		PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name", $IMMUTABLE_OFF);
 		if ($use_pgp) {
-		    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
+		    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_OFF);
 		}
 	    }
 	    elsif ($use_immutable) {
@@ -1961,9 +1963,9 @@ sub update_sets {
 		sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
 	    }
 	    if ($use_privsep && $use_immutable) {
-		PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
 		if ($use_pgp) {
-		    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
+		    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
 		}
 	    }
 	    elsif ($use_immutable) {
@@ -1990,9 +1992,9 @@ sub update_sets {
     }
     print "Updating specification for specification dir.\n" if ($verbose);
     if ($use_privsep && $use_immutable) {
-	PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
+	PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec", $IMMUTABLE_OFF);
 	if ($use_pgp) {
-	    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
+	    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_OFF);
 	}
     }
     elsif ($use_immutable) {
@@ -2005,7 +2007,7 @@ sub update_sets {
     # This must be done before the specification for the specification dir
     # is created, since changing flags involves inode modification.
     if ($use_privsep && $use_immutable) {
-	PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, $spec_dir, $IMMUTABLE_ON);
+	PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, $spec_dir, $IMMUTABLE_ON);
     }
     elsif ($use_immutable) {
 	set_immutable_flag ($spec_dir, $IMMUTABLE_ON);
@@ -2015,9 +2017,9 @@ sub update_sets {
 	sigtree_sign ("$spec_dir_dir/$spec_spec", $pgp_passphrase);
     }
     if ($use_privsep && $use_immutable) {
-	PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
+	PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec", $IMMUTABLE_ON);
 	if ($use_pgp) {
-	    PrivSep::request_immutable_set ($MAIN_PRIV_SOCK, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
+	    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
 	}
     }
     elsif ($use_immutable) {
@@ -2456,7 +2458,7 @@ sub sigtree_sign {
     my ($file, $pgp_passphrase) = @_;
 
     if ($use_privsep) {
-	PrivSep::request_sign_file ($MAIN_PRIV_SOCK,
+	PrivSep::request_sign_file ($FileAttr::PRIV_IPC,
 				    $file, $pgp_passphrase,
 				    $use_signify,
 				    $signify_seckey);
@@ -2474,7 +2476,7 @@ sub sigtree_verify {
     my ($file) = @_;
 
     if ($use_privsep) {
-	PrivSep::request_verify_signature ($MAIN_PRIV_SOCK,
+	PrivSep::request_verify_signature ($FileAttr::PRIV_IPC,
 					   $file,
 					   $use_signify,
 					   $signify_pubkey);
