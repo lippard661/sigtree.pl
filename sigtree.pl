@@ -252,7 +252,8 @@
 #    each package.
 # Modified 7 February 2026 by Jim Lippard to correct references to $MAIN_PRIV_SOCK to use
 #    $FileAttr::PRIV_IPC, remove warning if directory or file is missing in
-#    request_stat as that is normal and expected.
+#    request_stat as that is normal and expected. Fix the getting of PGP
+#    passphrase and test signing for privsep case.
 
 ### Required packages.
 
@@ -2444,7 +2445,7 @@ sub get_pgp_passphrase {
 	else {
 	    (my $fh, $temp_file) = tempfile ("/tmp/sigtree.XXXXXXXX");
 	}
-	sigtree_pgp_sign ($temp_file, $pgp_passphrase); # can skip the wrapper
+	sigtree_sign ($temp_file, $pgp_passphrase); # can no longer skip the wrapper due to privsep case
 	unlink ($temp_file);
 	unlink ("$temp_file.sig");
 	return ($pgp_passphrase);
@@ -3081,6 +3082,10 @@ sub is_sigtree_managed_file {
     # - Spec spec file in $spec_dir_dir
     # - Changed files in $spec_dir_dir (*.changed, *.changedsec)
     # - NOT arbitrary files in $root_dir (no longer used for changed files)
+
+    # Allow /tmp files for passphrase prompting (signing temp files)
+    # These are created by get_pgp_passphrase to initialize gpg-agent
+    return 1 if $path =~ m{^/tmp/sigtree\.[^/]+$};
     
     # Check if path is in spec_dir (per-host specs)
     if (defined $spec_dir) {
