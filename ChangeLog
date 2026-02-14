@@ -1,3 +1,5 @@
+14 February 2026: 1.22d: Minor cleanup, comments, don't set $PGP_or_GPG to GPG1
+	just for privsep workaround for gpg-agent when using GPG2.
 7 February 2026: 1.22c: Fix privsep references to $MAIN_PRIV_SOCK,
 	remove warning for nonexistent file/dir in request_stat.
 	Fix GPG signing with privsep.

@@ -254,6 +254,10 @@
 #    $FileAttr::PRIV_IPC, remove warning if directory or file is missing in
 #    request_stat as that is normal and expected. Make GPG signing work with
 #    privsep despite lack of tty.
+# Modified 14 February 2026 by Jim Lippard to not set PGP_or_GPG to "GPG1" when
+#    using privsep with GPG2, as it then displays "GPG1" in multiple places it
+#    shouldn't. We already had a redundant check, which we keep, before prompting
+#    for a passphrase (which doesn't work with gpg-agent in privsep mode).
 
 ### Required packages.
 
@@ -349,7 +353,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.22c of 7 February 2026';
+my $VERSION = 'sigtree 1.22d of 14 February 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -357,7 +361,7 @@ my $ROOT_PGP_PATH = '/root/.pgp';
 my $ROOT_GPG_PATH = '/root/.gnupg';
 my $PGP_COMMAND = '/usr/local/bin/pgp';
 my $GPG_COMMAND = '/usr/local/bin/gpg';
-my $GPG_NOAGENT = '/usr/local/bin/gpg-noagent';
+my $GPG_NOAGENT = '/usr/local/bin/gpg-noagent'; # Wrapper for batch-mode GPG (privsep, no tty in privileged process)
 my $SIGTREE_SIGNIFY_PUBKEY = '/etc/signify/sigtree.pub';
 my $SIGTREE_SIGNIFY_SECKEY = '/etc/signify/sigtree.sec';
 
@@ -383,6 +387,19 @@ my $ROOT_DIR = '/var/db/sigtree';
 my $SYSCONF_DIR = '/etc';
 
 # Pledge promises.
+# - rpath: Read filesystem paths
+# - wpath: Write to files
+# - cpath: Create new files
+# - tmppath: Create temp files in /tmp
+# - fattr: Get/set file attributes (immutable flags)
+# - exec: Execute external programs (GPG, chflags, etc.)
+# - proc: Process control (fork, waitpid)
+# - unveil: Set filesystem restrictions
+# - flock: File locking
+# - sendfd: send file descriptor
+# - recvfd: receive file descriptor
+# - id: setuid/setgid
+# - prot_exec: required to drop privs with Privileges::Drop
 my @READONLY_PROMISES = ('rpath');
 my @READWRITE_PROMISES = ('wpath', 'cpath', 'tmppath');
 my @CHANGE_ATTR_PROMISES = ('fattr');
@@ -896,18 +913,6 @@ if ($use_privsep) {
     push (@ALLOWED_TREES, $spec_dir) if $spec_dir;
     push (@ALLOWED_TREES, $root_dir) if $root_dir;
 
-    # GPG2+ with gpg-agent doesn't work with privsep
-    # (no TTY in privileged parent)
-    # Force GPG1 mode which prompts directly for passphrase BEFORE forking
-    # (Note: if the GPG vs. GPG1 logic is ever used for anything else,
-    # this can safely be removed; at present it is only used to determine
-    # the method for obtaining the passphrase (not using gpg-agent as is
-    # default for GPG2), but the get_pgp_passphrase subroutine also checks
-    # $use_privsep so this is redundant.)
-    if ($use_pgp && $PGP_or_GPG eq 'GPG') {
-	$PGP_or_GPG = 'GPG1';
-    }
-
     # Set up main privileged socket and worker sockets and fork
     # between privileged parent and unprivileged child.
     ($PRIVILEGED_PARENT_PID, my $worker_socks_ref, $MAIN_PRIV_SOCK) =
@@ -1037,7 +1042,8 @@ sub initialize_sets {
     $pgp_passphrase = get_pgp_passphrase() if ($use_pgp);
 
     if (!$specs_only) {
-
+	# With privsep, we can't do -e checks after dropping privileges
+	# so we collect all spec existence info before privsep in @EXISTING_SPECS
 	if ((!$use_privsep && -e $changed_file) ||
 	    ($use_privsep && grep { $_ eq $changed_file } @EXISTING_SPECS)) {
 	    $changed_file_exists = 1;
@@ -1159,7 +1165,8 @@ sub initialize_sets {
 		    # Close sockets we don't need.
 		    close $MAIN_PRIV_SOCK;
 		    
-		    # Don't close other worker sockets - just mark them unusable
+		    # Undef other worker sockets rather than closing them
+		    # because closing would affect the parent's copies via socketpair
 		    for my $idx (0..$#WORKER_SOCKETS) {
 			if ($idx != $current_worker_id) {
 			    $WORKER_SOCKETS[$idx] = undef;
@@ -1567,23 +1574,16 @@ sub check_sets {
 	    # In a new worker child process, switch the socket to
 	    # the worker and close the others.	    
 	    if ($use_privsep) {
-		warn "CHILD: [PID $$] checking tree $tree, using worker socket $current_worker_id\n" if ($main::debug_flag);
-		
 		# Set socket we use.
 		$FileAttr::PRIV_IPC = $WORKER_SOCKETS[$current_worker_id];
-
-		# Verify we got the right socker.
-		warn "CHILD: PID $$ FileAttr::PRIV_IPC = " . fileno($FileAttr::PRIV_IPC) . "\n" if ($main::debug_flag);
-
-		# Clear this array entry so Perl doesn't auto-close it later
-		$WORKER_SOCKETS[$current_worker_id] = undef;
-
 		# Close sockets we don't need.
 		close $MAIN_PRIV_SOCK;
+		    
+		# Undef other worker sockets rather than closing them
+		# because closing would affect the parent's copies via socketpair
 		for my $idx (0..$#WORKER_SOCKETS) {
 		    if ($idx != $current_worker_id) {
-			warn "CHILD: [PID $$] closing worker socket $idx (fd " . fileno($WORKER_SOCKETS[$idx]) . ")\n" if ($main::debug_flag);
-			close $WORKER_SOCKETS[$idx];
+			$WORKER_SOCKETS[$idx] = undef;
 		    }
 		}
 	    }
@@ -2445,17 +2445,18 @@ sub get_pgp_passphrase {
 	$PGP_or_GPG eq 'GPG1' ||
 	($PGP_or_GPG eq 'GPG' && $main::use_privsep) ||
 	$PGP_or_GPG eq 'signify') {
-	# Always show actual crypto system name
-	my $display_name = ($PGP_or_GPG eq 'GPG1' || $PGP_or_GPG eq 'GPG') ? 'GPG' : $PGP_or_GPG;
 	system ($STTY, '-echo');
-	print "$display_name Passphrase: ";
+	print "$PGP_or_GPG Passphrase: ";
 	$pgp_passphrase = <STDIN>;
 	print "\n";
 	system ($STTY, 'echo');
 	chop ($pgp_passphrase);
 	return ($pgp_passphrase);
     }
-    elsif ($PGP_or_GPG eq 'GPG') { # gpg-agent does the work when we sign something, so sign a temp file.
+    elsif ($PGP_or_GPG eq 'GPG') {
+	# GPG2 with gpg-agent - only works without privsep (needs TTY)
+	# With privsep, fall through to prompt method above
+	# To get gpg-agent to do the work and get the passphrase, we sign a temp file.
 	$pgp_passphrase = '';
 	open (my $outfh, '-|', $TTY);
 	$current_tty = <$outfh>;
@@ -2707,7 +2708,9 @@ sub setup_privsep_per_worker {
         close $_ for @worker_socks;
 
 	if ($use_pgp) {
-	    # Use GPG wrapper that runs in batch mode without TTY
+	    # Configure GPG for non-interactive mode in privileged parent
+	    # The gpg-noagent wrapper adds --batch --no-tty --pinentry-mode loopback
+	    # which allows GPG to accept passphrase programmatically without TTY access
 	    $PGP::Sign::PGPS = $PGP::Sign::PGPS; # Avoid "used only once" warning
 	    $PGP::Sign::PGPS = $GPG_NOAGENT;
 	}
@@ -4037,7 +4040,9 @@ sub send_request {
 
     print "DEBUG: [CHILD] [PID $$] Sending request #$req_id  type=$request->{type} $request->{path}\n" if ($main::debug_flag);
 
-    # Base64 encode path.
+    # Base64-encode paths to handle non-UTF8 filenames
+    # JSON requires valid UTF-8 strings, but Unix filenames can contain
+    # arbitrary bytes (like \x88). Base64 encoding preserves all bytes.
     if (exists $request->{path}) {
 	$request->{path_b64} = encode_base64 ($request->{path}, ''); # '' no newlines
 	delete $request->{path};
@@ -4075,6 +4080,7 @@ sub send_request {
 # Subroutine to receive a request on the privileged side.
 sub recv_request {
     my ($sock) = @_;
+    # Max request size: 1MB for large file paths and Base64-encoded data
     my $MAX_REQUEST_LENGTH = 1024 * 1024;
     # Previously was 10MB (10_000_000)
     
@@ -4139,6 +4145,7 @@ sub send_response {
 # Subroutine to receive a response on the nonprivileged side.
 sub recv_response {
     my ($sock) = @_;
+    # Max request size: 1MB for large file paths and Base64-encoded data
     my $MAX_REQUEST_LENGTH = 1024 * 1024;
 
     if ($main::debug_flag) {
@@ -4226,6 +4233,9 @@ sub recv_response {
 # These can be called from anywhere with appropriate socket
 ###############################################################################
 
+# Request a privileged stat operation
+# Args: $sock (socket), $path (file path)
+# Returns: Array of stat values (dev, ino, mode, ...) or empty list on error
 sub request_stat {
     my ($sock, $path) = @_;
     
