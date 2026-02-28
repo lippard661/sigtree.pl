@@ -258,6 +258,7 @@
 #    using privsep with GPG2, as it then displays "GPG1" in multiple places it
 #    shouldn't. We already had a redundant check, which we keep, before prompting
 #    for a passphrase (which doesn't work with gpg-agent in privsep mode).
+# Modified 27 February 2026 by Jim Lippard to remove tmppath pledge.
 
 ### Required packages.
 
@@ -353,7 +354,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.22d of 14 February 2026';
+my $VERSION = 'sigtree 1.22e of 28 February 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -390,7 +391,6 @@ my $SYSCONF_DIR = '/etc';
 # - rpath: Read filesystem paths
 # - wpath: Write to files
 # - cpath: Create new files
-# - tmppath: Create temp files in /tmp
 # - fattr: Get/set file attributes (immutable flags)
 # - exec: Execute external programs (GPG, chflags, etc.)
 # - proc: Process control (fork, waitpid)
@@ -401,7 +401,7 @@ my $SYSCONF_DIR = '/etc';
 # - id: setuid/setgid
 # - prot_exec: required to drop privs with Privileges::Drop
 my @READONLY_PROMISES = ('rpath');
-my @READWRITE_PROMISES = ('wpath', 'cpath', 'tmppath');
+my @READWRITE_PROMISES = ('wpath', 'cpath');
 my @CHANGE_ATTR_PROMISES = ('fattr');
 my @EXEC_PROMISES = ('exec', 'proc');
 my @FLOCK_PROMISE = ('flock');
