@@ -259,6 +259,9 @@
 #    shouldn't. We already had a redundant check, which we keep, before prompting
 #    for a passphrase (which doesn't work with gpg-agent in privsep mode).
 # Modified 27 February 2026 by Jim Lippard to remove tmppath pledge.
+# Modified 13 April 2026 by Jim Lippard to count mtimestasis violations (lack
+#    of change for some period of time) as changes so that they display even
+#    if there are no other changes to report.
 
 ### Required packages.
 
@@ -354,7 +357,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.22e of 28 February 2026';
+my $VERSION = 'sigtree 1.23 of 13 April 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -5201,8 +5204,9 @@ sub compare {
     if ($keywords{'mtimestasis'} && !($self->_compare ($self->{MTIME}, $fileattr->{MTIME})) &&
 	$self->_mtime_stasis_greater ($fileattr->{MTIME}, $keywords{'mtimestasis'})) {
 	$differences{'mtimestasis'} = $keywords{'mtimestasis'};
-	# We do not set $differences{'any'} = 1 because this is a lack of change.
-	# Reporting with -v needs to specialcase the presence of $differences{'mtimestasis'}.
+	$differences{'any'} = 1;
+	# We now set $differences{'any'} = 1 because lack of change for critical logs counts
+	# as a change.
     }
     if ($keywords{'ctime'} && ($self->_compare ($self->{CTIME}, $fileattr->{CTIME}))) {
 	$differences{'ctime'} = $fileattr->{CTIME};

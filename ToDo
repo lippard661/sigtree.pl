@@ -1,6 +1,8 @@
 BUGS:
 
-(1.21a fixes) Fixed bug in handling link targets.
+(1.23 fixes) Bug in critical-log (mtimestasis keyword) handling.
+
+(1.21a fixes) Bug in handling link targets.
 
 (1.20b fixes) Initialize on /dev takes forever for Proxmox/Debian Linux
 (problem is /dev/core, default config now ignores).
@@ -22,6 +24,18 @@ in the changed file, initialize_specs doesn't take it out. (Have modified
 update to permit updating a changed spec directory with version 1.14.)
 
 FEATURES TO ADD:
+
+Add a way to run check against a non-local host using a copy of the
+specs, that has a different file system prefix (e.g., a backup or
+separately mounted file system); it would pre-pend the prefix on the
+files being checked. (Also support for update?) Need to think through
+the pros and cons of verifying rsynced specs from the original host vs.
+just running a separate initialize/check/update on the backup, which
+would require a separate config.
+
+Add sign_specs that signs (or re-signs) them all, perhaps as an option
+to initialize_specs. Currently the only way to do that is re-initializing
+each tree (i.e., initialize_specs doesn't do it).
 
 Set user immutable or +i on changed file if immutable flags are used.
 
