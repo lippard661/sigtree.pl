@@ -262,6 +262,8 @@
 # Modified 13 April 2026 by Jim Lippard to count mtimestasis violations (lack
 #    of change for some period of time) as changes so that they display even
 #    if there are no other changes to report.
+# Modified 16 April 2026 by Jim Lippard to warn about world-readable config
+#    and warn about spec permissions when they are group or world-readable.
 
 ### Required packages.
 
@@ -357,7 +359,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.23 of 13 April 2026';
+my $VERSION = 'sigtree 1.23a of 16 April 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -611,6 +613,20 @@ elsif ($command ne 'initialize' &&
 }
 
 $config = new Config ($config_file);
+
+# Verify config file permissions are not world-readable.
+my @stat = stat ($config_file);
+if (@stat) {
+    my $mode = $stat[2] & 07777; # Get permission bits
+    if ($mode & 0004) { # world-readable bit set
+	warn "Warning: Config file $config_file is world-readable (permissions: " .
+	    sprintf ("%04o", $mode) . "). Consider chmod 0600 $config_file\n";
+    }
+    if ($mode & 0040) { # Group-readable bit set
+	warn "Warning: Config file $config_file is group-readable (permissions: " .
+	    sprintf ("%04o", $mode) . "). Consider chmod 0600 $config_file\n";
+    }
+}
 
 if ($set) {
     ($arg_no, $error, @sets) = $config->valid_setlist ($set);
@@ -2227,6 +2243,67 @@ sub verify_required_dirs {
 	elsif ($caller != $CHECK && !-w $spec_dir_dir . "/$spec_spec.sig") {
 	    die "Host specification signature is not writable. $spec_dir_dir/$spec_spec.sig\n";
 	}
+    }
+
+    # Check for world-readable or group-readable spec files
+    # This catches historically created files with insecure permissions
+    my @files_to_check;
+    
+    # Add changed file
+    push @files_to_check, $changed_file if -e $changed_file;
+    
+    # Add spec of specs and its signature
+    push @files_to_check, "$spec_dir_dir/$spec_spec" if -e "$spec_dir_dir/$spec_spec";
+    push @files_to_check, "$spec_dir_dir/$spec_spec.sig" if $use_pgp && -e "$spec_dir_dir/$spec_spec.sig";
+    
+    # Add all spec files in spec_dir
+    if (-d $spec_dir) {
+        opendir(my $dh, $spec_dir);
+        if ($dh) {
+            my @spec_files = grep { /\.spec$|\.sig$/ } readdir($dh);
+            closedir $dh;
+            push @files_to_check, map { "$spec_dir/$_" } @spec_files;
+        }
+    }
+    
+    my @insecure_files;
+    foreach my $file (@files_to_check) {
+        my @stat = stat($file);
+        if (@stat) {
+            my $mode = $stat[2] & 0777;
+            if ($mode & 0077) {  # Any group or world permissions
+                push @insecure_files, sprintf("%s (%04o)", $file, $mode);
+            }
+        }
+    }
+    
+    if (@insecure_files) {
+        warn "\n" . "="x70 . "\n";
+        warn "WARNING: The following files have insecure permissions:\n";
+        warn "  $_\n" for @insecure_files;
+        warn "\nThese files may contain sensitive path information and should be\n";
+        warn "readable only by root (permissions 0600).\n\n";
+        
+        # Check immutable-specs config setting
+        my $immutable_specs = $config->{IMMUTABLE_SPECS} || 0;
+        
+        if ($use_immutable && $immutable_specs) {
+            warn "To fix (with immutable-specs enabled):\n";
+            if ($^O eq 'linux') {
+                warn "  1. chattr -R -i $spec_dir_dir\n";
+                warn "  2. chmod -R 0600 $spec_dir_dir\n";
+                warn "  3. chattr -R +i $spec_dir_dir\n";
+            } else {
+                # BSD (OpenBSD, FreeBSD, etc.)
+                warn "  1. chflags -R no$immutable_flag $spec_dir_dir\n";
+                warn "  2. chmod -R 0600 $spec_dir_dir\n";
+                warn "  3. chflags -R $immutable_flag $spec_dir_dir\n";
+            }
+        } else {
+            warn "To fix:\n";
+            warn "  chmod -R 0600 $spec_dir_dir\n";
+        }
+        warn "="x70 . "\n\n";
     }
 }
 

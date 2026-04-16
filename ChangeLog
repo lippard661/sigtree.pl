@@ -1,3 +1,4 @@
+16 April 2026: 1.23a: Warn about world-readble/group-readable configs and specs.
 13 April 2026: 1.23: Fix bug in critical-log (mtimestasis) handling.
 28 February 2026: 1.22e: Remove deprecated pledge for "tmppath."
 14 February 2026: 1.22d: Minor cleanup, comments, don't set $PGP_or_GPG to GPG1

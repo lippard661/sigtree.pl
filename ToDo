@@ -1,5 +1,8 @@
 BUGS:
 
+(1.23a fixes) Added warning for config file and spec permissions
+when group- and world-readable.
+
 (1.23 fixes) Bug in critical-log (mtimestasis keyword) handling.
 
 (1.21a fixes) Bug in handling link targets.
