@@ -10,9 +10,9 @@ immutability flags, and privilege separation. Also runs on Linux and macOS.
 Available at https://www.discord.org/lippard/software/ and
 https://github.com/lippard661/sigtree
 
-The OpenBSD package sigtree-1.23a.tgz is signed with signify. To verify:
+The OpenBSD package sigtree-<version>.tgz is signed with signify. To verify:
 ```
-signify -C -p discord.org-2026-pkg.pub -x sigtree-1.23a.tgz
+signify -C -p discord.org-2026-pkg.pub -x sigtree-<version>.tgz
 ```
 Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
@@ -135,7 +135,7 @@ trees are preserved.
 ### Recommended: OpenBSD signed package
 
 ```
-pkg_add ./sigtree-1.23a.tgz
+pkg_add ./sigtree-<version>.tgz
 ```
 
 Or using [install.pl](https://github.com/lippard661/distribute) on OpenBSD,
