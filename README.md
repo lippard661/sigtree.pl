@@ -86,7 +86,7 @@ link            symlink target
 mtime           modification time
 mtimestasis-NN[smhd]  alert if mtime has NOT changed for NN seconds/minutes/hours/days
 ctime           inode change time
-shadigest       SHA-2 or SHA-3 digest (algorithm set globally)
+shadigest       SHA-2 or SHA-3 digest (algorithm set globally, default 256-bit SHA-3)
 flags           filesystem flags (chflags on BSD, chattr on Linux)
 ignore          exclude this file/tree from monitoring entirely
 ```
@@ -203,7 +203,7 @@ signify_pubkey: /path/to/pub
 signify_seckey: /path/to/sec
 immutable-specs: schg         # schg, uchg, yes (=schg), or no
 sha2_digest: 256              # 256, 384, or 512
-sha3_digest: 256              # 224, 256, 384, or 512 (default if unset)
+sha3_digest: 256              # 224, 256, 384, or 512 (default 256 if unset)
 max_child_procs: 5
 default_child_procs: 4
 privsep: yes
