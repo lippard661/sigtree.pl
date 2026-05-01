@@ -264,6 +264,12 @@
 #    if there are no other changes to report.
 # Modified 16 April 2026 by Jim Lippard to warn about world-readable config
 #    and warn about spec permissions when they are group or world-readable.
+# Modified 1 May 2026 by Jim Lippard to wipe $pgp_passphrase from memory after use,
+#    not follow symlinks for privileged file opens for writing (handle_open_request),
+#    not follow symlinks for nonpriv file opens for writing (Spec and ChangedFile
+#    packages, using new main::safe_open_for_write), and tighten up checks in
+#    is_sigtree_managed_file (prevent directory traversal, be stricter on file
+#    names). Prompted by Claude Security assessment (Opus 4.7).
 
 ### Required packages.
 
@@ -314,6 +320,7 @@ use strict;
 use feature 'state';
 use Digest::SHA;
 use Digest::SHA3;
+use Fcntl qw( :DEFAULT O_NOFOLLOW :flock ); # for use with sysopen in handle_open_request and for safe_open_request
 use File::Basename;
 # File::Temp is much larger than OpenBSD::MkTemp.
 use if $^O ne "openbsd", "File::Temp", qw ( :mktemp tempfile );
@@ -359,7 +366,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.23a of 16 April 2026';
+my $VERSION = 'sigtree 1.24 of 1 May 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -2551,6 +2558,8 @@ sub get_pgp_passphrase {
 	    (my $fh, $temp_file) = tempfile ("/tmp/sigtree.XXXXXXXX");
 	}
 	sigtree_sign ($temp_file, $pgp_passphrase); # can no longer skip the wrapper due to privsep case
+	$pgp_passphrase = "x" x length ($pgp_passphrase); # overwrite memory
+	$pgp_passphrase = '';
 	unlink ($temp_file);
 	unlink ("$temp_file.sig");
 	return ($pgp_passphrase);
@@ -2736,6 +2745,26 @@ sub path_to_spec {
     $string =~ s/\//./g;
 
     return ($string);
+}
+
+# Helper to open a file for writing with symlink protection
+# Used across packages (Spec::store_spec, ChangedFile::store_changedfile)
+# Returns filehandle on success, undef on failure (caller checks $!)
+sub safe_open_for_write {
+    my ($path, $needs_lock) = @_;
+    my $fh;
+    unless (sysopen($fh, $path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW)) {
+        return undef;
+    }
+    if ($needs_lock) {
+        unless (flock($fh, LOCK_EX)) {
+            my $saved_errno = $!;
+            close $fh;
+            $! = $saved_errno;
+            return undef;
+        }
+    }
+    return $fh;
 }
 
 ### Privilege separation subroutines (main program, also see separate PrivSep package below).
@@ -3003,8 +3032,17 @@ sub handle_open_request {
 	}
     }
     
-    # Open file as root
-    unless (open($fh, $mode, $path)) {
+    # Open file as root using sysopen.
+    # For writes, use O_NOFOLLOW to prevent symlink-based attacks;
+    # for reads, follow symlinks normally.
+    my $flags;
+    if ($mode eq '>') {
+	$flags = O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW;
+    }
+    else {
+	$flags = O_RDONLY;
+    }
+    unless (sysopen($fh, $path, $flags)) {
         return { error => "$! ($path)" };
     }
     
@@ -3189,6 +3227,13 @@ sub handle_verify_signature_request {
 
 sub is_sigtree_managed_file {
     my ($path) = @_;
+
+    # Reject any path containing directory traversal
+    # This prevents bypassing tree restrictions via ..
+    return 0 if $path =~ m{(?:^|/)\.\.(?:/|$)};
+
+    # Path must be absolute (no relative paths)
+    return 0 unless $path =~ m{^/};
     
     # Only allow writes to:
     # - Spec files in $spec_dir (per-host)
@@ -3201,9 +3246,12 @@ sub is_sigtree_managed_file {
     return 1 if $path =~ m{^/tmp/sigtree\.[^/]+$};
     
     # Check if path is in spec_dir (per-host specs)
+    # Restrict to single path component (no subdirectories) using [^/]+
     if (defined $spec_dir) {
-        return 1 if $path =~ m{^\Q$spec_dir\E/};
         return 1 if $path eq $spec_dir;
+        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.spec$};
+        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.specsec$};
+        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.sig$};
     }
     
     # Check if path is in spec_dir_dir (shared parent for multi-host)
@@ -3219,12 +3267,6 @@ sub is_sigtree_managed_file {
         # Allow changed files in spec_dir_dir
         return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changed$};
         return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changedsec$};
-    }
-    
-    # Also explicitly check for the spec files
-    if (defined ($spec_dir)) {
-	return 1 if $path =~ m{^\Q$spec_dir\E/.*\.spec$};
-	return 1 if $path =~ m{^\Q$spec_dir\E/.*\.sig$};
     }
     
     return 0;
@@ -5546,7 +5588,7 @@ package Spec;
 
 use strict;
 use warnings;
-use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore_fd);
+use Storable qw(fd_retrieve lock_retrieve nstore_fd);
 
 # Method to create new spec or restore one from a saved file.
 sub new {
@@ -5683,7 +5725,11 @@ sub store_spec {
 	close ($fh);
     }
     else {
-	lock_nstore ($self, $spec_path) or die "Failed to store spec to $spec_path: $!\n";
+	# Use main::safe_open_for_write for symlink protection
+	my $fh = main::safe_open_for_write ($spec_path, 1) # 1 = needs lock
+	    or die "Failed to open spec file $spec_path: $!\n";
+	nstore_fd ($self, $fh) or die "Failed to store spec to $spec_path: $!\n";
+	close ($fh);
     }
 }
 
@@ -5718,7 +5764,7 @@ package ChangedFile;
 
 use strict;
 use warnings;
-use Storable qw(fd_retrieve lock_retrieve lock_nstore nstore nstore_fd retrieve);
+use Storable qw(fd_retrieve lock_retrieve nstore_fd retrieve);
 
 # Method to create a new changed file or read in its contents,
 # and reset counters for check.
@@ -6138,13 +6184,20 @@ sub store_changedfile {
 	close ($fh);
     }
     elsif ($is_temp_file) {
-	# No locking.
-	nstore ($self, $self->{CHANGEDFILE})
+	# Worker temp file - no lock needed (each worker has its own).
+	my $fh = main::safe_open_for_write ($self->{CHANGEDFILE}, 0) # 0 = no lock
+	    or die "Failed to open temp changed file: $!\n";
+	nstore_fd ($self, $fh)
 	    or die "Failed to store child changed file: $!\n";
+	close ($fh);
     }
     else {
-	lock_nstore ($self, $self->{CHANGEDFILE})
+	# Main changed file - needs lock.
+	my $fh = main::safe_open_for_write ($self->{CHANGEDFILE}, 1) # 1 = needs lock
+	    or die "Failed to open changed file: $!\n";
+	nstore_fd ($self, $fh)
 	    or die "Failed to store changed file: $!\n";
+	close ($fh);
     }
 }
 

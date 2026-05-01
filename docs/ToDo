@@ -1,5 +1,12 @@
 BUGS:
 
+(1.24 fixes) Added safe_open_for_write helper to open and lock files
+for writing (for changed files and specs) to not follow symlinks,
+modified handle_open_request to not follow symlinks for privileged
+opens for writing, tightened is_sigtree_managed_file checks to reject
+directory traversal and be stricter about filenames, wipe $pgp_passphrase
+from memory after use in get_pgp_passphrase.
+
 (1.23a fixes) Added warning for config file and spec permissions
 when group- and world-readable.
 

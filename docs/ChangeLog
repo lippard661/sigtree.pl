@@ -1,3 +1,9 @@
+1 May 2026: 1.24: Security improvements after Claude Security (Opus 4.7) assessment:
+	Wipe $pgp_passphrase from memory after use, don't follow symlinks for
+	privileged file opens for writing, don't follow symlinks for unprivileged
+	file opens for writing, tighten up checks for sigtree managed files and
+	don't allow directory traversal within sigtree managed dirs in calls to
+	privileged file opens for writing.
 16 April 2026: 1.23a: Warn about world-readble/group-readable configs and specs.
 13 April 2026: 1.23: Fix bug in critical-log (mtimestasis) handling.
 28 February 2026: 1.22e: Remove deprecated pledge for "tmppath."
