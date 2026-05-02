@@ -3249,9 +3249,10 @@ sub is_sigtree_managed_file {
     # Restrict to single path component (no subdirectories) using [^/]+
     if (defined $spec_dir) {
         return 1 if $path eq $spec_dir;
-        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.spec$};
-        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.specsec$};
-        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.sig$};
+	# Individual tree specs have NO extension (e.g., var.www.html)
+	# Their signatures have .sig extension
+        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+$}; # tree spec (no extension)
+        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.sig$}; # tree sig
     }
     
     # Check if path is in spec_dir_dir (shared parent for multi-host)
