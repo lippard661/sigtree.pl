@@ -1,5 +1,8 @@
 BUGS:
 
+(1.24a fixes) Added interrupt handler to passphrase input to
+restore tty echo. Make macos.sigtree.conf name all lower case.
+
 (1.24 fixes) Added safe_open_for_write helper to open and lock files
 for writing (for changed files and specs) to not follow symlinks,
 modified handle_open_request to not follow symlinks for privileged

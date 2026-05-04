@@ -270,6 +270,8 @@
 #    packages, using new main::safe_open_for_write), and tighten up checks in
 #    is_sigtree_managed_file (prevent directory traversal, be stricter on file
 #    names). Prompted by Claude Security assessment (Opus 4.7).
+# Modified 2 May 2026 by Jim Lippard to add interrupt handler for passphrase input
+#    to restore tty echo.
 
 ### Required packages.
 
@@ -366,7 +368,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.24 of 1 May 2026';
+my $VERSION = 'sigtree 1.24a of 4 May 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -2527,6 +2529,12 @@ sub set_immutable_flag {
 # process has no tty.
 sub get_pgp_passphrase {
     my ($pgp_passphrase, $current_tty, $temp_file);
+
+    # Set up signal handler to restore echo on interrupt
+    local $SIG{INT} = sub { 
+        system ($STTY, 'echo'); 
+        die "Interrupted\n"; 
+    };
 
     if ($PGP_or_GPG eq 'PGP' ||
 	$PGP_or_GPG eq 'GPG1' ||
