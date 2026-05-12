@@ -275,7 +275,8 @@
 # Modified 12 May 2026 by Jim Lippard to use correct location for $SYSCTL on
 #    macOS (old OpenBSD location, see change above from 10 June 2004) and
 #    parse sysctl output for securelevel correctly on macOS. Properly handle
-#    legacy changed file moved to new location.
+#    legacy changed file moved to new location. Set descriptive process names
+#    for child processes.
 
 ### Required packages.
 
@@ -1198,6 +1199,9 @@ sub initialize_sets {
 		    $FileAttr::PRIV_IPC = $WORKER_SOCKETS[$current_worker_id];
 		    # Close sockets we don't need.
 		    close $MAIN_PRIV_SOCK;
+
+		    # Set descriptive process name.
+		    $0 = "sigtree: worker $current_worker_id (sigtree)";
 		    
 		    # Undef other worker sockets rather than closing them
 		    # because closing would affect the parent's copies via socketpair
@@ -1612,6 +1616,9 @@ sub check_sets {
 		$FileAttr::PRIV_IPC = $WORKER_SOCKETS[$current_worker_id];
 		# Close sockets we don't need.
 		close $MAIN_PRIV_SOCK;
+
+		# Set descriptive process name.
+		$0 = "sigtree: worker $current_worker_id (sigtree)";
 		    
 		# Undef other worker sockets rather than closing them
 		# because closing would affect the parent's copies via socketpair
@@ -2823,8 +2830,9 @@ sub setup_privsep_per_worker {
     die "fork privileged parent: $!" unless defined $priv_pid;
     
     if ($priv_pid == 0) {
-        # PRIVILEGED PARENT PROCESS
+        # PRIVILEGED PARENT PROCESS (but actually child of main)
         # This process stays as root
+	$0 = 'sigtree: priv (sigtree)';
         
         # Close worker ends (we don't need them)
         close $main_worker_sock;

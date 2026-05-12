@@ -2,6 +2,7 @@ BUGS:
 
 (1.24b fixed) Use right location for sysctl (/usr/sbin) on macOS
 and right format for securelevel output on macOS (: instead of =).
+Change process names of child processes.
 
 (1.24a fixes) Added interrupt handler to passphrase input to
 restore tty echo. Make macos.sigtree.conf name all lower case.
