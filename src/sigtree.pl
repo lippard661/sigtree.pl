@@ -272,6 +272,10 @@
 #    names). Prompted by Claude Security assessment (Opus 4.7).
 # Modified 2 May 2026 by Jim Lippard to add interrupt handler for passphrase input
 #    to restore tty echo.
+# Modified 12 May 2026 by Jim Lippard to use correct location for $SYSCTL on
+#    macOS (old OpenBSD location, see change above from 10 June 2004) and
+#    parse sysctl output for securelevel correctly on macOS. Properly handle
+#    legacy changed file moved to new location.
 
 ### Required packages.
 
@@ -295,7 +299,7 @@
 # * If immutable flags are used (recommended for BSD):
 #   BSD:
 #   * /usr/bin/chflags (schg/noschg or uchg/nouchg)
-#   * /sbin/sysctl kern.securelevel
+#   * /sbin/sysctl kern.securelevel (/usr/sbin/sysctl on macOS)
 #   Linux:
 #   * /usr/bin/chattr (+i/-i)
 #   * /usr/bin/lsattr
@@ -362,13 +366,14 @@ my $SIGNIFY = '/usr/bin/signify';
 my $STAT = '/usr/bin/stat';
 my $STTY = '/bin/stty';
 my $SYSCTL = '/sbin/sysctl';
+$SYSCTL = '/usr/sbin/sysctl' if ($^O eq 'darwin');
 my $TTY = '/usr/bin/tty';
 my $BSD_SYS_IMMUTABLE_FLAG = 'schg';
 my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.24a of 4 May 2026';
+my $VERSION = 'sigtree 1.24b of 12 May 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -763,7 +768,8 @@ if ($use_immutable) {
 	$SECURELEVEL = <$outfh>;
 	close ($outfh);
 	chomp ($SECURELEVEL) if (defined ($SECURELEVEL));
-	$SECURELEVEL =~ s/^.*=\s*//;
+	$SECURELEVEL =~ s/^.*=\s*// if ($^O ne 'darwin');
+	$SECURELEVEL =~ s/^.*:\s*// if ($^O eq 'darwin');
 	if ($SECURELEVEL !~ /^\d$/) {
 	    die "Immutable file flags do not appear to be supported by your operating system.\n";
 	}
@@ -5809,6 +5815,10 @@ sub new {
 	else {
 	    $self = lock_retrieve ($changed_file);
 	}
+
+	# Always use the current path, not what's serialized
+	# (handles case where file was moved or path config changed)
+	$self->{CHANGEDFILE} = $changed_file if $self;
     }
     else {
 	$self = _initialize_empty_changedfile ($changed_file);

@@ -1,3 +1,4 @@
+12 May 2026: 1.24b: Correct sysctl location and output parsing for macOS.
 4 May 2026: 1.24a: Add interrupt handler for passphrase input.
 1 May 2026: 1.24: Security improvements after Claude Security (Opus 4.7) assessment:
 	Wipe $pgp_passphrase from memory after use, don't follow symlinks for
