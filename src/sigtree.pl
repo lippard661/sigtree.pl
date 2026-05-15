@@ -277,6 +277,7 @@
 #    parse sysctl output for securelevel correctly on macOS. Properly handle
 #    legacy changed file moved to new location. Set descriptive process names
 #    for child processes.
+# Modified 15 May 2026 by Jim Lippard to shorten process names.
 
 ### Required packages.
 
@@ -1201,7 +1202,7 @@ sub initialize_sets {
 		    close $MAIN_PRIV_SOCK;
 
 		    # Set descriptive process name.
-		    $0 = "sigtree: worker $current_worker_id (sigtree)";
+		    $0 = "sigtree worker $current_worker_id";
 		    
 		    # Undef other worker sockets rather than closing them
 		    # because closing would affect the parent's copies via socketpair
@@ -1618,7 +1619,7 @@ sub check_sets {
 		close $MAIN_PRIV_SOCK;
 
 		# Set descriptive process name.
-		$0 = "sigtree: worker $current_worker_id (sigtree)";
+		$0 = "sigtree worker $current_worker_id";
 		    
 		# Undef other worker sockets rather than closing them
 		# because closing would affect the parent's copies via socketpair
@@ -2832,7 +2833,7 @@ sub setup_privsep_per_worker {
     if ($priv_pid == 0) {
         # PRIVILEGED PARENT PROCESS (but actually child of main)
         # This process stays as root
-	$0 = 'sigtree: priv (sigtree)';
+	$0 = 'sigtree [priv]';
         
         # Close worker ends (we don't need them)
         close $main_worker_sock;
