@@ -1,5 +1,8 @@
 BUGS:
 
+(1.24c fixed) Do config writeability permissions check, move
+overly permissive readability check into Config package.
+
 (1.24b fixed) Use right location for sysctl (/usr/sbin) on macOS
 and right format for securelevel output on macOS (: instead of =).
 Change process names of child processes.

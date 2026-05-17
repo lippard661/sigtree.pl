@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 #
 #########################################################################
 #
@@ -278,6 +278,11 @@
 #    legacy changed file moved to new location. Set descriptive process names
 #    for child processes.
 # Modified 15 May 2026 by Jim Lippard to shorten process names.
+# Modified 17 May 2026 by Jim Lippard to move config permissions checks
+#    into Config package to avoid TOCTOU races. Switched from -w to
+#    "use warnings".
+#
+# To Do: convert remaining bareword filehandles to $fh form.
 
 ### Required packages.
 
@@ -325,6 +330,7 @@
 
 require 5.004;
 use strict;
+use warnings;
 use feature 'state';
 use Digest::SHA;
 use Digest::SHA3;
@@ -375,7 +381,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.24b of 12 May 2026';
+my $VERSION = 'sigtree 1.24c of 17 May 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -629,20 +635,6 @@ elsif ($command ne 'initialize' &&
 }
 
 $config = new Config ($config_file);
-
-# Verify config file permissions are not world-readable.
-my @stat = stat ($config_file);
-if (@stat) {
-    my $mode = $stat[2] & 07777; # Get permission bits
-    if ($mode & 0004) { # world-readable bit set
-	warn "Warning: Config file $config_file is world-readable (permissions: " .
-	    sprintf ("%04o", $mode) . "). Consider chmod 0600 $config_file\n";
-    }
-    if ($mode & 0040) { # Group-readable bit set
-	warn "Warning: Config file $config_file is group-readable (permissions: " .
-	    sprintf ("%04o", $mode) . "). Consider chmod 0600 $config_file\n";
-    }
-}
 
 if ($set) {
     ($arg_no, $error, @sets) = $config->valid_setlist ($set);
@@ -3386,9 +3378,36 @@ sub new {
 
     $current_set = 0;
 
-    open (CONFIG, '<', $config_file) ||
+    open (my $config_fh, '<', $config_file) ||
 	die "Cannot open config file. $!. $config_file\n";
-    while (<CONFIG>) {
+
+    # Verify config file permissions are not world-readable.
+    my @stat = stat ($config_fh);
+    if (@stat) {
+	my $mode = $stat[2] & 07777; # Get permission bits
+	my $uid = $stat[4];
+
+	# FATAL: Reject if group or world writable
+        if ($mode & 0022) {
+            die "Config file $config_file has unsafe write permissions (" . 
+                sprintf("%04o", $mode) . "). Must not be group or world writable.\n" .
+                "Fix with: chmod go-w $config_file\n";
+        }
+        
+        # FATAL: Reject if not owned by root (or current effective user)
+        if ($uid != 0 && $uid != $>) {
+            die "Config file $config_file is not owned by root (uid=$uid). " .
+                "Fix with: chown root $config_file\n";
+        }
+        
+        # WARN: Group or world readable
+        if ($mode & 0044) {
+            warn "WARNING: Config file $config_file is " .
+                 (($mode & 0004) ? "world" : "group") . "-readable (permissions: " .
+                 sprintf("%04o", $mode) . "). Consider chmod 0600 $config_file\n";
+        }
+    }
+    while (<$config_fh>) {
 	$line++;
 	$raw_line = $_;
 	chop;
@@ -3759,7 +3778,7 @@ sub new {
 	    }
 	} # non-comment and non-blank line
     }
-    close (CONFIG);
+    close ($config_fh);
 
     # If no sha3_digest or sha2_digest field was specified, default
     # is SHA-3, 256 bits.
