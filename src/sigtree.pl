@@ -281,8 +281,17 @@
 # Modified 17 May 2026 by Jim Lippard to move config permissions checks
 #    into Config package to avoid TOCTOU races. Switched from -w to
 #    "use warnings".
-#
-# To Do: convert remaining bareword filehandles to $fh form.
+# Modified 1 July 2026 by Jim Lippard after Claude Opus 4.8 review:
+#    privsep readdir key mismatch (entries vs entries_b64); missing "/" in the
+#    host-spec existence check in verify_required_dirs; wrong-case {nlink} key
+#    in FileAttr::compare; reset_changed_file using () instead of {} for hash
+#    fields (TIME/USER kept, to preserve check history); dead $changed_file
+#    vs $changedfile check in check_sets; removed dead request_write_file/
+#    request_read_file; use eq/quotemeta instead of regex for tree-path
+#    matching; fork-count off-by-one; tightened child_procs config validation;
+#    stale recv_request comment. Also hardened priv and nonpriv reads against
+#    symlink/TOCTOU swaps (O_NOFOLLOW, ELOOP/EMLINK detection, fstat dev/ino
+#    verification) and added a refuse-to-write-through-symlink message.
 
 ### Required packages.
 
@@ -334,6 +343,7 @@ use warnings;
 use feature 'state';
 use Digest::SHA;
 use Digest::SHA3;
+use Errno qw( ELOOP EMLINK ); # for use in handle_read_request
 use Fcntl qw( :DEFAULT O_NOFOLLOW :flock ); # for use with sysopen in handle_open_request and for safe_open_request
 use File::Basename;
 # File::Temp is much larger than OpenBSD::MkTemp.
@@ -381,7 +391,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.24c of 17 May 2026';
+my $VERSION = 'sigtree 1.25 of 1 July 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1097,9 +1107,9 @@ sub initialize_sets {
 	    push (@specified_trees, $tree) if ($config->tree_uses_sets ($tree, @sets));
 	}
 	# Don't fork unnecessarily.
-	if ($#specified_trees < $fork_children) {
-	    $fork_children = $#specified_trees;
-	    $fork_children = 0 if ($#specified_trees == 1);
+	if (scalar (@specified_trees) < $fork_children) {
+	    $fork_children = scalar (@specified_trees);
+	    $fork_children = 0 if (scalar (@specified_trees) == 1);
 	}
 
 	# Track available worker slots
@@ -1281,7 +1291,7 @@ sub initialize_sets {
 	    # in the config.
 	    @changed_trees = $changedfile->get_trees;
 	    foreach $tree (@changed_trees) {
-		$changedfile->delete ($tree) if (!grep (/^$tree$/, @trees));
+		$changedfile->delete ($tree) if (!grep { $_ eq $tree } @trees);
 	    }
 	}
 	$changedfile->store_changedfile();
@@ -1457,7 +1467,7 @@ sub show_changes {
 sub check_sets {
     my ($config, $specs_only, @sets) = @_;
     my ($subtree_only, $changedfile, @specified_trees,
-	@trees, $tree, $quoted_tree, $tree_spec_name,
+	@trees, $tree, $tree_spec_name,
 	@changed_sets, $set, $priority, $keywords, $description, $path);
     # used for Parallel::ForkManager
     my ($pm, $child_temp_dir, $child_temp_file, $child_changedfile);
@@ -1471,7 +1481,7 @@ sub check_sets {
     }
 
     $changedfile = new ChangedFile ($changed_file);
-    unless ($changed_file) {
+    unless ($changedfile) {
 	die "Failed to load changed file: $changed_file\n";
     }
 
@@ -1500,10 +1510,7 @@ sub check_sets {
 	    $path = '.';
 	}
 	else {
-	    $quoted_tree = $trees[0];
-	    $quoted_tree =~ s/\//\\\//;
-	    $quoted_tree =~ s/\./\\\./;
-	    $path =~ s/^$quoted_tree\///;
+	    $path =~ s/^\Q$trees[0]\E\///;
 	}
     }
     else {
@@ -1516,9 +1523,9 @@ sub check_sets {
 	push (@specified_trees, $tree) if ($config->tree_uses_sets ($tree, @sets));
     }
     # Don't fork unnecessarily.
-    if ($#specified_trees < $fork_children) {
-	$fork_children = $#specified_trees;
-	$fork_children = 0 if ($#specified_trees == 1);
+    if (scalar (@specified_trees) < $fork_children) {
+	$fork_children = scalar (@specified_trees);
+	$fork_children = 0 if (scalar (@specified_trees) == 1);
     }
     
     # Track available worker slots
@@ -1901,7 +1908,7 @@ sub update_sets {
 	    # Need to remove the spec dir from the list, but do it after other changes,
 	    # not here.
 	}
-	elsif (!grep (/^$tree$/, @config_trees)) {
+	elsif (!grep { $_ eq $tree } @config_trees) {
 	    print "Warning: changed file contains tree \"$tree\" which is not in config. Removing from changed file.\n";
 	    $changedfile->delete ($tree);
 	    # Save changes (deletions).
@@ -2235,7 +2242,7 @@ sub verify_required_dirs {
     if (!-e $spec_dir_dir . "/$spec_spec" && $caller != $INITIALIZE) {
 	die "Host specification does not exist. $spec_dir_dir/$spec_spec.\n";
     }
-    elsif (-e $spec_dir_dir . "$spec_spec") {
+    elsif (-e $spec_dir_dir . "/$spec_spec") {
 	if (!-r $spec_dir_dir . "/$spec_spec") {
 	    die "Host specification is not readable. $spec_dir_dir/$spec_spec.\n";
 	}
@@ -2385,9 +2392,9 @@ sub _identify_extraneous_files {
     # dir, instead of reading out the files, that would be a historical
     # snapshot instead of right now.
     if (-r $spec_dir) {
-	opendir (DIR, $spec_dir);
-	@files = grep (!/^\.{1,2}$/, readdir (DIR));
-	closedir (DIR);
+	opendir (my $dir_fh, $spec_dir);
+	@files = grep (!/^\.{1,2}$/, readdir ($dir_fh));
+	closedir ($dir_fh);
 	
 	@trees = $config->all_trees;
 	
@@ -2624,11 +2631,11 @@ sub sigtree_pgp_sign {
     my ($file, $pgp_passphrase) = @_;
     my ($signature, $version, @data, @errors);
 
-    if (open (FILE, '<', $file)) {
-	while (<FILE>) {
+    if (open (my $fh, '<', $file)) {
+	while (<$fh>) {
 	    push (@data, $_);
 	}
-	close (FILE);
+	close ($fh);
     }
     else {
 	print "Could not read $file to create $PGP_or_GPG signature.\n";
@@ -2642,9 +2649,9 @@ sub sigtree_pgp_sign {
 	die "@errors";
     }
 
-    if (open (FILE, '>', "$file.sig")) {
-	print FILE "$signature\n";
-	close (FILE);
+    if (my $fh = safe_open_for_write ("$file.sig")) {
+	print $fh "$signature\n";
+	close ($fh);
     }
     else {
 	print "Could not write $file.sig to create $PGP_or_GPG signature.\n";
@@ -2658,21 +2665,21 @@ sub sigtree_pgp_verify {
     my ($signer, $signature, $version, @data, @errors);
     # $version is left undefined.
 
-    if (open (FILE, '<', $file)) {
-	while (<FILE>) {
+    if (open (my $fh, '<', $file)) {
+	while (<$fh>) {
 	    push (@data, $_);
 	}
-	close (FILE);
+	close ($fh);
     }
     else {
 	print "Cannot open file $file to verify $PGP_or_GPG signature.\n";
 	return;
     }
-    if (open (FILE, '<', "$file.sig")) {
-	while (<FILE>) {
+    if (open (my $fh, '<', "$file.sig")) {
+	while (<$fh>) {
 	    $signature .= $_;
 	}
-	close (FILE);
+	close ($fh);
 	chop ($signature);
     }
     else {
@@ -3048,18 +3055,52 @@ sub handle_open_request {
     }
     
     # Open file as root using sysopen.
-    # For writes, use O_NOFOLLOW to prevent symlink-based attacks;
-    # for reads, follow symlinks normally.
+    # For writes and reads, use O_NOFOLLOW to prevent symlink-based
+    # attacks.
     my $flags;
     if ($mode eq '>') {
 	$flags = O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW;
     }
     else {
-	$flags = O_RDONLY;
+        # O_NOFOLLOW: refuse if the final component is now a symlink.
+        # O_NONBLOCK: don't hang if the file was swapped for a fifo/device
+        #             (no effect on regular files).
+	$flags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
     }
     unless (sysopen($fh, $path, $flags)) {
-        return { error => "$! ($path)" };
+	my $err = $!;
+	if ($mode eq '>' && ($err == ELOOP || $err == EMLINK)) {
+	    return { error => "Refusing to write through symlink: $path ($err)",
+		     swap_detected => 1 };
+	}
+	# ELOOP on Linux/OpenBSD/macOS; EMLINK on FreeBSD for O_NOFOLLOW-on-symlink.
+        elsif ($err == ELOOP || $err == EMLINK) {
+            return { error => "File type changed between stat and open "
+                            . "(now a symlink): $path ($err)",
+                     swap_detected => 1 };
+        }
+        return { error => "$err ($path)" };
     }
+
+    # If the caller told us which inode it stat'd, confirm we opened the
+    # same object. Catches what O_NOFOLLOW can't: an intermediate directory
+    # component swapped for a symlink, or the file replaced by a different
+    # inode (rename-over, hardlink swap, fifo/device).
+    if (defined $request->{expect_dev} && defined $request->{expect_ino}) {
+        my @st = stat($fh);               # fstat on the open descriptor
+        unless (@st) {
+            my $e = $!;
+            close $fh;
+            return { error => "fstat failed after open: $e ($path)" };
+        }
+        if ($st[0] != $request->{expect_dev} ||
+            $st[1] != $request->{expect_ino}) {
+            close $fh;
+            return { error => "File identity changed between stat and open "
+                            . "(dev/ino mismatch): $path",
+                     swap_detected => 1 };
+        }
+    }    
     
     # Get the file descriptor number
     my $fd = fileno($fh);
@@ -3527,9 +3568,8 @@ sub new {
 		if ($self->{MAX_CHILD_PROCS}) {
 		    die "A second \"max_child_procs:\" field, line $line. $config_file\nLine: $raw_line";		    
 		}
-		if ($value =~ /^\d+/) {
+		if ($value =~ /^\d+$/) {
 		    die "\"max_child_procs:\" field must be zero or an integer >= 2, line $line. $config_file\nLine: $raw_line" if ($value == 1);	    
-		    $self->{MAX_CHILD_PROCS} = $value;
 		}
 		else {
 		    die "\"max_child_procs:\" field must be an integer, line $line. $config_file\nLine: $raw_line";
@@ -3546,9 +3586,8 @@ sub new {
 		if ($self->{DEFAULT_CHILD_PROCS}) {
 		    die "A second \"default_child_procs:\" field, line $line. $config_file\nLine: $raw_line";		    
 		}
-		if ($value =~ /^\d+/) {
+		if ($value =~ /^\d+$/) {
 		    die "\"default_child_procs:\" field must be zero or an integer >= 2, line $line. $config_file\nLine: $raw_line" if ($value == 1);
-		    $self->{DEFAULT_CHILD_PROCS} = $value;
 		}
 		else {
 		    die "\"default_child_procs:\" field must be an integer, line $line. $config_file\nLine: $raw_line";
@@ -4146,13 +4185,10 @@ sub tree_for_path {
     my $self = shift;
     my $class = ref ($self) || $self;
     my ($path) = @_;
-    my ($tree, $quoted_tree);
+    my ($tree);
 
     foreach $tree (@{$self->{TREES}}) {
-	$quoted_tree = $tree;
-	$quoted_tree =~ s/\//\\\//;
-	$quoted_tree =~ s/\./\\\./;
-	if ($path eq $tree || $path =~ /^$quoted_tree\//) {
+	if ($path eq $tree || $path =~ /^\Q$tree\E\//) {
 	    return ($tree);
 	}
     }
@@ -4258,7 +4294,7 @@ sub recv_request {
     my $len = unpack('N', $len_packed);
     
     # Sanity check
-    return undef if $len > $MAX_REQUEST_LENGTH;  # 10MB max
+    return undef if $len > $MAX_REQUEST_LENGTH;  # 1 MB max
     
     # Read data
     my $json = '';
@@ -4439,7 +4475,7 @@ sub request_stat {
 
 # Request a privileged file open.
 sub request_open {
-    my ($sock, $path, $mode) = @_;
+    my ($sock, $path, $mode, $expect_dev, $expect_ino) = @_;
     $mode //= '<'; # Default to read
     
     my $request = {
@@ -4447,6 +4483,9 @@ sub request_open {
         path => $path,
 	mode => $mode,
     };
+
+    $request->{expect_dev} = $expect_dev if defined $expect_dev;
+    $request->{expect_ino} = $expect_ino if defined $expect_ino;
     
     send_request($sock, $request);
     my $response = recv_response($sock);
@@ -4523,7 +4562,7 @@ sub request_readdir {
     }
 
     # Base64 decode each entry.
-    my @decoded = map { decode_base64 ($_) } @{$response->{entries_b64}};
+    my @decoded = map { decode_base64 ($_) } @{$response->{entries} || []};
     return \@decoded;
 }
 
@@ -4583,45 +4622,6 @@ sub request_immutable_set {
     }
     
     return 1;
-}
-
-sub request_write_file {
-    my ($sock, $path, $content, $mode) = @_;
-    
-    my $request = {
-        type => 'WRITE_FILE',
-        path => $path,
-        content => $content,
-        mode => $mode,
-    };
-    
-    send_request($sock, $request);
-    my $response = recv_response($sock);
-    
-    if ($response->{error}) {
-        die "Failed to write file $path: $response->{error}\n";
-    }
-    
-    return 1;
-}
-
-sub request_read_file {
-    my ($sock, $path) = @_;
-    
-    my $request = {
-        type => 'READ_FILE',
-        path => $path,
-    };
-    
-    send_request($sock, $request);
-    my $response = recv_response($sock);
-    
-    if ($response->{error}) {
-        warn "Failed to read file $path: $response->{error}\n";
-        return undef;
-    }
-    
-    return $response->{content};
 }
 
 sub request_delete_file {
@@ -4697,8 +4697,8 @@ package FileAttr;
 use strict;
 use warnings;
 use Cwd qw( abs_path ); # used in _canonicalize_link_target
-use Errno qw( EACCES EPERM );
-use Fcntl ':mode'; # For S_IRUSR, S_IRGRP, S_IROTH, etc.
+use Errno qw( EACCES EPERM ELOOP EMLINK ); # ELOOP EMLINK in _get_sha_digest
+use Fcntl qw( :DEFAULT O_NOFOLLOW :mode ); # For S_IRUSR, S_IRGRP, S_IROTH, etc.; :DEFAULT and O_NOFOLLOW for sysopen in _get_sha_digest
 use File::Basename;
 use File::Spec;
 
@@ -4865,7 +4865,8 @@ sub new {
     if ($self->{TYPE} eq 'file') {
 	# Get SHA digest if requested.
 	if ($sha_digest) {
-	    $self->{SHADIGEST} = _get_sha_digest ($full_path, $sha_digest, $need_priv);
+	    # add dev and ino at end
+	    $self->{SHADIGEST} = _get_sha_digest ($full_path, $sha_digest, $need_priv, $stat[0]. $stat[1]);
 	}
     }
     elsif ($self->{TYPE} eq 'dir') {
@@ -4950,8 +4951,9 @@ sub _canonicalize_link_target {
 # Internal method to get SHA digest. Claude rewrote this and lost the SHA3 support, so
 # I rewrote it again.
 sub _get_sha_digest {
-    my ($full_path, $sha_digest, $need_priv) = @_;
+    my ($full_path, $sha_digest, $need_priv, $dev, $ino) = @_;
     my ($fh, $sha_version, $sha_bits, $digest);
+    my $opened_locally = 0;
 
     # Determine which SHA digest to use.
     if ($sha_digest =~ /-/) {
@@ -4963,23 +4965,61 @@ sub _get_sha_digest {
     
     # If privsep is disabled, always open directly
     if (!$main::use_privsep) {
-        if (!open ($fh, '<', $full_path)) {
+        if (!sysopen ($fh, $full_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {
+	    my $err = $!;
+	    if ($err == ELOOP || $err == EMLINK) {
+		warn "File type changed between stat and open "
+		    . "(now a symlink): $full_path ($err)\n";
+	    }
             return undef;
         }
+	$opened_locally = 1;
     }
     elsif ($need_priv) {
         # Request file descriptor from privileged parent
-        $fh = PrivSep::request_open ($FileAttr::PRIV_IPC, $full_path);
+        $fh = PrivSep::request_open ($FileAttr::PRIV_IPC, $full_path, '<', $dev, $ino);
         return undef unless $fh;
     }
     else {
         # Try to open unprivileged
-        if (!open ($fh, '<', $full_path)) {
+        if (!sysopen ($fh, $full_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {
+	    my $err = $!;
+	    if ($err == ELOOP || $err == EMLINK) {
+		warn "File type changed between stat and open "
+		    . "(now a symlink): $full_path ($err)\n";
+		return undef;
+	    }
             # Unexpected - mode said we could read but we can't
             # Fall back to privileged
-            $fh = PrivSep::request_open($FileAttr::PRIV_IPC, $full_path);
+            $fh = PrivSep::request_open($FileAttr::PRIV_IPC, $full_path, '<', $dev, $ino);
             return undef unless $fh;
         }
+	else {
+	    $opened_locally = 1;
+	}
+    }
+
+    if ($opened_locally) {
+	# If the caller told us which inode it stat'd, confirm we opened the
+	# same object. Catches what O_NOFOLLOW can't: an intermediate directory
+	# component swapped for a symlink, or the file replaced by a different
+	# inode (rename-over, hardlink swap, fifo/device).
+	if (defined $dev && defined $ino) {
+	    my @st = stat($fh);               # fstat on the open descriptor
+	    unless (@st) {
+		my $err = $!;
+		close $fh;
+		warn "fstat failed after open: $err ($full_path)\n";
+		return undef;
+	    }
+	    if ($st[0] != $dev ||
+		$st[1] != $ino) {
+		close $fh;
+		warn "File identity changed between stat and open "
+		    . "(dev/ino mismatch): $full_path\n";
+		return undef;
+	    }
+	}
     }
     
     # Now compute digest from the filehandle
@@ -5375,7 +5415,7 @@ sub compare {
 	$differences{'any'} = 1;
     }
     if ($keywords{'nlink'} && ($self->_compare ($self->{NLINK}, $fileattr->{NLINK}))) {
-	$differences{'nlink'} = $fileattr->{nlink};
+	$differences{'nlink'} = $fileattr->{NLINK};
 	$differences{'any'} = 1;
     }
 
@@ -5879,14 +5919,15 @@ sub reset_changed_file {
     my $self = shift;
     my $class = ref ($self) || $self;
 
-    $self->{CHANGES} = ();
-    $self->{ADDITIONS} = ();
-    $self->{DELETIONS} = (); 
-    $self->{SET_TO_PATH_ADD} = (); 
-    $self->{SET_TO_PATH_DEL} = (); 
-    $self->{SET_TO_PATH_CHANGE} = (); 
-    $self->{SET_TO_PATH_CH_ATTR} = ();
-    $self->{PATH} = ();
+    $self->{CHANGES} = {};
+    $self->{ADDITIONS} = {};
+    $self->{DELETIONS} = {};
+    $self->{SET_TO_PATH_ADD} = {};
+    $self->{SET_TO_PATH_DEL} = {};
+    $self->{SET_TO_PATH_CHANGE} = {};
+    $self->{SET_TO_PATH_CH_ATTR} = {};
+    $self->{PATH} = {};
+    # don't reset TIME and USER
 }
 
 # Method to add a path to the changed file (unless already present).
