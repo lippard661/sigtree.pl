@@ -1,3 +1,94 @@
+15 October 2026 1.26: Bug fixes and improvements after Claude Opus 5.5 review:
+    call Signify::sign and Signify::verify with Signify.pm's named
+    arguments and require Signify.pm 1.4 (1.3 can report a successful
+    signing with a signify -n key as failed). Privileged parent:
+    is_allowed_path rejects ".." components, so the unprivileged process
+    can no longer have root open any file via "$tree/../.."; removed the
+   /tmp/sigtree.* exception from is_sigtree_managed_file (unused under
+    privsep), through which the unprivileged process could have root
+    run chflags on a symlink it placed in /tmp; chflags now runs with -h
+    so a symlink is never followed; signing and verification use the
+    parent's own method and keys, not the request's; the passphrase it
+    receives is overwritten after use. A failed signature (signify or
+    PGP) now stops initialize and update, and update signs a spec before
+    removing its tree from the changed file, so a wrong passphrase no
+    longer leaves specs with stale signatures and the changes forgotten.
+    initialize and update also sign a throwaway file right after the
+    passphrase prompt (in the privileged parent under privsep), so a
+    wrong passphrase stops them before any spec is changed.
+    initialize and check now treat a worker that died as failed (its
+    tree's changes are kept; check does not write a changed file with a
+    tree missing) and exit non-zero. chflags/chattr failures are
+    reported and fatal, including under privsep, where the request used
+    to report success; "Unable to reset" no longer exits 0. Securelevel
+    -1 is accepted and treated as 0; sysctl failures are reported.
+    update's "Failed to load spec ... skipping" now skips only that tree
+    (it ended the update with the spec dir unlocked). An absolute -d
+    outside the root dir now works under privsep (the privileged parent
+    refused the host spec, which is in the spec dir's parent) and its
+    spec dir is in the sigtree set (it had no set). An absolute
+    exception or exception-tree path is now a config error (it never
+    matched, and with an ignored set gave no warning), and an
+    exception-tree for the whole tree says to change the tree's sets
+    instead. unveil: the spec
+    dir's parent is unveiled when an absolute -d puts it outside the
+    root dir; dropped x where nothing is exec'd and /bin/sh for the
+    immutable commands (ls is run directly). Removed the Linux-only FD
+    ACK (reads are exact-length sysread) and bounded the descriptor wait
+    at 30 seconds instead; SIGPIPE is ignored around socket writes; a
+    lost or corrupt privsep response is fatal instead of read as
+    success. Worker temp changed files are marked by the caller rather
+    than by a /tmp/ path prefix, and their temp dir is removed even
+    after a worker died with its file half-written. Spec and changed
+    file writes check close. yes_or_no treats end of input as no; no passphrase at end of
+    input is an error. The passphrase is overwritten at the end of
+    initialize and update (the 1 May wipe applied only to an empty
+    string). require 5.010, which the code already needed.
+1 July 2026: 1.25: Bug fixes and improvements after Claude Opus 4.8 review:
+	- Fixed privilege-separation readdir failure: request_readdir read
+	the response under key 'entries_b64', but handle_readdir_request
+	returns it as 'entries', causing an undef array deref (fatal under
+	strict) on any directory the unprivileged user cannot read
+	directly (e.g. the 0700 spec dir). Now reads 'entries', with a
+	defensive || [].
+	- Fixed missing "/" in the host-spec existence
+	test in verify_required_dirs
+	(was $spec_dir_dir . "$spec_spec"), which had made the host-spec
+	readability/writability checks unreachable dead code.
+	- Fixed wrong-case hash key in FileAttr::compare: an nlink
+	difference stored $fileattr->{nlink} (undef) instead of {NLINK},
+	suppressing display of nlink changes even though the change was
+	still detected.
+	- Fixed ChangedFile::reset_changed_file initializing its hash
+	fields with = () (which yields undef) instead of = {}. TIME/USER
+	are intentionally left un-reset so the history of prior,
+	not-yet-updated checks is preserved.
+	- Fixed a dead load-failure check in check_sets that tested
+	$changed_file (the filename, always true) instead of $changedfile
+	(the object).
+	- Hardened privileged and nonprivileged file reads against
+	symlink/TOCTOU swaps: added O_NOFOLLOW (and O_NONBLOCK) to read
+	opens; special-cased ELOOP/EMLINK to report a file whose type
+	changed between stat and open (the nonpriv path warns and skips
+	the privileged fallback rather than masking the swap); and added
+	an fstat dev/ino comparison against the classifying lstat to catch
+	intermediate-directory symlink and inode swaps.  Added a "refusing
+	to write through symlink" message on the write path.
+	- Removed dead IPC helpers request_write_file/request_read_file,
+	which sent WRITE_FILE/READ_FILE request types that no handler
+	dispatched.
+	- Replaced regex-based exact matching of tree paths
+	(grep /^$tree$/) with string eq / quotemeta, to avoid mismatching
+	paths that contain regex metacharacters; fixed incomplete (non-/g)
+	escaping in tree-path matching.
+	- Fixed a fork-count off-by-one that compared $#specified_trees
+	(last index) to the requested child count, under-parallelizing by
+	one and disabling forking entirely with two trees.
+	- Tightened config validation of
+	max_child_procs/default_child_procs (anchored the integer regex;
+	removed a redundant assignment).
+	- Corrected a stale comment in recv_request (the limit is 1MB, not
+	10MB).
 17 May 2026: 1.24c: Move config permissions check into Config package
 	and improve it.
 12 May 2026: 1.24b: Correct sysctl location and output parsing for macOS,

@@ -16,7 +16,8 @@ signify -C -p discord.org-2026-pkg.pub -x sigtree-<version>.tgz
 ```
 Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-(Last version without dependency on Signify.pm or Parallel::ForkManager is 1.18d.)
+(Last version without dependency on Signify.pm or Parallel::ForkManager is 1.18d.
+Version 1.26 and later require Signify.pm 1.4 or later when signify is used.)
 
 ## Overview
 
@@ -42,8 +43,10 @@ The recommended approach is two independent sets of specs per host:
 - Comprehensive — monitors all trees in the "weekly" set
 
 **Secondary specs** (`/var/db/sigtree/secondary/<hostname>/`):
-- Protected with user immutability flags (uchg on OpenBSD)
-- Not signed (signing optional)
+- Protected with user immutability flags (uchg on OpenBSD/BSD; no
+  immutability flag on Linux)
+- Never signed: `-d secondary` turns signing off whatever crypto_sigs says,
+  so daily updates need no passphrase
 - Checked and auto-updated daily; full check Wednesday night
 - Monitors a critical subset ("daily" set) daily, full "weekly" set Wednesday
 
@@ -68,14 +71,14 @@ to rsync specs from multiple hosts to a central server for aggregation.
 - **Immutability flag support**: schg or uchg on OpenBSD/BSD; +i on Linux
 - **mtimestasis**: monitors for files that have NOT changed within a
   specified time window — useful for detecting silenced log files
-- **SHA-2 and SHA-3**: configurable digest algorithm and key length
+- **SHA-2 and SHA-3**: configurable digest algorithm and digest length
 - **macOS application support**: -m option to suppress application bundle
   contents while still processing them
 
 ## Monitored Attributes (Keywords)
 
 ```
-type            file type (file, dir, link, fifo, device, socket)
+type            file type (file, dir, link, block device, char device, fifo, socket)
 linktarget_type type of a symlink's target
 uid             owner user ID
 gid             owner group ID
@@ -85,13 +88,16 @@ nlink           number of hard links
 link            symlink target
 mtime           modification time
 mtimestasis-NN[smhd]  alert if mtime has NOT changed for NN seconds/minutes/hours/days
+                (NN is one or two digits)
 ctime           inode change time
 shadigest       SHA-2 or SHA-3 digest (algorithm set globally, default 256-bit SHA-3)
 flags           filesystem flags (chflags on BSD, chattr on Linux)
 ignore          exclude this file/tree from monitoring entirely
 ```
 
-Default if no keywords specified: all of the above except mtimestasis.
+Default if no keywords specified:
+`type,uid,gid,mode,size,nlink,link,mtime,ctime,shadigest,flags`
+(that is, everything above except linktarget_type, mtimestasis, and ignore).
 
 ## Commands
 
@@ -105,29 +111,49 @@ update            Update specs to reflect changes found by check
 changes           Show pending changes from last check before update
 ```
 
-On initialize, the sigtree spec-of-specs is written and signed last,
-ensuring a valid signed spec implies all tree specs were successfully
-written. On update, the spec-of-specs is also updated last.
+On initialize and update, the sigtree spec-of-specs is written and signed
+last, after the tree specs. It records the spec directory as it is at that
+point, so a good signature on it does not by itself mean every tree spec
+was written: if a tree failed, sigtree says so and exits non-zero (and that
+tree's pending changes are kept). Check the exit status, or the output, of
+initialize and update.
 
 The changes command shows what check found before you commit to an update —
 review this before running update. For partial updates, only updated trees
 are removed from the pending changes file; unreviewed changes in other
 trees are preserved.
 
+sigtree exits non-zero when a command fails, including when one tree's
+worker fails (the other trees are still processed and the failed tree's
+pending changes are kept), when signing fails, or when an immutability
+flag cannot be set or reset. initialize and update test the passphrase
+by signing a temporary file before changing any spec, so a mistyped
+passphrase changes nothing.
+
 ## Options
 
 ```
 -r root_dir       Root directory for specs (default: /var/db/sigtree)
--c config_file    Config file (default: <root_dir>/<hostname>.sigtree.conf)
+-c config_file    Config file (default: /etc/<hostname>.sigtree.conf; a
+                  relative path is taken relative to /etc unless it
+                  starts with ./)
 -d spec_dir       Spec directory, absolute or relative to root_dir;
                   "secondary" is special-cased to <root_dir>/secondary/<hostname>
--s set_list       Comma-separated list of sets to operate on
--f N              Number of child worker processes
+                  (with an absolute path, the spec-of-specs and changed
+                  file go in its parent directory)
+-s set_list       Comma-separated list of sets to operate on; with
+                  initialize, "new" (or "uninitialized") selects trees
+                  that have no spec yet. Not allowed with
+                  initialize_specs, check_specs, or check_file.
+-f N              Number of child worker processes: 0 (no workers) or
+                  2 up to max_child_procs. Only for initialize and check.
 -m                Don't show macOS application bundle contents
--p                Use privilege separation (_sigtree user required)
+-p                Use privilege separation (must run as root; _sigtree
+                  user and group required); same as "privsep: yes"
 -v                Verbose: show old and new values of changed attributes
--V                Show version
+-V                Show version (alone, with no other option or command)
 -h                Help
+-D                Debugging output
 ```
 
 ## Installation
@@ -144,33 +170,37 @@ Linux, or macOS.
 ### Dependencies
 
 Required:
-- Perl 5
-- CPAN modules: Digest::SHA, Sys::Hostname, Getopt::Std, File::Basename,
-  File::Temp (OpenBSD::MkTemp on OpenBSD), Cwd, Storable
-  (all included with OpenBSD standard distribution)
+- Perl 5.10 or later
+- Core Perl modules: Digest::SHA, Sys::Hostname, Getopt::Std, File::Basename,
+  File::Temp (OpenBSD::MkTemp on OpenBSD), Cwd, Storable, IO::Socket,
+  MIME::Base64 (all included with Perl and with OpenBSD's base system)
 - Digest::SHA3 (CPAN)
-- Parallel::ForkManager 1.19 or later (CPAN)
+- Parallel::ForkManager 1.19 or later (CPAN), unless workers are turned
+  off (-f 0 and default_child_procs: 0)
 - OpenBSD::Pledge, OpenBSD::Unveil, OpenBSD::MkTemp (OpenBSD only)
 
 For signify signing (recommended):
-- [Signify.pm](https://github.com/lippard661/Signify)
+- [Signify.pm](https://github.com/lippard661/Signify) 1.4 or later
 - signify (standard on OpenBSD), signify-openbsd (Linux apt package),
   or signify via Homebrew (macOS)
 
 For privilege separation:
-- IO::Socket, IO::Handle, IO::Select, IO::FDPass, MIME::Base64,
-  Privileges::Drop, JSON::MaybeXS or JSON::PP
+- Run as root, with a _sigtree user and group
+- IO::Handle, IO::Select, JSON::MaybeXS or JSON::PP (core), and
+  IO::FDPass and Privileges::Drop (CPAN)
 - Note: Privileges::Drop requires a small patch on macOS with the
   system perl (5.34.1); works correctly with Homebrew perl
 
 For GPG/PGP signing (optional, signify preferred):
 - GPG or PGP 5 or later
 - PGP::Sign (CPAN; security/p5-PGP-Sign in OpenBSD ports)
-- GPG2 with privsep requires the provided gpg-noagent shell script
+- GPG2 with privsep requires the provided gpg-noagent shell script,
+  installed as /usr/local/bin/gpg-noagent
 
 For immutability flag support:
-- OpenBSD/BSD: /usr/bin/chflags, /usr/sbin/sysctl
-- Linux: /usr/bin/chattr, /usr/bin/lsattr
+- OpenBSD/BSD: /usr/bin/chflags, /sbin/sysctl, /bin/ls
+- macOS: /usr/bin/chflags, /usr/sbin/sysctl, /bin/ls
+- Linux: /usr/bin/chattr, /usr/bin/lsattr, /usr/bin/stat
 
 Install CPAN modules via OpenBSD ports, Homebrew, apt, or:
 ```
@@ -186,31 +216,68 @@ install Privileges::Drop
 cp src/sigtree.pl /usr/local/bin/
 chmod 755 /usr/local/bin/sigtree.pl
 mkdir -p /var/db/sigtree
+chmod 700 /var/db/sigtree
 ```
 
-Copy the sample config from etc/ to /var/db/sigtree/<hostname>.sigtree.conf
-and edit to reflect the trees you want to monitor.
+Copy the sample config from etc/ to /etc/<hostname>.sigtree.conf (owned by
+root, mode 0600; sigtree refuses a config that is group- or world-writable
+or owned by another user) and edit it to reflect the trees you want to
+monitor. `<hostname>` is the short host name, as `hostname -s` prints it.
+
+For signify, create a key pair (sigtree's default paths are shown; others
+can be set with signify_seckey and signify_pubkey):
+```sh
+signify -G -p /etc/signify/sigtree.pub -s /etc/signify/sigtree.sec
+```
+
+Then create the specs with `sigtree.pl initialize`.
 
 ## Configuration
 
-The config file has three sections: global attributes, set definitions,
-and tree list. Lines beginning with # are comments.
+The config file has three sections, in this order: global attributes, set
+definitions, and tree list. Lines beginning with # are comments; a # later
+in a line is not a comment, so values cannot have trailing comments.
 
 **Global attributes**:
 ```
-crypto-sigs: signify          # signify, GPG, GPG1, or PGP
-signify_pubkey: /path/to/pub
-signify_seckey: /path/to/sec
-immutable-specs: schg         # schg, uchg, yes (=schg), or no
-sha2_digest: 256              # 256, 384, or 512
-sha3_digest: 256              # 224, 256, 384, or 512 (default 256 if unset)
+crypto_sigs: signify
+signify_pubkey: /etc/signify/sigtree.pub
+signify_seckey: /etc/signify/sigtree.sec
+immutable-specs: schg
+sha3_digest: 256
 max_child_procs: 5
 default_child_procs: 4
 privsep: yes
 ```
 
+- `crypto_sigs`: signify, GPG (GPG 2), GPG1, PGP, or none. If omitted,
+  specs are signed only if `pgpkeyid` is set (GPG 2, or signify if
+  `pgpkeyid: signify`).
+- `signify_pubkey`, `signify_seckey`: default to /etc/signify/sigtree.pub
+  and /etc/signify/sigtree.sec. The files must exist and be readable.
+- `pgpkeyid`, `pgpkeyring`: key ID and keyring directory for GPG/PGP
+  (keyring default /root/.gnupg for GPG, /root/.pgp for PGP).
+- `immutable-specs`: schg, uchg, yes, or no. schg and uchg are BSD/macOS
+  only; yes means schg on BSD/macOS and +i on Linux.
+- `sha2_digest` (256, 384, or 512) or `sha3_digest` (224, 256, 384, or
+  512), not both. Default is 256-bit SHA-3.
+- `max_child_procs`, `default_child_procs`: 0 or 2 and up (defaults 5 and
+  4); default must not exceed max.
+- `privsep`: yes or no.
+
 **Set definitions**:
+
+Each set is `set: longname,shortname` (both names required, at most 12
+characters each), followed by a required `description:`, optional
+`keywords:` (default list above), and optional `priority:` (reports list
+sets highest priority first). A set named `sigtree` must be defined; it is
+used for sigtree's own spec directory.
 ```
+set: sigtree,SIG
+description: Sigtree files.
+keywords: gid,mode,nlink,shadigest,uid,size,link,mtime,ctime,type,linktarget_type
+priority: 500
+
 set: weekly,wk
 description: Weekly comprehensive check.
 keywords: type,uid,gid,mode,size,nlink,link,mtime,ctime,shadigest,flags
@@ -233,19 +300,24 @@ keywords: ignore
 **Tree list**:
 ```
 tree: /etc:weekly,daily
-exception: /etc/mtab:IGNORE
-exception-tree: /etc/cups:IGNORE
+exception: mtab:IGNORE
+exception-tree: cups:IGNORE
 
 tree: /usr/local/bin:weekly,daily
 
 tree: /var/log:logs
 ```
 
+A tree takes a list of sets; the first is its primary set, which decides
+which keywords are checked, and the others group trees for `-s`.
 `exception` applies to a single file or directory; `exception-tree` applies
-to a directory and all its contents. Specifying `.` as an exception changes
-the primary set of the tree's root directory itself without affecting its
-contents — useful for directories like /etc whose mtime/ctime changes
-frequently.
+to a directory and all its contents. Exception paths are relative to the
+tree (`mtab`, not `/etc/mtab`; an absolute path is a config error), and
+each exception takes one set.
+Exceptions are only allowed for trees that are directories. Specifying
+`.` as an exception changes the primary set of the tree's root directory
+itself without affecting its contents — useful for directories like /etc
+whose mtime/ctime changes frequently.
 
 Trees may not overlap; no tree may be a subtree of another tree in the config.
 Symbolic links are never followed to avoid loops.
@@ -279,8 +351,9 @@ Add `-v` for verbose output showing old and new values of changed attributes.
 
 ## Security Notes
 
-- Spec files and the sigtree config should be owned by root and not
-  world-readable (0600); they reveal exactly what is and isn't monitored
+- Spec files and the sigtree config (/etc/<hostname>.sigtree.conf) should
+  be owned by root and not world-readable (0600); they reveal exactly what
+  is and isn't monitored
 - The /var/db/sigtree directory tree should not be world-traversable
 - Primary specs with schg immutability require single-user mode on OpenBSD
   for initialize and update operations

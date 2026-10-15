@@ -292,11 +292,58 @@
 #    stale recv_request comment. Also hardened priv and nonpriv reads against
 #    symlink/TOCTOU swaps (O_NOFOLLOW, ELOOP/EMLINK detection, fstat dev/ino
 #    verification) and added a refuse-to-write-through-symlink message.
+# Modified 15 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard after review against the audit checklist (version 1.26):
+#    call Signify::sign and Signify::verify with Signify.pm's named
+#    arguments and require Signify.pm 1.4 (1.3 can report a successful
+#    signing with a signify -n key as failed). Privileged parent:
+#    is_allowed_path rejects ".." components, so the unprivileged process
+#    can no longer have root open any file via "$tree/../.."; removed the
+#    /tmp/sigtree.* exception from is_sigtree_managed_file (unused under
+#    privsep), through which the unprivileged process could have root
+#    run chflags on a symlink it placed in /tmp; chflags now runs with -h
+#    so a symlink is never followed; signing and verification use the
+#    parent's own method and keys, not the request's; the passphrase it
+#    receives is overwritten after use. A failed signature (signify or
+#    PGP) now stops initialize and update, and update signs a spec before
+#    removing its tree from the changed file, so a wrong passphrase no
+#    longer leaves specs with stale signatures and the changes forgotten.
+#    initialize and update also sign a throwaway file right after the
+#    passphrase prompt (in the privileged parent under privsep), so a
+#    wrong passphrase stops them before any spec is changed.
+#    initialize and check now treat a worker that died as failed (its
+#    tree's changes are kept; check does not write a changed file with a
+#    tree missing) and exit non-zero. chflags/chattr failures are
+#    reported and fatal, including under privsep, where the request used
+#    to report success; "Unable to reset" no longer exits 0. Securelevel
+#    -1 is accepted and treated as 0; sysctl failures are reported.
+#    update's "Failed to load spec ... skipping" now skips only that tree
+#    (it ended the update with the spec dir unlocked). An absolute -d
+#    outside the root dir now works under privsep (the privileged parent
+#    refused the host spec, which is in the spec dir's parent) and its
+#    spec dir is in the sigtree set (it had no set). An absolute
+#    exception or exception-tree path is now a config error (it never
+#    matched, and with an ignored set gave no warning), and an
+#    exception-tree for the whole tree says to change the tree's sets
+#    instead. unveil: the spec
+#    dir's parent is unveiled when an absolute -d puts it outside the
+#    root dir; dropped x where nothing is exec'd and /bin/sh for the
+#    immutable commands (ls is run directly). Removed the Linux-only FD
+#    ACK (reads are exact-length sysread) and bounded the descriptor wait
+#    at 30 seconds instead; SIGPIPE is ignored around socket writes; a
+#    lost or corrupt privsep response is fatal instead of read as
+#    success. Worker temp changed files are marked by the caller rather
+#    than by a /tmp/ path prefix, and their temp dir is removed even
+#    after a worker died with its file half-written. Spec and changed
+#    file writes check close. yes_or_no treats end of input as no; no passphrase at end of
+#    input is an error. The passphrase is overwritten at the end of
+#    initialize and update (the 1 May wipe applied only to an empty
+#    string). require 5.010, which the code already needed.
 
 ### Required packages.
 
 # sigtree.pl requires the following in order to work:
-# * Perl 5.
+# * Perl 5.10 or later.
 # * Standard Perl modules File::Basename, File::Temp, Getopt::Std,
 #   Storable, and Sys::Hostname.
 # * Standard Perl module Cwd used in FileAttr and for check_file.
@@ -311,7 +358,7 @@
 #   * Or: /usr/bin/signify (signify-openbsd for Linux)
 #   * /bin/stty (for PGP or GPG 1, without gpg-agent)
 #   * /usr/bin/tty (for GPG 2, with gpg-agent)
-#   * Signify.pm wrapper for signify
+#   * Signify.pm 1.4 or later, wrapper for signify
 # * If immutable flags are used (recommended for BSD):
 #   BSD:
 #   * /usr/bin/chflags (schg/noschg or uchg/nouchg)
@@ -337,7 +384,7 @@
 # copy your spec dir to a known clean system and do a check_specs
 # on them (use a known clean $spec_dir/$HOSTNAME.spec file).
 
-require 5.004;
+require 5.010; # feature 'state' and the // operator
 use strict;
 use warnings;
 use feature 'state';
@@ -391,7 +438,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.25 of 1 July 2026';
+my $VERSION = 'sigtree 1.26 of 15 October 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -725,6 +772,14 @@ elsif ($config->{CRYPTO_SIGS} ne 'none') {
 if ($use_signify) {
     require_module ('Signify') or
 	die "Could not require Signify. $@\n";
+    # The named-argument calls below need Signify.pm 1.3 or later (an
+    # older module would take the hash reference as the passphrase or the
+    # public key path), and 1.4 or later because 1.3 can report a
+    # successful signing as failed with a key made with signify -n, which
+    # sigtree now treats as fatal.
+    eval { Signify->VERSION ('1.4'); 1 } or
+	die "Signify.pm " . (Signify->VERSION // 'without a version') .
+	    " is too old, 1.4 or later is required.\n";
 }
 # GPG or PGP.
 elsif ($use_pgp) {
@@ -768,14 +823,21 @@ if ($secondary_specs) {
 
 if ($use_immutable) {
     if (-e $CHFLAGS) { # BSD
-	open (my $outfh, '-|', $SYSCTL, 'kern.securelevel');
+	open (my $outfh, '-|', $SYSCTL, 'kern.securelevel') or
+	    die "Could not run $SYSCTL kern.securelevel: $!\n";
 	$SECURELEVEL = <$outfh>;
 	close ($outfh);
-	chomp ($SECURELEVEL) if (defined ($SECURELEVEL));
+	if ($? != 0) {
+	    die "$SYSCTL kern.securelevel failed (" .
+		(($? & 127) ? 'killed by signal ' . ($? & 127) : 'exit ' . ($? >> 8)) . ").\n";
+	}
+	$SECURELEVEL //= '';
+	chomp ($SECURELEVEL);
 	$SECURELEVEL =~ s/^.*=\s*// if ($^O ne 'darwin');
 	$SECURELEVEL =~ s/^.*:\s*// if ($^O eq 'darwin');
-	if ($SECURELEVEL !~ /^\d$/) {
-	    die "Immutable file flags do not appear to be supported by your operating system.\n";
+	# Securelevel is -1 (permanently insecure), 0, 1 or 2.
+	if ($SECURELEVEL !~ /^-?\d+\z/) {
+	    die "Could not parse securelevel from $SYSCTL kern.securelevel (\"$SECURELEVEL\").\n";
 	}
     }
     elsif (-e $CHATTR) { # Linux
@@ -845,21 +907,27 @@ if ($OSNAME eq 'openbsd') {
     # stdio is automatically included
     pledge (@promises) || die "Cannot pledge initial promises. $!\n";
 
-    # Need rwc for sigtree files (and x for dirs). This doesn't work if $root_dir doesn't exist yet.
-    unveil ($root_dir, 'rwxc');
-    if (!-e $root_dir) {
-	my $root_dir_dir = File::Basename::dirname ($root_dir);
-	unveil ($root_dir_dir, 'rwxc');
+    # Need rwc for sigtree files. x is checked only for a path given to
+    # exec, and nothing is run from these directories. Walking through a
+    # directory needs no unveil permission on it. Unveiling a path that
+    # doesn't exist yet fails, so unveil its parent instead.
+    foreach my $dir ($root_dir, $spec_dir_dir) {
+	# An absolute -d spec dir may lie outside $root_dir.
+	next if ($dir ne $root_dir && $dir =~ m{^\Q$root_dir\E(?:/|\z)});
+	if (-e $dir) {
+	    unveil ($dir, 'rwc');
+	}
+	else {
+	    unveil (File::Basename::dirname ($dir), 'rwc');
+	}
     }
 
-    # Need x for immutable flag setting and checking.
-    # Need r to be able to detect existence for sigtree checks.
-    # Need x on /bin/sh for execution of list command..
+    # Need x to run the flag commands; r because they are file-tested.
+    # (ls is run directly, not through /bin/sh.)
     # $SYSCTL absent because it's already been run.
     if ($use_immutable) {
 	unveil ($CHFLAGS, 'rx');
 	unveil ($LIST_FLAGS_CMD, 'rx');
-	unveil ($BINSH, 'rx');
     }
     # Need x for crypto sign/verify and keys.
     if ($use_pgp) {
@@ -869,8 +937,10 @@ if ($OSNAME eq 'openbsd') {
 	    unveil ($signify_seckey, 'r');
 	}
 	else {
-	    unveil ($PGP::Sign::PGPPATH, 'rx');
+	    unveil ($PGP::Sign::PGPPATH, 'r');
 	    if ($use_privsep) {
+		# gpg-noagent is a #! script, so its interpreter is
+		# exec-checked under unveil too.
 		unveil ($BINSH, 'rx');
 		unveil ($GPG_NOAGENT, 'rx');
 	    }
@@ -888,8 +958,8 @@ if ($OSNAME eq 'openbsd') {
 	unveil ($STTY, 'rx');
 	unveil ($TTY, 'rx');
     }
-    # Need /tmp access.
-    unveil ('/tmp', 'rwxc');
+    # Need /tmp access (worker temp files, GPG2 passphrase temp file).
+    unveil ('/tmp', 'rwc');
 
     # Need r for all trees, and there could be symlinks from a tree
     # to a non-tree, so we just unveil /.
@@ -1063,6 +1133,7 @@ sub initialize_sets {
 	@trees, $tree, $tree_spec_name, @specified_trees);
     # used for Parallel::ForkManager
     my ($pm, $child_temp_dir);
+    my @failed_trees; # Trees whose worker did not finish normally.
 
     $| = 1;
 
@@ -1078,6 +1149,8 @@ sub initialize_sets {
     }
 
     $pgp_passphrase = get_pgp_passphrase() if ($use_pgp);
+    # Stop now, before any spec is changed, if the passphrase cannot sign.
+    check_passphrase ($pgp_passphrase) if ($use_pgp);
 
     if (!$specs_only) {
 	# With privsep, we can't do -e checks after dropping privileges
@@ -1086,12 +1159,14 @@ sub initialize_sets {
 	    ($use_privsep && grep { $_ eq $changed_file } @EXISTING_SPECS)) {
 	    $changed_file_exists = 1;
 	    $changedfile = new ChangedFile ($changed_file);
-	    unless ($changedfile) {
+	    if ($changedfile) {
+		$changed_specs = $changedfile->tree_present ($spec_dir);
+	    }
+	    else {
 		warn "Failed to load changed file, treating it as if it doesn't exist.\n";
 		$changed_file_exists = 0;
 	    }
-	    $changed_specs = $changedfile->tree_present ($spec_dir);
-	    if ($verbose) {
+	    if ($verbose && $changed_file_exists) {
 		print "A changed file exists.  We will remove any trees we initialize from it.\n";
 		print "There are changed specifications, we will re-initialize them.\n" if ($changed_specs);
 	    }
@@ -1121,7 +1196,8 @@ sub initialize_sets {
 	# like in check_sets.
 	if ($fork_children) {
 	    # create $child_temp_dir with mktemp
-	    $child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
+	    $child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX') or
+		die "Could not create temp dir in /tmp: $!\n";
 	    chomp ($child_temp_dir);
 	    $pm = Parallel::ForkManager->new ($fork_children,
 					      $child_temp_dir);
@@ -1147,14 +1223,12 @@ sub initialize_sets {
 			}
 		    }
 			
-		    if (defined ($tree_ref) || defined ($ident)) {
-			if (defined ($tree_ref)) {
-			    $child_tree = ${$tree_ref};
-			}
-			else {
-			    print "Warning: using ident $ident instead of tree ref for child $pid.\n";
-			    $child_tree = $ident;
-			}
+		    # Only a worker that exited 0 and returned its tree name
+		    # initialized its tree. Any other ending (a die, a signal,
+		    # lost return data) leaves the tree's changes in the
+		    # changed file, so they are not lost.
+		    if ($exit_code == 0 && !$exit_signal && defined ($tree_ref)) {
+			$child_tree = ${$tree_ref};
 			# Need to do this check again, only remove if it was in a specified set.
 			if ($config->tree_uses_sets ($child_tree, @sets) &&
 			    $changed_file_exists && $changedfile->tree_present ($child_tree)) {
@@ -1162,8 +1236,10 @@ sub initialize_sets {
 			}
 		    }
 		    else {
-			# child failed
-			print "Warning: child pid $pid did not return a tree name or ident, exit code $exit_code.\n";
+			push (@failed_trees, $ident // "pid $pid");
+			print "Warning: child for tree " . ($ident // "(unknown)") . " (pid $pid) failed (" .
+			    ($exit_signal ? "signal $exit_signal" : "exit $exit_code") .
+			    "); its changes are kept in the changed file.\n";
 		    }
 		}
 		);
@@ -1276,7 +1352,7 @@ sub initialize_sets {
 	# Wait for all children to finish.
 	$pm->wait_all_children;
 	# Remove $child_temp_dir.
-	rmdir ($child_temp_dir);
+	remove_temp_dir ($child_temp_dir);
     }
 
     # If we reinitialized any changed specs, delete spec_dir from the
@@ -1334,6 +1410,17 @@ sub initialize_sets {
 	if ($use_pgp) {
 	    set_immutable_flag ("$spec_dir_dir/$spec_spec.sig", $IMMUTABLE_ON);
 	}
+    }
+
+    # Overwrite the passphrase now that signing is done.
+    if (defined ($pgp_passphrase)) {
+	$pgp_passphrase = "x" x length ($pgp_passphrase);
+	$pgp_passphrase = '';
+    }
+
+    if (@failed_trees) {
+	die "Initialization failed for " . scalar (@failed_trees) . " tree(s): @failed_trees\n" .
+	    "Their changes are still in the changed file; fix the cause and initialize them again.\n";
     }
 }
 
@@ -1531,10 +1618,12 @@ sub check_sets {
     # Track available worker slots
     my @available_workers = (0 .. $fork_children - 1);  # Initially all available
     my %worker_in_use;  # Track which workers are busy
-    
+    my @failed_trees;   # Trees whose worker did not finish normally
+
     if ($fork_children) {
 	# create $child_temp_dir with mktemp
-	$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX');
+	$child_temp_dir = mkdtemp ('/tmp/sigtree.XXXXXXXX') or
+	    die "Could not create temp dir in /tmp: $!\n";
 	chomp ($child_temp_dir);
 	$pm = Parallel::ForkManager->new ($fork_children,
 					  $child_temp_dir);
@@ -1559,25 +1648,28 @@ sub check_sets {
 		    }
 		}
         
-		if (defined ($tempfile_ref)) {
+		if ($exit_code == 0 && !$exit_signal && defined ($tempfile_ref)) {
 		    # Get the returned filename.
 		    $child_temp_file = ${$tempfile_ref};
 		    # Retrieve from stored.
-		    $child_changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
+		    $child_changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file", 1);
 		    if ($child_changedfile) {
 			# Merge into main one.
 			$changedfile->merge ($child_changedfile);
 		    }
 		    else {
+			push (@failed_trees, $ident);
 			warn "Failed to load child changed file: $child_temp_dir/$child_temp_file\n";
 		    }
 		    # Remove the file.
 		    unlink ("$child_temp_dir/$child_temp_file");
 		}
 		else {
-		    # child failed
-		    # what's the recovery here?
-		    print "Warning: child $pid ($ident) did not return a changedfile, exit code $exit_code.\n";
+		    # Child failed: its tree's results are missing, so the
+		    # changed file is not written (see below).
+		    push (@failed_trees, $ident // "pid $pid");
+		    print "Warning: child for tree " . ($ident // "(unknown)") . " (pid $pid) failed (" .
+			($exit_signal ? "signal $exit_signal" : "exit $exit_code") . ").\n";
 		}
 	    }
 	    );
@@ -1638,7 +1730,7 @@ sub check_sets {
 	    }
 	    $child_temp_file = File::Basename::basename ($child_temp_file);
 	    # Use temp file for location of changedfile.
-	    $changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file");
+	    $changedfile = new ChangedFile ("$child_temp_dir/$child_temp_file", 1);
 	    unless ($changedfile) {
 		die "Failed to create temp changed file in child: $child_temp_dir/$child_temp_file\n";
 	    }
@@ -1705,7 +1797,16 @@ sub check_sets {
 	# Wait for all children to finish.
 	$pm->wait_all_children;
 	# Remove $child_temp_dir.
-	rmdir ($child_temp_dir);
+	remove_temp_dir ($child_temp_dir);
+    }
+
+    if (@failed_trees) {
+	# The changed file was reset above, so writing it now would drop
+	# the failed trees' earlier changes along with this run's. Show
+	# what was found but keep the previous changed file.
+	show_change_details ($changedfile, $verbose, 0, $no_macos_app_contents);
+	die "Check failed for " . scalar (@failed_trees) . " tree(s): @failed_trees\n" .
+	    "The changed file was not updated; it still holds the previous check's results.\n";
     }
 
     show_change_details ($changedfile, $verbose, 1, $no_macos_app_contents);
@@ -1874,6 +1975,7 @@ sub update_sets {
 	$spec, $fileattr, $fileattr2, $full_path, $path, $primary_set, $description,
 	$keywords, $priority, %differences);
     my ($macos_OK_flag);
+    my @failed_trees; # Trees whose spec could not be loaded.
 
     $changedfile = new ChangedFile ($changed_file);
     unless ($changedfile) {
@@ -1925,6 +2027,8 @@ sub update_sets {
     die "Nothing changed in specified sets to update.\n" if (!$something_to_update);
 
     $pgp_passphrase = get_pgp_passphrase() if ($use_pgp);
+    # Stop now, before any spec is changed, if the passphrase cannot sign.
+    check_passphrase ($pgp_passphrase) if ($use_pgp);
 
     # Ugly hack, but it prevents a problem.
     @changed_trees = $changedfile->get_trees if ($removed_old_trees);
@@ -1965,10 +2069,27 @@ sub update_sets {
 
 	    ($spec, $fileattr) = new Spec ($tree, "$spec_dir/$tree_spec_name");
 	    unless ($spec && $fileattr) {
+		# Skip only this tree: its changes stay in the changed file,
+		# its spec is locked again, and the update goes on (it used
+		# to return here, leaving the spec dir unlocked and the spec
+		# for the spec dir not regenerated).
 		print "Failed to load spec for $tree, skipping.\n";
-		return;
+		push (@failed_trees, $tree);
+		if ($use_privsep && $use_immutable) {
+		    PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		    if ($use_pgp) {
+			PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
+		    }
+		}
+		elsif ($use_immutable) {
+		    set_immutable_flag ("$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
+		    if ($use_pgp) {
+			set_immutable_flag ("$spec_dir/$tree_spec_name.sig", $IMMUTABLE_ON);
+		    }
+		}
+		next;
 	    }
-	    
+
 	    @changed_paths = $changedfile->get_paths ($tree);
 	    foreach $changed_path (@changed_paths) {
 		if ($changed_path eq '.') {
@@ -2010,6 +2131,13 @@ sub update_sets {
 	    # Save the changed spec.
 	    $spec->store_spec ("$spec_dir/$tree_spec_name");
 
+	    # Sign before removing the tree from the changed file: if
+	    # signing fails (dies), the changes stay recorded and a second
+	    # update (with the right passphrase) redoes this tree.
+	    if ($use_pgp) {
+		sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
+	    }
+
 	    # Now updated; delete this tree from the changed file.
 	    $changedfile->delete ($tree);
 
@@ -2018,10 +2146,6 @@ sub update_sets {
 
 	    # And delete the changed file if it's now empty.
 	    $changedfile->delete_if_empty;
-
-	    if ($use_pgp) {
-		sigtree_sign ("$spec_dir/$tree_spec_name", $pgp_passphrase);
-	    }
 	    if ($use_privsep && $use_immutable) {
 		PrivSep::request_immutable_set ($FileAttr::PRIV_IPC, "$spec_dir/$tree_spec_name", $IMMUTABLE_ON);
 		if ($use_pgp) {
@@ -2095,6 +2219,17 @@ sub update_sets {
 	$changedfile->store_changedfile;
 	# And delete the changed file if it's now empty.
 	$changedfile->delete_if_empty;
+    }
+
+    # Overwrite the passphrase now that signing is done.
+    if (defined ($pgp_passphrase)) {
+	$pgp_passphrase = "x" x length ($pgp_passphrase);
+	$pgp_passphrase = '';
+    }
+
+    if (@failed_trees) {
+	die "Update skipped " . scalar (@failed_trees) . " tree(s) whose spec could not be loaded: @failed_trees\n" .
+	    "Their changes are still in the changed file.\n";
     }
 }
 
@@ -2250,7 +2385,7 @@ sub verify_required_dirs {
 	    die "Host specification is not writable. $spec_dir_dir/$spec_spec\n";
 	}
     }
-    elsif ($caller != $CHECK && $use_immutable && $SECURELEVEL != 0 && ($immutable_flag ne $BSD_USER_IMMUTABLE_FLAG)) {
+    elsif ($caller != $CHECK && $use_immutable && $SECURELEVEL > 0 && ($immutable_flag ne $BSD_USER_IMMUTABLE_FLAG)) {
 	die "Cannot write to existing host specification when kernel securelevel > 0.  Securelevel = $SECURELEVEL\n";
     }
 
@@ -2421,14 +2556,14 @@ sub writable_file {
     # on failure of priv open for write.
     return 1 if ($use_privsep);
 
-    if (-w $file && ($SECURELEVEL == 0 || !immutable_file ($file))) {
+    if (-w $file && ($SECURELEVEL <= 0 || !immutable_file ($file))) {
 	return 1;
     }
     # If file doesn't exist, dir must be writable.  We don't
     # auto-create dirs, so this isn't a recursive function.
     elsif (!-e $file) {
 	$dir = File::Basename::dirname ($file);
-	if (-w $dir && ($SECURELEVEL == 0 || !immutable_file ($dir))) {
+	if (-w $dir && ($SECURELEVEL <= 0 || !immutable_file ($dir))) {
 	    return 1;
 	}
 	else {
@@ -2475,7 +2610,12 @@ sub yes_or_no {
     while (1) {
 	print "$query";
 	$answer = <STDIN>;
-	chop ($answer);
+	# End of input is "no", rather than asking forever.
+	if (!defined ($answer)) {
+	    print "\n";
+	    return 0;
+	}
+	chomp ($answer);
 
 	if ($answer eq 'yes' || $answer eq 'y') {
 	    return 1;
@@ -2489,7 +2629,10 @@ sub yes_or_no {
     }
 }
 
-# Subroutine to set immutable flag.
+# Subroutine to set immutable flag. Dies if the command cannot be run or
+# fails, or if the flag is still set after clearing it. (The privileged
+# parent calls this inside an eval and returns the message to the
+# requester.)
 sub set_immutable_flag {
     my ($path, $on) = @_;
     my ($flag, $linux, $bsd);
@@ -2523,16 +2666,31 @@ sub set_immutable_flag {
     }
 
     if (-e $path) {
+	my @cmd;
 	if ($bsd) {
-	    system ($CHFLAGS, $flag, $path);
+	    # -h: act on a symlink itself, never on the file it points to.
+	    # chflags otherwise follows a symlink named on its command line.
+	    @cmd = ($CHFLAGS, '-h', $flag, $path);
 	}
 	elsif ($linux && !-l $path) {
-	    system ($CHATTR, '-f', $flag, $path);
+	    # chattr refuses symlinks; -f suppresses its own messages, so
+	    # a failure is reported below.
+	    @cmd = ($CHATTR, '-f', $flag, $path);
+	}
+
+	if (@cmd) {
+	    system (@cmd);
+	    my $status = $?;
+	    if ($status != 0) {
+		die "Unable to " . ($on ? 'set' : 'reset') . " immutable flag on $path: $cmd[0] " .
+		    ($status == -1 ? "could not be run: $!" :
+		     ($status & 127) ? 'killed by signal ' . ($status & 127) :
+		     'exit ' . ($status >> 8)) . "\n";
+	    }
 	}
 
 	if (!$on && !writable_file ($path)) {
-	    print "Unable to reset immutable flag on $path.\n";
-	    exit;
+	    die "Unable to reset immutable flag on $path.\n";
 	}
     }
 }
@@ -2558,7 +2716,8 @@ sub get_pgp_passphrase {
 	$pgp_passphrase = <STDIN>;
 	print "\n";
 	system ($STTY, 'echo');
-	chop ($pgp_passphrase);
+	die "No passphrase given.\n" if (!defined ($pgp_passphrase));
+	chomp ($pgp_passphrase);
 	return ($pgp_passphrase);
     }
     elsif ($PGP_or_GPG eq 'GPG') {
@@ -2590,15 +2749,87 @@ sub get_pgp_passphrase {
     }
 }
 
-# Generic wrapper for signing.
+# Remove a worker temp dir made by mkdtemp. A worker that died can
+# leave its partial temp file there (and Parallel::ForkManager its own),
+# so plain files in it are removed first; the dir is 0700 and ours, so
+# nothing else can have been put in it.
+sub remove_temp_dir {
+    my ($dir) = @_;
+
+    if (opendir (my $dh, $dir)) {
+	foreach my $entry (readdir ($dh)) {
+	    next if ($entry eq '.' || $entry eq '..');
+	    unlink ("$dir/$entry") if (-f "$dir/$entry" && !-l "$dir/$entry");
+	}
+	closedir ($dh);
+    }
+    rmdir ($dir) or warn "Could not remove $dir: $!\n";
+}
+
+# Subroutine to make sure the passphrase can sign before initialize or
+# update changes anything: a mistyped passphrase found only at the
+# first spec leaves that spec rewritten but unsigned, and a check run
+# before the next update would then see no change to redo. Dies if
+# signing a throwaway file fails. (GPG 2 without privsep already signed
+# a temp file in get_pgp_passphrase, through gpg-agent.)
+sub check_passphrase {
+    my ($pgp_passphrase) = @_;
+
+    return if ($PGP_or_GPG eq 'GPG' && !$use_privsep);
+
+    if ($use_privsep) {
+	PrivSep::request_check_passphrase ($FileAttr::PRIV_IPC, $pgp_passphrase);
+    }
+    else {
+	sign_test_file ($pgp_passphrase);
+    }
+}
+
+# Sign a throwaway file in a private temp directory with this process's
+# method and key, then remove both. Dies with the reason on failure.
+# Used by check_passphrase, and by the privileged parent for it, which
+# is why the file is in a directory of its own (no other user can put
+# anything in a 0700 mkdtemp directory) rather than directly in /tmp.
+sub sign_test_file {
+    my ($pgp_passphrase) = @_;
+
+    my $dir = mkdtemp ('/tmp/sigtree.XXXXXXXX') or
+	die "Could not create temp dir to check the passphrase: $!\n";
+    my $file = "$dir/passphrase-check";
+    my $error;
+    if (my $fh = safe_open_for_write ($file)) {
+	print $fh "sigtree passphrase check\n";
+	close ($fh) or $error = "Could not write $file: $!\n";
+    }
+    else {
+	$error = "Could not create $file: $!\n";
+    }
+    if (!$error) {
+	eval {
+	    if ($use_signify) {
+		sigtree_signify_sign ($file, $pgp_passphrase);
+	    }
+	    else {
+		sigtree_pgp_sign ($file, $pgp_passphrase);
+	    }
+	};
+	$error = $@;
+    }
+    unlink ($file, "$file.sig");
+    rmdir ($dir);
+    die "The $PGP_or_GPG passphrase was not accepted (nothing has been changed): $error" if ($error);
+    return 1;
+}
+
+# Generic wrapper for signing. Dies if the file could not be signed.
+# (The privileged parent uses its own $use_signify and key paths; the
+# request carries only the file and the passphrase.)
 sub sigtree_sign {
     my ($file, $pgp_passphrase) = @_;
 
     if ($use_privsep) {
 	PrivSep::request_sign_file ($FileAttr::PRIV_IPC,
-				    $file, $pgp_passphrase,
-				    $use_signify,
-				    $signify_seckey);
+				    $file, $pgp_passphrase);
     }
     elsif ($use_signify) {
 	sigtree_signify_sign ($file, $pgp_passphrase);
@@ -2613,10 +2844,7 @@ sub sigtree_verify {
     my ($file) = @_;
 
     if ($use_privsep) {
-	PrivSep::request_verify_signature ($FileAttr::PRIV_IPC,
-					   $file,
-					   $use_signify,
-					   $signify_pubkey);
+	PrivSep::request_verify_signature ($FileAttr::PRIV_IPC, $file);
     }
     elsif ($use_signify) {
 	sigtree_signify_verify ($file);
@@ -2638,8 +2866,7 @@ sub sigtree_pgp_sign {
 	close ($fh);
     }
     else {
-	print "Could not read $file to create $PGP_or_GPG signature.\n";
-	return;
+	die "Could not read $file to create $PGP_or_GPG signature. $!\n";
     }
 
     ($signature, $version) = &PGP::Sign::pgp_sign ($config->{PGPKEYID}, $pgp_passphrase, @data);
@@ -2649,13 +2876,10 @@ sub sigtree_pgp_sign {
 	die "@errors";
     }
 
-    if (my $fh = safe_open_for_write ("$file.sig")) {
-	print $fh "$signature\n";
-	close ($fh);
-    }
-    else {
-	print "Could not write $file.sig to create $PGP_or_GPG signature.\n";
-	return;
+    my $fh = safe_open_for_write ("$file.sig") or
+	die "Could not write $file.sig to create $PGP_or_GPG signature. $!\n";
+    unless ((print $fh "$signature\n") && close ($fh)) {
+	die "Could not write $file.sig to create $PGP_or_GPG signature. $!\n";
     }
 }
 
@@ -2701,30 +2925,36 @@ sub sigtree_pgp_verify {
 }
 
 # Create a signify signature in a detached file and save it.
+# Dies if signing fails (as sigtree_pgp_sign does), so that a wrong
+# passphrase stops initialize or update instead of leaving specs whose
+# old signatures no longer match.
 sub sigtree_signify_sign {
     my ($file, $signify_passphrase) = @_;
     my (@errors);
     my $SKIP_SIGNIFY_CHECK = 1;
 
-    if (Signify::sign ($file, $signify_passphrase, $signify_seckey, $SKIP_SIGNIFY_CHECK)) {
-	return;
+    if (Signify::sign ($file, { secret_key_path => $signify_seckey,
+				passphrase => $signify_passphrase,
+				skip_signify_check => $SKIP_SIGNIFY_CHECK })) {
+	return 1;
     }
 
     @errors = Signify::signify_error();
+    $errors[0] //= "unknown error\n";
 
     if ($errors[0] =~ /^no readable file/) {
-	print "Could not read $file to create $PGP_or_GPG signature.\n";
+	die "Could not read $file to create $PGP_or_GPG signature.\n";
     }
-    elsif ($errors[0] =~ /^cannot write signature file/) {
-	print "Could not write $file.sig to create $PGP_or_GPG signature.\n";
+    elsif ($errors[0] =~ /^cannot (?:write|create) signature file/) {
+	die "Could not write $file.sig to create $PGP_or_GPG signature.\n";
     }
     elsif ($errors[0] =~ /^no readable secret key/) {
-	print "Could not read secret key $signify_seckey to create $PGP_or_GPG signature.\n";
+	die "Could not read secret key $signify_seckey to create $PGP_or_GPG signature.\n";
     }
     else {
-	print "@errors";
+	# signify prints its own reason (e.g. incorrect passphrase) first.
+	die "Could not create $PGP_or_GPG signature for $file: @errors";
     }
-    return;
 }
 
 # Verify a signify signature on a specification.
@@ -2733,7 +2963,8 @@ sub sigtree_signify_verify {
     my (@errors);
     my $SKIP_SIGNIFY_CHECK = 1;
 
-    if (Signify::verify ($file, $signify_pubkey, $SKIP_SIGNIFY_CHECK)) {
+    if (Signify::verify ($file, { public_key_path => $signify_pubkey,
+				  skip_signify_check => $SKIP_SIGNIFY_CHECK })) {
 	print "   Good $PGP_or_GPG signature from $signify_pubkey on specification.\n" if ($verbose);
 	return;
     }
@@ -2936,32 +3167,18 @@ sub privileged_parent_multiplex {
             
             # If response includes a file descriptor to send, send it now
             if (defined $response_fd_to_send) {
-		# ACK protocol only on Linux.
-		if ($^O eq 'linux') {
-		    warn "[DEBUG] [PRIVILEGED PARENT] Waiting for ACK before sending FD\n" if ($main::debug_flag);
-		    my $ack_buf;
-		    # Timeout.
-		    eval {
-			local $SIG{ALRM} = sub { die "ACK timeout\n"; };
-			alarm (5); # 5 second timeout
-			my $n = sysread ($sock, $ack_buf, 3);
-			alarm (0);
-		    
-			unless ($n == 3 && $ack_buf eq 'ACK') {
-			    warn "[PRIVILEGED PARENT] Failed to receive ACK for FD transfer (got '$ack_buf', $n bytes)\n";
-			    close $response_filehandle;
-			    next;
-			}
-		    };
-		    if ($@) {
-			warn "[PRIVILEGED PARENT] ACK timeout or error: $@\n";
-			close $response_filehandle;
-			next;
-		    }
+		# No ACK is needed before sending the descriptor (the Linux-only
+		# ACK was removed in 1.26): every read on these sockets is an
+		# exact-length sysread, so the child's read of the response
+		# cannot consume the descriptor's carrier byte.
+		my $sent;
+		{
+		    local $SIG{PIPE} = 'IGNORE'; # as in send_response
+		    $sent = IO::FDPass::send (fileno ($sock), $response_fd_to_send);
 		}
-
-		# Now send the FD
-		IO::FDPass::send(fileno($sock), $response_fd_to_send);
+		unless ($sent) {
+		    warn "[PRIVILEGED PARENT] Failed to send file descriptor: $!\n";
+		}
 
 		# Close our copy of the filehandle (child now has it)
 		close $response_filehandle;
@@ -2978,8 +3195,8 @@ sub privileged_parent_multiplex {
 sub handle_privileged_request {
     my ($request) = @_;
     
-    my $type = $request->{type};
-    my $path = $request->{path};
+    my $type = $request->{type} // "";
+    my $path = $request->{path} // ""; # CHECK_PASSPHRASE has no path
 
     my @TREE_REQUESTS = ('OPEN', 'STAT', 'READDIR', 'READLINK',
 			 'IMMUTABLE_GET');
@@ -2990,7 +3207,10 @@ sub handle_privileged_request {
 
     # Validate path for all tree requests OR sigtree file requests.
     if (grep { $_ eq $type } @TREE_REQUESTS) {
-	unless (is_allowed_path($path)) {	   
+	# sigtree's own files in $spec_dir_dir (host spec, changed
+	# file, their sigs) are outside the trees and the root dir when
+	# an absolute -d puts the spec dir elsewhere.
+	unless (is_allowed_path($path) || is_sigtree_managed_file($path)) {
 	    return { error => "Path not in allowed trees: $path" };
 	}
     }
@@ -3028,6 +3248,10 @@ sub handle_privileged_request {
     }
     elsif ($type eq 'VERIFY_SIGNATURE') {
         return handle_verify_signature_request($request);
+    }
+    elsif ($type eq 'CHECK_PASSPHRASE') {
+        # No path: signs a file of its own in a private temp dir.
+        return handle_check_passphrase_request($request);
     }
     else {
         return { error => "Unknown request type: $type" };
@@ -3208,10 +3432,14 @@ sub handle_immutable_set_request {
     my ($request) = @_;
     my $path = $request->{path};
     my $immutable = $request->{immutable};
-    
-    # Call existing set_immutable_flag function
-    set_immutable_flag($path, $immutable);
-    
+
+    # set_immutable_flag dies on failure; report it to the requester
+    # (which dies with the message) instead of claiming success.
+    eval { set_immutable_flag ($path, $immutable); };
+    if ($@) {
+	return { error => $@ };
+    }
+
     return { success => 1 };
 }
 
@@ -3229,21 +3457,25 @@ sub handle_delete_file_request {
 sub handle_sign_file_request {
     my ($request) = @_;
     my $file = $request->{path};
-    my $pgp_passphrase = $request->{passphrase};
-    my $use_signify = $request->{use_signify};
-    my $signify_seckey = $request->{signify_seckey};
-    
-    # Call the appropriate signing function
+    my $pgp_passphrase = $request->{passphrase} // '';
+
+    # Use this process's own signing method and keys (set from the config
+    # before the fork), not anything the requester could supply.
     eval {
-        if ($use_signify) {
-            main::sigtree_signify_sign($file, $pgp_passphrase, $signify_seckey);
+        if ($main::use_signify) {
+            main::sigtree_signify_sign ($file, $pgp_passphrase);
         } else {
-            main::sigtree_pgp_sign($file, $pgp_passphrase);
+            main::sigtree_pgp_sign ($file, $pgp_passphrase);
         }
     };
-    
-    if ($@) {
-        return { error => "Signing failed: $@" };
+    my $error = $@;
+
+    # Overwrite this copy of the passphrase.
+    $pgp_passphrase = "x" x length ($pgp_passphrase);
+    $request->{passphrase} = $pgp_passphrase = '';
+
+    if ($error) {
+        return { error => "Signing failed: $error" };
     }
     
     # Ensure .sig file is root-owned
@@ -3255,17 +3487,33 @@ sub handle_sign_file_request {
     return { success => 1 };
 }
 
+# Sign a throwaway file with this process's method and key, so that
+# initialize and update can stop on a wrong passphrase before they
+# change any spec.
+sub handle_check_passphrase_request {
+    my ($request) = @_;
+    my $pgp_passphrase = $request->{passphrase} // '';
+
+    eval { main::sign_test_file ($pgp_passphrase); };
+    my $error = $@;
+
+    # Overwrite this copy of the passphrase.
+    $pgp_passphrase = "x" x length ($pgp_passphrase);
+    $request->{passphrase} = $pgp_passphrase = '';
+
+    return $error ? { error => $error } : { success => 1 };
+}
+
 sub handle_verify_signature_request {
     my ($request) = @_;
     my $file = $request->{path};
-    my $use_signify = $request->{use_signify};
-    my $signify_pubkey = $request->{signify_pubkey};
-    
-    # Call the appropriate verification function
+
+    # Call the appropriate verification function, by this process's own
+    # setting and public key.
     my $result;
     eval {
-        if ($use_signify) {
-            $result = main::sigtree_signify_verify($file, $signify_pubkey);
+        if ($main::use_signify) {
+            $result = main::sigtree_signify_verify ($file);
         } else {
             $result = main::sigtree_pgp_verify($file);
         }
@@ -3286,46 +3534,46 @@ sub is_sigtree_managed_file {
 
     # Reject any path containing directory traversal
     # This prevents bypassing tree restrictions via ..
-    return 0 if $path =~ m{(?:^|/)\.\.(?:/|$)};
+    return 0 if $path =~ m{(?:^|/)\.\.(?:/|\z)};
 
     # Path must be absolute (no relative paths)
     return 0 unless $path =~ m{^/};
-    
+
     # Only allow writes to:
     # - Spec files in $spec_dir (per-host)
     # - Spec spec file in $spec_dir_dir
     # - Changed files in $spec_dir_dir (*.changed, *.changedsec)
     # - NOT arbitrary files in $root_dir (no longer used for changed files)
+    # (There is deliberately no /tmp exception: nothing under privsep
+    # asks the privileged parent to act on a /tmp path, and /tmp is
+    # writable by the unprivileged process, which could put a symlink
+    # there for chflags or a write to follow.)
 
-    # Allow /tmp files for passphrase prompting (signing temp files)
-    # These are created by get_pgp_passphrase to initialize gpg-agent
-    return 1 if $path =~ m{^/tmp/sigtree\.[^/]+$};
-    
     # Check if path is in spec_dir (per-host specs)
     # Restrict to single path component (no subdirectories) using [^/]+
     if (defined $spec_dir) {
         return 1 if $path eq $spec_dir;
 	# Individual tree specs have NO extension (e.g., var.www.html)
 	# Their signatures have .sig extension
-        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+$}; # tree spec (no extension)
-        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.sig$}; # tree sig
+        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\z}; # tree spec (no extension)
+        return 1 if $path =~ m{^\Q$spec_dir\E/[^/]+\.sig\z}; # tree sig
     }
-    
+
     # Check if path is in spec_dir_dir (shared parent for multi-host)
     if (defined $spec_dir_dir) {
         # Allow the directory itself
         return 1 if $path eq $spec_dir_dir;
-        
+
         # Allow spec spec file (e.g., hostname.spec(sec) in spec_dir_dir)
-        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.spec$};
-	return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.specsec$};
-        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.sig$};
-        
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.spec\z};
+	return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.specsec\z};
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.sig\z};
+
         # Allow changed files in spec_dir_dir
-        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changed$};
-        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changedsec$};
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changed\z};
+        return 1 if $path =~ m{^\Q$spec_dir_dir\E/[^/]+\.changedsec\z};
     }
-    
+
     return 0;
 }
 
@@ -3335,14 +3583,20 @@ sub is_allowed_path {
     
     # Path must be absolute
     return 0 unless $path =~ m{^/};
-    
+
+    # Reject any path containing directory traversal, as
+    # is_sigtree_managed_file does: otherwise "$tree/../.." reaches any
+    # file, and this process reads as root. (Paths sigtree builds itself
+    # never contain a .. component: readdir's . and .. are skipped.)
+    return 0 if $path =~ m{(?:^|/)\.\.(?:/|\z)};
+
     # Check against configured trees (loaded from config)
     # Get this from the global $config object
     # Note: This function runs in privileged parent, so it needs
     # access to the tree list. Pass it during setup.
-    
+
     for my $tree (@ALLOWED_TREES) {
-        return 1 if $path =~ m{^\Q$tree\E(/|$)};
+        return 1 if $path =~ m{^\Q$tree\E(?:/|\z)};
     }
     
     return 0;
@@ -3789,9 +4043,27 @@ sub new {
 		    die "Second \"$field:\" field \"$path\" for tree \"$current_tree\", line $line. $config_file\nLine: $raw_line";
 		}
 
+		# Exception paths are relative to the tree. An absolute one
+		# would be looked up as "$current_tree//abs/path" and never
+		# match, silently (no existence warning) if its set ignores it.
+		if (substr ($path, 0, 1) eq '/') {
+		    my $relative = _relative_hint ($current_tree, $path);
+		    # The whole tree as an exception-tree is just the tree's own
+		    # set list, so there is no relative form to suggest.
+		    $path = $relative if (defined ($relative) && $relative eq '.' && $field eq 'exception-tree');
+		    if ($path ne '.') {
+			die "The \"$field:\" path \"$path\" for tree \"$current_tree\" must be relative to the tree" .
+			    (defined ($relative) ? " (\"$relative\")" : ", and this one is not in the tree") .
+			    ", line $line. $config_file\nLine: $raw_line";
+		    }
+		}
+
 		# Don't allow ..; . is allowed only for "exception:".
-		if ($path eq '..' || ($path eq '.' && $field eq 'exception-tree')) {
+		if ($path eq '..') {
 		    die "Cannot use \"$path\" in \"$field:\" field for tree \"$current_tree\", line $line. $config_file\nLine: $raw_line";
+		}
+		if ($path eq '.' && $field eq 'exception-tree') {
+		    die "An \"exception-tree:\" for all of tree \"$current_tree\" is the same as the tree's own sets; change its \"tree:\" line instead (\"exception: .\" changes only the tree's root directory), line $line. $config_file\nLine: $raw_line";
 		}
 
 		if ($field eq 'exception-tree') {
@@ -3942,6 +4214,18 @@ sub valid_setlist {
 	$arg_no++;
     }
     return ($uninitialized_arg_no, $set_includes_uninitialized, @return_sets);
+}
+
+# Internal subroutine to give the tree-relative form of an absolute
+# exception path, for the config error message, or undef if the path
+# is not in the tree.
+sub _relative_hint {
+    my ($tree, $path) = @_;
+
+    $path =~ s{/+\z}{} if ($path ne '/');
+    return '.' if ($path eq $tree);
+    return $1 if ($path =~ m{^\Q$tree\E/+(.+)\z});
+    return undef;
 }
 
 # Internal subroutine to convert a set array to a set list.
@@ -4170,8 +4454,10 @@ sub primary_set_for_path {
     # This is special-cased because the root dir and spec dirs can't be
     # trees returned by $config->all_trees, or we'll cause some infinite
     # recursion issues.
-    if (substr ($tree, 0, length ($root_dir)) eq $root_dir) {
-	return ('sigtree');
+    # So is the spec dir, which an absolute -d can put outside the root
+    # dir (without this, path_set_list found no set for it).
+    foreach my $dir ($root_dir, $spec_dir) {
+	return ('sigtree') if (defined ($dir) && $tree =~ m{^\Q$dir\E(?:/|\z)});
     }
 
     $path_set_list = $self->path_set_list ($tree, $path);
@@ -4264,11 +4550,14 @@ sub send_request {
         warn "DEBUG: [CHILD] send_request [PID $$]: total_bytes=$total (4 + " . length($json) . ")\n";
     }
 
+    # A write to a socket whose reader has gone raises SIGPIPE, which
+    # would kill this process silently; make it a write error instead.
+    local $SIG{PIPE} = 'IGNORE';
     while ($written < $total) {
 	my $n = syswrite ($sock, $data, $total - $written, $written);
 	if (!defined $n) {
-	    warn "send_request: syswrite failed: $!\n";
-	    return;
+	    # Without the privileged parent nothing more can be done.
+	    die "send_request: lost connection to privileged parent: $!\n";
 	}
 	$written += $n;
     }
@@ -4333,6 +4622,10 @@ sub send_response {
     my $total = length ($data);
     my $written = 0;
 
+    # A worker that has died must not take the privileged parent (and so
+    # every other worker) with it: make SIGPIPE a write error. Local, so
+    # the commands this process execs keep the default disposition.
+    local $SIG{PIPE} = 'IGNORE';
     while ($written < $total) {
 	my $n = syswrite ($sock, $data, $total - $written, $written);
 	if (!defined $n) {
@@ -4343,8 +4636,20 @@ sub send_response {
     }
 }
 
-# Subroutine to receive a response on the nonprivileged side.
+# Subroutine to receive a response on the nonprivileged side. Dies if no
+# valid response arrives: after a short read, a bad length or bad JSON the
+# stream is out of step, so no later request on it could be trusted, and
+# the callers would otherwise read the undefined response as success.
 sub recv_response {
+    my ($sock) = @_;
+    my $response = _recv_response_raw ($sock);
+    defined ($response) or
+	die "Lost or corrupted connection to privileged parent [PID $$]\n";
+    return $response;
+}
+
+# Read one response; returns undef (after a warning) on any failure.
+sub _recv_response_raw {
     my ($sock) = @_;
     # Max request size: 1MB for large file paths and Base64-encoded data
     my $MAX_REQUEST_LENGTH = 1024 * 1024;
@@ -4501,18 +4806,22 @@ sub request_open {
     }
 
     if ($response->{success}) {
-	# ACK protocol only on Linux.
-	if ($^O eq 'linux') {
-	    warn "DEBUG: Sending ACK for FD transfer\n" if ($main::debug_flag);
-	    # Send ACK to tell parent we're ready to receive FD (needed for Linux).
-	    my $n = syswrite ($sock, 'ACK', 3);
-	    if ($n != 3) {
-		warn "Failed to send ACK: " . ($! || 'short write') . "\n";
-	    }
+	# Now receive file descriptor from privileged parent. The parent
+	# sends it right after the response; bound the wait so that a
+	# parent that never sends it cannot hang this process forever
+	# (this was the only job of the old Linux ACK's timeout). After a
+	# timeout the stream is out of step, so the process dies.
+	my $fd;
+	eval {
+	    local $SIG{ALRM} = sub { die "timeout\n"; };
+	    alarm (30);
+	    $fd = IO::FDPass::recv (fileno ($sock));
+	    alarm (0);
+	};
+	alarm (0);
+	if ($@) {
+	    die "Timed out waiting for file descriptor for $path from privileged parent [PID $$]\n";
 	}
-	
-	# Now receive file descriptor from privileged parent
-	my $fd = IO::FDPass::recv(fileno($sock));
 
 	warn "DEBUG: [PID $$] After recv FD, got fd=$fd for $path\n" if ($main::debug_flag);
 
@@ -4618,7 +4927,10 @@ sub request_immutable_set {
     my $response = recv_response($sock);
     
     if ($response->{error}) {
-        die "Failed to set immutable flag on $path: $response->{error}\n";
+        # The error names the path and whether it was a set or reset.
+        my $error = $response->{error};
+        chomp ($error);
+        die "Immutable flag request refused or failed: $error\n";
     }
     
     return 1;
@@ -4644,14 +4956,14 @@ sub request_delete_file {
 }
 
 sub request_sign_file {
-    my ($sock, $file, $pgp_passphrase, $use_signify, $signify_seckey) = @_;
-    
+    my ($sock, $file, $pgp_passphrase) = @_;
+
+    # The privileged parent signs with its own method and key; the
+    # request carries only the file and the passphrase.
     my $request = {
         type => 'SIGN_FILE',
         path => $file,
         passphrase => $pgp_passphrase,
-        use_signify => $use_signify,
-        signify_seckey => $signify_seckey,
     };
     
     send_request($sock, $request);
@@ -4664,14 +4976,25 @@ sub request_sign_file {
     return 1;
 }
 
+# Dies if the privileged parent could not sign a test file with this
+# passphrase.
+sub request_check_passphrase {
+    my ($sock, $pgp_passphrase) = @_;
+
+    send_request ($sock, { type => 'CHECK_PASSPHRASE',
+			   passphrase => $pgp_passphrase });
+    my $response = recv_response ($sock);
+
+    die $response->{error} if ($response->{error});
+    return 1;
+}
+
 sub request_verify_signature {
-    my ($sock, $file, $use_signify, $signify_pubkey) = @_;
-    
+    my ($sock, $file) = @_;
+
     my $request = {
         type => 'VERIFY_SIGNATURE',
         path => $file,
-        use_signify => $use_signify,
-        signify_pubkey => $signify_pubkey,
     };
     
     send_request($sock, $request);
@@ -5805,14 +6128,14 @@ sub store_spec {
 	    die "Failed to open spec file for writing via privsep: $spec_path\n";
 	}
 	nstore_fd ($self, $fh) or die "Failed to store spec to $spec_path: $!\n";
-	close ($fh);
+	close ($fh) or die "Failed to store spec to $spec_path: $!\n";
     }
     else {
 	# Use main::safe_open_for_write for symlink protection
 	my $fh = main::safe_open_for_write ($spec_path, 1) # 1 = needs lock
 	    or die "Failed to open spec file $spec_path: $!\n";
 	nstore_fd ($self, $fh) or die "Failed to store spec to $spec_path: $!\n";
-	close ($fh);
+	close ($fh) or die "Failed to store spec to $spec_path: $!\n";
     }
 }
 
@@ -5854,9 +6177,13 @@ use Storable qw(fd_retrieve lock_retrieve nstore_fd retrieve);
 sub new {
     my $class = shift;
     my ($self);
-    my ($changed_file) = @_;
+    # $is_temp_file: a worker's own temp changed file, read and written
+    # directly by the worker (never the main changed file). Given by the
+    # caller rather than guessed from the path, so a root dir under /tmp
+    # is not mistaken for one.
+    my ($changed_file, $is_temp_file) = @_;
+    $is_temp_file = $is_temp_file ? 1 : 0;
 
-    my $is_temp_file = ($changed_file =~ m{^/tmp/});
     # Might be a zero-length temp file.
     my $should_read = ((!$main::use_privsep && -e $changed_file && !-z $changed_file) ||
 		       ($main::use_privsep && $is_temp_file && -e $changed_file && !-z $changed_file) ||
@@ -5884,13 +6211,17 @@ sub new {
 	    $self = lock_retrieve ($changed_file);
 	}
 
+	# Could not open or read it (the reason has been reported).
+	return undef unless ($self);
+
 	# Always use the current path, not what's serialized
 	# (handles case where file was moved or path config changed)
-	$self->{CHANGEDFILE} = $changed_file if $self;
+	$self->{CHANGEDFILE} = $changed_file;
     }
     else {
 	$self = _initialize_empty_changedfile ($changed_file);
     }
+    $self->{IS_TEMP} = $is_temp_file;
 
     bless $self, $class;
     return $self;
@@ -6240,7 +6571,7 @@ sub delete_if_empty {
 
     @trees = keys (%{$self->{PATH}});
     if ($#trees < 0) {
-	my $is_temp_file = ($self->{CHANGEDFILE} =~ m{^/tmp/});
+	my $is_temp_file = $self->{IS_TEMP};
 
 	if ($main::use_privsep && !$is_temp_file) {
 	    # Main changed file - needs privileged delete
@@ -6258,7 +6589,7 @@ sub store_changedfile {
     my $self = shift;
     my $class = ref ($self) || $self;
 
-    my $is_temp_file = ($self->{CHANGEDFILE} =~ m{^/tmp/});
+    my $is_temp_file = $self->{IS_TEMP};
 
     if ($main::use_privsep && !$is_temp_file) {
 	# Main changed file - requires privileged write.
@@ -6268,8 +6599,8 @@ sub store_changedfile {
 	unless ($fh) {
 	    die "Failed to open changed file for writing via privsep: $self->{CHANGEDFILE}\n";
 	}
-	nstore_fd ($self, $fh);
-	close ($fh);
+	(nstore_fd ($self, $fh) && close ($fh))
+	    or die "Failed to store changed file $self->{CHANGEDFILE}: $!\n";
     }
     elsif ($is_temp_file) {
 	# Worker temp file - no lock needed (each worker has its own).
@@ -6277,7 +6608,7 @@ sub store_changedfile {
 	    or die "Failed to open temp changed file: $!\n";
 	nstore_fd ($self, $fh)
 	    or die "Failed to store child changed file: $!\n";
-	close ($fh);
+	close ($fh) or die "Failed to store child changed file: $!\n";
     }
     else {
 	# Main changed file - needs lock.
@@ -6285,7 +6616,7 @@ sub store_changedfile {
 	    or die "Failed to open changed file: $!\n";
 	nstore_fd ($self, $fh)
 	    or die "Failed to store changed file: $!\n";
-	close ($fh);
+	close ($fh) or die "Failed to store changed file: $!\n";
     }
 }
 
