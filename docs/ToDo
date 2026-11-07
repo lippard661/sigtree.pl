@@ -1,5 +1,8 @@
 BUGS:
 
+(1.27 fixed) Fix bug introduced in 1.26 that causes no changedfile
+    output if a single file has a read error.
+
 (1.26 fixed) Claude Opus 5.5 review:
     call Signify::sign and Signify::verify with Signify.pm's named
     arguments and require Signify.pm 1.4 (1.3 can report a successful

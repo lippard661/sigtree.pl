@@ -339,6 +339,19 @@
 #    input is an error. The passphrase is overwritten at the end of
 #    initialize and update (the 1 May wipe applied only to an empty
 #    string). require 5.010, which the code already needed.
+# Modified 6 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.27): a read error part way through hashing a file
+#    (Digest::SHA's "Read failed", e.g. ETIMEDOUT for a macOS cloud-backed
+#    file) is now reported with the file's path and the file is treated
+#    like one that cannot be opened; it used to kill the worker, and in 1.26
+#    the whole check then wrote no changed file. When a worker does fail,
+#    check now writes the changed file with this run's results for the
+#    other trees and the previous check's results for the failed tree, and
+#    still exits non-zero. The dev/ino identity check between stat and
+#    open never ran: the two values were passed concatenated ("." for ",").
+#    A privileged stat that fails with ENOTDIR (a directory in the spec has
+#    become a file) is no longer warned about, like ENOENT; the paths are
+#    still reported as deleted.
 
 ### Required packages.
 
@@ -438,7 +451,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.26 of 15 October 2026';
+my $VERSION = 'sigtree 1.27 of 6 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1572,7 +1585,9 @@ sub check_sets {
 	die "Failed to load changed file: $changed_file\n";
     }
 
-    # Clear the current contents of the changed file.
+    # Keep a copy of the previous results, for any tree whose worker
+    # fails below, then clear the current contents of the changed file.
+    my $previous_changedfile = $changedfile->copy;
     $changedfile->reset_changed_file;
 
     print "Checking for extraneous files in specification dir.\n" if ($verbose);
@@ -1665,8 +1680,8 @@ sub check_sets {
 		    unlink ("$child_temp_dir/$child_temp_file");
 		}
 		else {
-		    # Child failed: its tree's results are missing, so the
-		    # changed file is not written (see below).
+		    # Child failed: its tree's results from this run are
+		    # missing, so its previous results are kept (see below).
 		    push (@failed_trees, $ident // "pid $pid");
 		    print "Warning: child for tree " . ($ident // "(unknown)") . " (pid $pid) failed (" .
 			($exit_signal ? "signal $exit_signal" : "exit $exit_code") . ").\n";
@@ -1801,12 +1816,23 @@ sub check_sets {
     }
 
     if (@failed_trees) {
-	# The changed file was reset above, so writing it now would drop
-	# the failed trees' earlier changes along with this run's. Show
-	# what was found but keep the previous changed file.
-	show_change_details ($changedfile, $verbose, 0, $no_macos_app_contents);
+	# Keep each failed tree's results from the previous check, so that
+	# neither they nor the other trees' results from this run are lost.
+	# Only if a failed worker cannot be matched to a tree (it should
+	# always be) is the changed file left as it was.
+	my %known = map { $_ => 1 } @specified_trees;
+	if (grep { !$known{$_} } @failed_trees) {
+	    show_change_details ($changedfile, $verbose, 0, $no_macos_app_contents);
+	    die "Check failed for " . scalar (@failed_trees) . " tree(s): @failed_trees\n" .
+		"The changed file was not updated; it still holds the previous check's results.\n";
+	}
+	foreach my $failed_tree (@failed_trees) {
+	    $changedfile->copy_tree_from ($previous_changedfile, $failed_tree);
+	}
+	show_change_details ($changedfile, $verbose, 1, $no_macos_app_contents);
 	die "Check failed for " . scalar (@failed_trees) . " tree(s): @failed_trees\n" .
-	    "The changed file was not updated; it still holds the previous check's results.\n";
+	    "The changed file holds this check's results for the other trees, and the\n" .
+	    "previous check's results for these.\n";
     }
 
     show_change_details ($changedfile, $verbose, 1, $no_macos_app_contents);
@@ -3345,7 +3371,8 @@ sub handle_stat_request {
     my @stat = lstat($path);
     
     unless (@stat) {
-        return { error => "$! ($path)" };
+	# errno too, so the requester can tell "not there" from a failure.
+        return { error => "$! ($path)", errno => 0 + $! };
     }
     
     return {
@@ -4501,6 +4528,7 @@ package PrivSep;
 
 use strict;
 use warnings;
+use Errno qw( ENOENT ENOTDIR ); # in request_stat
 use MIME::Base64;
 
 # Try to load JSON (with fallback)
@@ -4754,8 +4782,13 @@ sub request_stat {
     my $response = recv_response($sock);
     
     if ($response->{error}) {
-	# Do not warn for expected error for missing files (ENOENT)
-	unless ($response->{error} =~ /No such file or directory/) {
+	# Do not warn for a path that is simply not there: ENOENT, or
+	# ENOTDIR when a directory in the spec has become a file (an app
+	# update turning a .nib bundle into a flat .nib, say), so its
+	# recorded children are reported as deleted without a warning each.
+	my $errno = $response->{errno} // 0;
+	unless ($errno == ENOENT || $errno == ENOTDIR ||
+		(!$errno && $response->{error} =~ /No such file or directory/)) {
 	    warn "Privileged stat failed: $response->{error}\n";
 	}
         return ();
@@ -5189,7 +5222,7 @@ sub new {
 	# Get SHA digest if requested.
 	if ($sha_digest) {
 	    # add dev and ino at end
-	    $self->{SHADIGEST} = _get_sha_digest ($full_path, $sha_digest, $need_priv, $stat[0]. $stat[1]);
+	    $self->{SHADIGEST} = _get_sha_digest ($full_path, $sha_digest, $need_priv, $stat[0], $stat[1]);
 	}
     }
     elsif ($self->{TYPE} eq 'dir') {
@@ -5358,7 +5391,19 @@ sub _get_sha_digest {
 	die "Internal error: ShA version unknown. $sha_version\n";
     }
 
-    $digest->addfile ($fh);
+    # addfile croaks ("Read failed: ...") if a read fails part way -- on
+    # macOS, for instance, a cloud-backed file whose download times out
+    # (ETIMEDOUT). That is a problem with one file, so report it and carry
+    # on, as for a file that cannot be opened, rather than let it kill the
+    # worker and with it the whole tree's results.
+    unless (eval { $digest->addfile ($fh); 1 }) {
+	my $err = $@;
+	close $fh;
+	$err =~ s/ at \S+ line \d+\.?\n?\z//;
+	chomp ($err);
+	warn "$err ($full_path)\n";
+	return undef;
+    }
     close $fh;
 
     return $digest->hexdigest;
@@ -6310,6 +6355,53 @@ sub add_time {
 
     push (@{${$self->{TIME}}{$tree}}, time());
     push (@{${$self->{USER}}{$tree}}, $USERNAME);
+}
+
+# Method to return an independent copy of this changed file (so check
+# can keep a tree's previous results after resetting the original).
+sub copy {
+    my $self = shift;
+
+    return Storable::dclone ($self);
+}
+
+# Method to copy one tree's records from another changed file: its
+# changed paths and the per-set lists and counts for paths in it. Used by
+# check to keep a tree's previous results when its worker failed. Check
+# times and users are not reset by reset_changed_file, so they are
+# already present.
+sub copy_tree_from {
+    my $self = shift;
+    my $class = ref ($self) || $self;
+    my ($other, $tree) = @_;
+    my $in_tree = qr{^\Q$tree\E(?:/|\z)};
+
+    return unless (${$other->{PATH}}{$tree});
+
+    foreach my $kind (['ADDITIONS', 'SET_TO_PATH_ADD'],
+		      ['DELETIONS', 'SET_TO_PATH_DEL']) {
+	my ($counts, $lists) = @{$kind};
+	foreach my $set (keys (%{$other->{$lists} || {}})) {
+	    my @paths = grep { /$in_tree/ } @{${$other->{$lists}}{$set}};
+	    next unless (@paths);
+	    push (@{${$self->{$lists}}{$set}}, @paths);
+	    ${$self->{$counts}}{$set} += @paths;
+	    ${$self->{$counts}}{'_total_'} += @paths;
+	}
+    }
+    # Changed paths and their changed attributes are parallel lists.
+    foreach my $set (keys (%{$other->{SET_TO_PATH_CHANGE} || {}})) {
+	my $paths = ${$other->{SET_TO_PATH_CHANGE}}{$set};
+	my $attrs = ${$other->{SET_TO_PATH_CH_ATTR}}{$set} || [];
+	foreach my $i (0 .. $#{$paths}) {
+	    next unless ($paths->[$i] =~ $in_tree);
+	    push (@{${$self->{SET_TO_PATH_CHANGE}}{$set}}, $paths->[$i]);
+	    push (@{${$self->{SET_TO_PATH_CH_ATTR}}{$set}}, $attrs->[$i] // '');
+	    ${$self->{CHANGES}}{$set}++;
+	    ${$self->{CHANGES}}{'_total_'}++;
+	}
+    }
+    ${$self->{PATH}}{$tree} = [ @{${$other->{PATH}}{$tree}} ];
 }
 
 # Method to merge a changed file with the main changed file.

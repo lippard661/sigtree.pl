@@ -1,3 +1,5 @@
+6 November 2026 1.27: Bug fix of bug introduced in previous version where
+    a failed read on one file yields no output from an entire check run.
 15 October 2026 1.26: Bug fixes and improvements after Claude Opus 5.5 review:
     call Signify::sign and Signify::verify with Signify.pm's named
     arguments and require Signify.pm 1.4 (1.3 can report a successful
