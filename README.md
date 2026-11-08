@@ -109,6 +109,7 @@ check_specs       Check the spec-of-specs for changes
 check_file <f>    Check a single file against its spec
 update            Update specs to reflect changes found by check
 changes           Show pending changes from last check before update
+verify_hosts      On a central server, check copies of other hosts' databases
 ```
 
 On initialize and update, the sigtree spec-of-specs is written and signed
@@ -333,7 +334,7 @@ single-user mode when the web server is not running. A path has either an
 `exception` line, shared by both kinds of specs, or per-mode lines, not
 both. Lines for the other kind of specs are still checked for errors, but
 a missing path is only warned about for the kind being run. (Added in
-sigtree 1.29.)
+sigtree 1.28.)
 
 Trees may not overlap; no tree may be a subtree of another tree in the config.
 Symbolic links are never followed to avoid loops.
@@ -364,6 +365,39 @@ host=`/bin/hostname -s`
 ```
 
 Add `-v` for verbose output showing old and new values of changed attributes.
+
+## Checking Hosts from a Central Server
+
+If each host's `/var/db/sigtree` is copied to a central server (and backed
+up there with rsnapshot), `sigtree verify_hosts` on that server checks the
+copies with its own config file (`/etc/sigtree.hosts.conf`, or `-c`; see
+`sigtree.hosts.conf.sample`). Added in sigtree 1.29. For each host it
+reports:
+
+- how long ago the host's primary changed file was written (its mtime is
+  the time of the host's last check that found changes), or that there is
+  none (normal the day after an update);
+- spec files that changed between the previous and current snapshots, and
+  any changed spec that is byte for byte a copy from an older snapshot: a
+  validly signed old spec put back, which no signature check can catch;
+- for a host whose signify public key is pinned in the config, any spec or
+  spec-of-specs whose signature does not verify;
+- among hosts marked as peers (same OS release), files under the
+  configured common paths that differ from what most peers have, that one
+  host lacks, or that only one host has.
+
+It prints nothing when there is nothing to report, so it can run from
+`/etc/daily.local` on the central server:
+```sh
+/usr/bin/perl /usr/local/bin/sigtree.pl verify_hosts
+```
+
+A host's spec is loaded only after its signature has verified, and then
+only in a process running as `_sigtree`: specs are written by the hosts,
+which might be compromised. Nothing else a host wrote is loaded; the
+changed file is judged by its mtime and the snapshots by size and hash.
+Hosts that sign with GPG get the changed-file and snapshot checks but not
+the signature checks or the comparison.
 
 ## Security Notes
 

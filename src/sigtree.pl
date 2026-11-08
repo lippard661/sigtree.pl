@@ -381,6 +381,18 @@
 #    reading flags on ..." for each (the flags recorded were right: such
 #    a path was then read through the privileged parent). The batch now
 #    leaves those paths to the privileged parent, as 1.27 did.
+# Modified 8 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.29): new verify_hosts command, for a server that
+#    collects other hosts' sigtree databases. With its own config file
+#    (default /etc/sigtree.hosts.conf), it reports for each host: the age
+#    of its primary changed file, or that it has none; spec files changed
+#    between the previous and current rsnapshot snapshots, and any that
+#    match an older snapshot instead (an old signed spec put back); bad
+#    or missing signify signatures, checked with a public key pinned in
+#    the config; and, among hosts marked as peers, files under common
+#    paths that differ from what most peers have, are missing, or exist on
+#    one host only. A spec is loaded only after its signature verifies,
+#    in a child running as _sigtree. Prints nothing when all is well.
 
 ### Required packages.
 
@@ -480,7 +492,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.28a of 8 November 2026';
+my $VERSION = 'sigtree 1.29 of 8 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -491,6 +503,7 @@ my $GPG_COMMAND = '/usr/local/bin/gpg';
 my $GPG_NOAGENT = '/usr/local/bin/gpg-noagent'; # Wrapper for batch-mode GPG (privsep, no tty in privileged process)
 my $SIGTREE_SIGNIFY_PUBKEY = '/etc/signify/sigtree.pub';
 my $SIGTREE_SIGNIFY_SECKEY = '/etc/signify/sigtree.sec';
+my $VERIFY_HOSTS_CONFIG = 'sigtree.hosts.conf'; # in $SYSCONF_DIR, for verify_hosts
 
 my $MAX_CHILD_PROCS = 5;
 my $DEFAULT_CHILD_PROCS = 4;
@@ -702,6 +715,8 @@ if ($opts{'h'}) {
     print "   (The file name is specified on the command line after \"check_file\".)\n";
     print "check_specs: Check specification for the specification dir.\n";
     print "update: Update specifications with changes found by check.\n";
+    print "verify_hosts: Check copies of other hosts' sigtree databases (on a central server).\n";
+    print "   (-c names its own config file, default $SYSCONF_DIR/$VERIFY_HOSTS_CONFIG.)\n";
     exit;
 }
 
@@ -728,9 +743,22 @@ elsif ($command eq 'changes' ||
        $command eq 'update') {
     die "The -f option cannot be used with $command.\n" if ($opts{'f'});
 }
+elsif ($command eq 'verify_hosts') {
+    # Its own config (-c), and none of the per-host options.
+    foreach my $opt ('r', 's', 'd', 'f', 'm', 'p') {
+	die "The -$opt option cannot be used with verify_hosts.\n" if ($opts{$opt});
+    }
+}
 elsif ($command ne 'initialize' &&
        $command ne 'check') {
     die "Unknown command \"$command\".\n"
+}
+
+# verify_hosts reads other hosts' copied databases, not this host's
+# sigtree config, so it runs before that config is read.
+if ($command eq 'verify_hosts') {
+    my $hosts_config = $opts{'c'} ? $config_file : $SYSCONF_DIR . '/' . $VERIFY_HOSTS_CONFIG;
+    exit (VerifyHosts::run ($hosts_config, $verbose, $OSNAME));
 }
 
 $config = new Config ($config_file);
@@ -6946,3 +6974,660 @@ sub store_changedfile {
 1;
 
 ### End ChangedFile package.
+
+### VerifyHosts package.
+
+# The verify_hosts command, run on a server that collects other hosts'
+# sigtree databases (rsynced copies under a spec root, and rsnapshot
+# snapshots of each host's /var). It reports, for each host in its own
+# config file:
+#   - the age of the host's primary changed file (its mtime is the time
+#     of the host's last check that found changes), or that there is none;
+#   - spec files changed between the previous and current snapshots, and
+#     any whose contents match an older snapshot instead of the previous
+#     one (a validly signed old spec put back);
+#   - for hosts with a signify key pinned in the config, any spec or
+#     spec-of-specs whose signature does not verify;
+#   - for hosts marked as peers, files under the configured common paths
+#     that differ from what most peers have, are missing, or exist on one
+#     host only.
+# Specs are Storable files written by the hosts, so a spec is loaded only
+# after its signature has verified, and only in a child process that has
+# dropped to _sigtree. Nothing else a host wrote is deserialized: the
+# changed file is judged by its mtime and the snapshots by size and hash.
+# It prints nothing when there is nothing to report.
+package VerifyHosts;
+
+use strict;
+use warnings;
+use Digest::SHA;
+use Fcntl qw( :DEFAULT O_NOFOLLOW :mode );
+use POSIX ();
+use Storable qw( fd_retrieve );
+
+use constant DEFAULT_MAX_AGE => 36;          # hours
+use constant DEFAULT_ATTRIBUTES => 'type,shadigest,mode,uid,gid,link';
+use constant DEFAULT_SNAPSHOT_SUBDIR => 'var/db/sigtree';
+use constant DEFAULT_CURRENT => 'daily.0';
+use constant DEFAULT_PREVIOUS => 'daily.1';
+use constant LIST_LIMIT => 25;               # lines per host per category
+
+# Spec attribute names that can be compared, and the FileAttr field each
+# one is stored in.
+our %ATTR_FIELD;
+
+sub _attr_fields {
+    %ATTR_FIELD = (type => 'TYPE', shadigest => 'SHADIGEST', mode => 'MODE',
+		   uid => 'UID', gid => 'GID', link => 'LINK', size => 'SIZE',
+		   flags => 'FLAGS', nlink => 'NLINK') unless (%ATTR_FIELD);
+}
+
+# Entry point. Returns the exit status: 0 if nothing was reported, 1 if
+# anything was.
+sub run {
+    my ($config_file, $verbose, $osname) = @_;
+    my (@out, $reported);
+
+    _attr_fields ();
+    my $cf = _parse_config ($config_file);
+
+    main::require_module ('Signify') or
+	die "Could not require Signify. $@\n";
+    eval { Signify->VERSION ('1.4'); 1 } or
+	die "Signify.pm " . (Signify->VERSION // 'without a version') .
+	    " is too old, 1.4 or later is required.\n";
+
+    # Specs are only ever loaded as _sigtree.
+    my ($uid, $gid) = ((getpwnam ('_sigtree'))[2], (getgrnam ('_sigtree'))[2]);
+    if (grep { $_->{PEER} } @{$cf->{HOSTS}}) {
+	die "verify_hosts needs the _sigtree user and group to compare hosts.\n"
+	    unless (defined ($uid) && defined ($gid));
+	die "verify_hosts must be run as root to compare hosts.\n" if ($> != 0);
+    }
+
+    if ($osname eq 'openbsd') {
+	main::pledge ('rpath', 'wpath', 'cpath', 'proc', 'exec', 'id', 'unveil') ||
+	    die "Cannot pledge promises. $!\n";
+	main::unveil ($cf->{SPEC_ROOT}, 'r');
+	main::unveil ($cf->{SNAPSHOT_ROOT}, 'r') if (defined ($cf->{SNAPSHOT_ROOT}));
+	foreach my $host (@{$cf->{HOSTS}}) {
+	    main::unveil ($host->{KEY_COPY}, 'r') if (defined ($host->{KEY_COPY}));
+	}
+	{ no warnings 'once'; main::unveil ($Signify::SIGNIFY_PATH, 'rx'); }
+	main::unveil ('/tmp', 'rwc');
+	main::unveil ();
+    }
+
+    my $temp_dir = main::mkdtemp ('/tmp/sigtree.XXXXXXXX') or
+	die "Could not create a temp dir: $!\n";
+    my %verified;  # host => [ [name, data], ... ] for peers whose specs all verified
+    my %hash_cache;
+    my $ok = eval {
+	my $snapshots = _list_snapshots ($cf);
+	foreach my $host (@{$cf->{HOSTS}}) {
+	    my @lines;
+	    push (@lines, _check_changed_file ($cf, $host));
+	    push (@lines, _check_snapshots ($cf, $host, $snapshots, \%hash_cache))
+		if (defined ($cf->{SNAPSHOT_ROOT}));
+	    if (defined ($host->{KEY})) {
+		my ($sig_lines, $specs, $all_good) = _check_signatures ($cf, $host, $temp_dir);
+		push (@lines, @{$sig_lines});
+		if ($host->{PEER}) {
+		    if ($all_good) {
+			$verified{$host->{NAME}} = $specs;
+		    }
+		    else {
+			push (@lines, "not compared with peers: not every spec has a good signature");
+		    }
+		}
+	    }
+	    elsif ($host->{PEER}) {
+		push (@lines, "not compared with peers: no signify key in the config");
+	    }
+	    if (@lines) {
+		push (@out, "$host->{NAME}:", map { "   $_" } @lines);
+		$reported = 1;
+	    }
+	    elsif ($verbose) {
+		push (@out, "$host->{NAME}: OK");
+	    }
+	}
+	my @peer_lines = _compare_peers ($cf, \%verified, $uid, $gid, $osname);
+	if (@peer_lines) {
+	    push (@out, "Comparison of peers (" . join (', ', sort keys %verified) . "):",
+		  map { "   $_" } @peer_lines);
+	    $reported = 1;
+	}
+	elsif ($verbose && keys (%verified) >= 2) {
+	    push (@out, "Comparison of peers (" . join (', ', sort keys %verified) . "): OK");
+	}
+	1;
+    };
+    my $error = $@;
+    _remove_dir ($temp_dir);
+    die $error unless ($ok);
+
+    print "$_\n" foreach (@out);
+    return ($reported ? 1 : 0);
+}
+
+# Parse the verify_hosts config. "field: value" lines, # comments. Host
+# settings (key, key-copy, peer) follow their "host:" line.
+sub _parse_config {
+    my ($config_file) = @_;
+    my (%cf, $current, $line_no);
+
+    open (my $fh, '<', $config_file) ||
+	die "Cannot open config file. $!. $config_file\n";
+    my @stat = stat ($fh);
+    die "Cannot stat config file. $!. $config_file\n" unless (@stat);
+    die "Config file $config_file must not be group or world writable.\n"
+	if ($stat[2] & 0022);
+    die "Config file $config_file is not owned by root (uid=$stat[4]).\n"
+	if ($stat[4] != 0 && $stat[4] != $>);
+
+    $cf{HOSTS} = [];
+    $cf{COMMON} = [];
+    $cf{EXCEPT} = [];
+    my %seen;
+    while (my $raw = <$fh>) {
+	$line_no++;
+	my $l = $raw;
+	$l =~ s/^\s+//;
+	$l =~ s/\s+\z//;
+	next if ($l eq '' || $l =~ /^#/);
+	my ($field, $value) = ($l =~ /^([a-z-]+):\s*(.*)\z/);
+	die "Unparseable line $line_no. $config_file\nLine: $raw" unless (defined ($field));
+	die "No value for \"$field:\", line $line_no. $config_file\nLine: $raw" if ($value eq '');
+	if ($field =~ /^(spec-root|snapshot-root)\z/) {
+	    die "\"$field:\" must be an absolute path, line $line_no. $config_file\nLine: $raw"
+		unless ($value =~ m{^/} && $value !~ m{(?:^|/)\.\.(?:/|\z)});
+	    my $key = ($field eq 'spec-root') ? 'SPEC_ROOT' : 'SNAPSHOT_ROOT';
+	    die "Second \"$field:\", line $line_no. $config_file\nLine: $raw" if (defined ($cf{$key}));
+	    $cf{$key} = $value;
+	}
+	elsif ($field eq 'snapshot-subdir') {
+	    die "\"snapshot-subdir:\" must be a relative path without \"..\", line $line_no. $config_file\nLine: $raw"
+		if ($value =~ m{^/} || $value =~ m{(?:^|/)\.\.(?:/|\z)});
+	    $cf{SNAPSHOT_SUBDIR} = $value;
+	}
+	elsif ($field =~ /^(current|previous)-snapshot\z/) {
+	    my $which = uc ($1);    # before the match below resets $1
+	    die "Invalid \"$field:\" (expected a name like daily.0), line $line_no. $config_file\nLine: $raw"
+		unless ($value =~ /^[\w-]+\.\d+\z/);
+	    $cf{$which} = $value;
+	}
+	elsif ($field eq 'max-age') {
+	    die "\"max-age:\" must be a number of hours, line $line_no. $config_file\nLine: $raw"
+		unless ($value =~ /^\d+\z/ && $value > 0);
+	    $cf{MAX_AGE} = $value;
+	}
+	elsif ($field eq 'attributes') {
+	    my @attrs = split (/\s*,\s*/, $value);
+	    foreach my $attr (@attrs) {
+		die "Unknown attribute \"$attr\" in \"attributes:\", line $line_no. $config_file\nLine: $raw"
+		    unless ($ATTR_FIELD{$attr});
+	    }
+	    $cf{ATTRIBUTES} = \@attrs;
+	}
+	elsif ($field eq 'common' || $field eq 'except') {
+	    foreach my $path (split (/\s+/, $value)) {
+		die "\"$field:\" paths must be absolute, line $line_no. $config_file\nLine: $raw"
+		    unless ($path =~ m{^/});
+		$path =~ s{/+\z}{} unless ($path eq '/');
+		push (@{$cf{uc ($field)}}, [$path, _glob_to_regex ($path)]);
+	    }
+	}
+	elsif ($field eq 'host') {
+	    die "Invalid host name \"$value\", line $line_no. $config_file\nLine: $raw"
+		unless ($value =~ /^[\w][\w.-]*\z/);
+	    die "Second \"host: $value\", line $line_no. $config_file\nLine: $raw" if ($seen{$value}++);
+	    $current = { NAME => $value, PEER => 0 };
+	    push (@{$cf{HOSTS}}, $current);
+	}
+	elsif ($field eq 'key' || $field eq 'key-copy' || $field eq 'peer') {
+	    die "\"$field:\" before any \"host:\", line $line_no. $config_file\nLine: $raw"
+		unless (defined ($current));
+	    if ($field eq 'key') {
+		die "Second \"key:\" for host $current->{NAME}, line $line_no. $config_file\nLine: $raw"
+		    if (defined ($current->{KEY}));
+		die "\"key:\" must be the base64 line of a signify public key, line $line_no. $config_file\nLine: $raw"
+		    unless ($value =~ m{^[A-Za-z0-9+/]{40,}={0,2}\z});
+		$current->{KEY} = $value;
+	    }
+	    elsif ($field eq 'key-copy') {
+		die "\"key-copy:\" must be an absolute path, line $line_no. $config_file\nLine: $raw"
+		    unless ($value =~ m{^/});
+		$current->{KEY_COPY} = $value;
+	    }
+	    else {
+		die "\"peer:\" must be yes or no, line $line_no. $config_file\nLine: $raw"
+		    unless ($value eq 'yes' || $value eq 'no');
+		$current->{PEER} = ($value eq 'yes');
+	    }
+	}
+	else {
+	    die "Invalid field \"$field\", line $line_no. $config_file\nLine: $raw";
+	}
+    }
+    close ($fh);
+
+    die "No \"spec-root:\" in $config_file\n" unless (defined ($cf{SPEC_ROOT}));
+    die "No \"host:\" in $config_file\n" unless (@{$cf{HOSTS}});
+    foreach my $host (@{$cf{HOSTS}}) {
+	die "Host $host->{NAME} has \"key-copy:\" but no \"key:\". $config_file\n"
+	    if (defined ($host->{KEY_COPY}) && !defined ($host->{KEY}));
+    }
+    $cf{MAX_AGE} //= DEFAULT_MAX_AGE;
+    $cf{ATTRIBUTES} //= [split (/,/, DEFAULT_ATTRIBUTES)];
+    $cf{SNAPSHOT_SUBDIR} //= DEFAULT_SNAPSHOT_SUBDIR;
+    $cf{CURRENT} //= DEFAULT_CURRENT;
+    $cf{PREVIOUS} //= DEFAULT_PREVIOUS;
+    if ((grep { $_->{PEER} } @{$cf{HOSTS}}) && !@{$cf{COMMON}}) {
+	die "Peers are marked but there is no \"common:\" path. $config_file\n";
+    }
+    return \%cf;
+}
+
+# A common/except path: * and ? match within one path component; the
+# pattern matches the path itself or anything beneath it.
+sub _glob_to_regex {
+    my ($glob) = @_;
+    my $re = join ('', map { $_ eq '*' ? '[^/]*' : $_ eq '?' ? '[^/]' : quotemeta ($_) }
+		   split (/([*?])/, $glob));
+    return ($glob eq '/') ? qr{^/} : qr{^$re(?:/|\z)};
+}
+
+sub _when {
+    my ($time) = @_;
+    return POSIX::strftime ('%Y-%m-%d %H:%M', localtime ($time));
+}
+
+# 1. The changed file: missing, or older than max-age.
+sub _check_changed_file {
+    my ($cf, $host) = @_;
+    my $path = "$cf->{SPEC_ROOT}/specs/$host->{NAME}.changed";
+    my @stat = lstat ($path);
+
+    if (!@stat) {
+	return ("no changed file ($path): no record of a recent check (normal on the day after an update)");
+    }
+    my $age = (time () - $stat[9]) / 3600;
+    if ($age > $cf->{MAX_AGE}) {
+	return (sprintf ("changed file last written %s, %.0f hours ago (max-age %d)",
+			 _when ($stat[9]), $age, $cf->{MAX_AGE}));
+    }
+    return ();
+}
+
+# Snapshot directories under the snapshot root, with their times (the
+# directories' mtimes), newest first.
+sub _list_snapshots {
+    my ($cf) = @_;
+    my @snapshots;
+
+    return [] unless (defined ($cf->{SNAPSHOT_ROOT}));
+    opendir (my $dh, $cf->{SNAPSHOT_ROOT}) ||
+	die "Cannot read snapshot root $cf->{SNAPSHOT_ROOT}: $!\n";
+    foreach my $name (readdir ($dh)) {
+	next unless ($name =~ /^[\w-]+\.\d+\z/);
+	my @stat = stat ("$cf->{SNAPSHOT_ROOT}/$name");
+	next unless (@stat && S_ISDIR ($stat[2]));
+	push (@snapshots, { NAME => $name, TIME => $stat[9] });
+    }
+    closedir ($dh);
+    return [ sort { $b->{TIME} <=> $a->{TIME} } @snapshots ];
+}
+
+# The spec files of a host in one copy of its sigtree directory: the
+# spec-of-specs and each tree spec, by name (signatures and changed files
+# are not specs). Returns name => [path, size, dev, ino].
+sub _spec_files {
+    my ($sigtree_dir, $host) = @_;
+    my %files;
+    my $specs = "$sigtree_dir/specs";
+
+    my @stat = lstat ("$specs/$host.spec");
+    $files{"$host.spec"} = ["$specs/$host.spec", @stat[7, 0, 1]] if (@stat && S_ISREG ($stat[2]));
+    if (opendir (my $dh, "$specs/$host")) {
+	foreach my $name (readdir ($dh)) {
+	    next if ($name eq '.' || $name eq '..' || $name =~ /\.sig\z/);
+	    my $path = "$specs/$host/$name";
+	    @stat = lstat ($path);
+	    next unless (@stat && S_ISREG ($stat[2]));
+	    $files{"$host/$name"} = [$path, @stat[7, 0, 1]];
+	}
+	closedir ($dh);
+    }
+    return \%files;
+}
+
+# SHA-256 of a file, cached by device and inode: rsnapshot hard-links a
+# file that has not changed, so each version is read once.
+sub _file_hash {
+    my ($file, $cache) = @_;
+    my ($path, $size, $dev, $ino) = @{$file};
+    my $key = "$dev:$ino";
+
+    return $cache->{$key} if (exists ($cache->{$key}));
+    my $digest;
+    if (sysopen (my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {
+	binmode ($fh);
+	my $sha = Digest::SHA->new (256);
+	eval { $sha->addfile ($fh); $digest = $sha->hexdigest; 1 } or
+	    warn "Could not read $path: $@";
+	close ($fh);
+    }
+    else {
+	warn "Could not open $path: $!\n";
+    }
+    $cache->{$key} = $digest;
+    return $digest;
+}
+
+sub _same_file {
+    my ($x, $y, $cache) = @_;
+    return 0 unless ($x->[1] == $y->[1]);                       # size
+    return 1 if ($x->[2] == $y->[2] && $x->[3] == $y->[3]);    # same inode
+    my ($ha, $hb) = (_file_hash ($x, $cache), _file_hash ($y, $cache));
+    return (defined ($ha) && defined ($hb) && $ha eq $hb);
+}
+
+# 2 and 3. Spec files changed between the previous and current snapshots,
+# and changed ones that match an older snapshot instead.
+sub _check_snapshots {
+    my ($cf, $host, $snapshots, $cache) = @_;
+    my (@lines, %snap);
+
+    %snap = map { $_->{NAME} => $_ } @{$snapshots};
+    my $cur = $snap{$cf->{CURRENT}};
+    my $prev = $snap{$cf->{PREVIOUS}};
+    unless ($cur && $prev) {
+	return ("snapshot $cf->{CURRENT} or $cf->{PREVIOUS} not found under $cf->{SNAPSHOT_ROOT}");
+    }
+    my $dir = sub { "$cf->{SNAPSHOT_ROOT}/$_[0]{NAME}/$host->{NAME}/$cf->{SNAPSHOT_SUBDIR}" };
+    my $cur_dir = $dir->($cur);
+    unless (-d "$cur_dir/specs") {
+	return ("no sigtree specs in snapshot $cur->{NAME} ($cur_dir/specs)");
+    }
+    my $cur_files = _spec_files ($cur_dir, $host->{NAME});
+    my $prev_files = _spec_files ($dir->($prev), $host->{NAME});
+    my @older = grep { $_->{TIME} < $prev->{TIME} } @{$snapshots};
+    my %older_files;
+
+    my (@changed, @added, @removed, @rolled_back);
+    foreach my $name (sort keys %{$cur_files}) {
+	if (!$prev_files->{$name}) {
+	    push (@added, $name);
+	    next;
+	}
+	next if (_same_file ($cur_files->{$name}, $prev_files->{$name}, $cache));
+	push (@changed, $name);
+	# A changed spec that is byte for byte an older one has been put
+	# back: specs record mtimes and ctimes, so an update cannot
+	# legitimately recreate an earlier copy.
+	foreach my $old (@older) {
+	    $older_files{$old->{NAME}} //= _spec_files ($dir->($old), $host->{NAME});
+	    my $file = $older_files{$old->{NAME}}{$name} or next;
+	    if (_same_file ($cur_files->{$name}, $file, $cache)) {
+		push (@rolled_back, "$name in $cur->{NAME} is identical to the copy in $old->{NAME} (" .
+		      _when ($old->{TIME}) . "), not to $prev->{NAME}'s: an older spec has been put back");
+		last;
+	    }
+	}
+    }
+    @removed = grep { !$cur_files->{$_} } sort keys %{$prev_files};
+
+    my $span = "between $prev->{NAME} (" . _when ($prev->{TIME}) . ") and $cur->{NAME} (" .
+	_when ($cur->{TIME}) . ")";
+    push (@lines, _limited ("spec changed $span", \@changed)) if (@changed);
+    push (@lines, _limited ("spec added $span", \@added)) if (@added);
+    push (@lines, _limited ("spec removed $span", \@removed)) if (@removed);
+    push (@lines, @rolled_back);
+    return @lines;
+}
+
+# "label: a, b, c" with at most LIST_LIMIT names.
+sub _limited {
+    my ($label, $names) = @_;
+    my @shown = @{$names}[0 .. ($#{$names} < LIST_LIMIT - 1 ? $#{$names} : LIST_LIMIT - 1)];
+    my $more = @{$names} - @shown;
+    return ("$label: " . join (', ', @shown) . ($more ? ", and $more more" : ''));
+}
+
+# 4. Signatures on the spec-of-specs and every tree spec in the spec
+# root's copy, with the key pinned in the config. Each spec and its
+# signature are copied into the private temp dir and the copy verified,
+# so what is verified is what is later loaded. Returns the problem lines,
+# the verified tree specs as [name, data], and whether every spec and the
+# spec-of-specs verified.
+sub _check_signatures {
+    my ($cf, $host, $temp_dir) = @_;
+    my (@lines, @specs);
+    my $name = $host->{NAME};
+    my $all_good = 1;
+
+    my $key_file = "$temp_dir/$name.pub";
+    sysopen (my $kfh, $key_file, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) ||
+	die "Could not create $key_file: $!\n";
+    print $kfh "untrusted comment: sigtree verify_hosts key for $name\n$host->{KEY}\n";
+    close ($kfh) || die "Could not write $key_file: $!\n";
+
+    if (defined ($host->{KEY_COPY})) {
+	if (open (my $cfh, '<', $host->{KEY_COPY})) {
+	    my @key_lines = <$cfh>;
+	    close ($cfh);
+	    my $copy = $key_lines[1] // '';
+	    chomp ($copy);
+	    push (@lines, "key-copy $host->{KEY_COPY} does not match the key in the config")
+		if ($copy ne $host->{KEY});
+	}
+	else {
+	    push (@lines, "cannot read key-copy $host->{KEY_COPY}: $!");
+	}
+    }
+
+    my $files = _spec_files ($cf->{SPEC_ROOT}, $name);
+    unless ($files->{"$name.spec"}) {
+	push (@lines, "no spec-of-specs $cf->{SPEC_ROOT}/specs/$name.spec");
+	$all_good = 0;
+    }
+    my $n = 0;
+    foreach my $spec (sort keys %{$files}) {
+	my $path = $files->{$spec}[0];
+	my $copy = "$temp_dir/" . ++$n;
+	my $data = _copy_file ($path, $copy);
+	my $sig = _copy_file ("$path.sig", "$copy.sig");
+	if (!defined ($data)) {
+	    push (@lines, "cannot read $path");
+	    $all_good = 0;
+	    next;
+	}
+	if (!defined ($sig)) {
+	    push (@lines, "no signature for $path");
+	    $all_good = 0;
+	    unlink ($copy);
+	    next;
+	}
+	if (Signify::verify ($copy, { public_key_path => $key_file,
+				      skip_signify_check => 1 })) {
+	    push (@specs, [$spec, $data]) unless ($spec eq "$name.spec");
+	}
+	else {
+	    my @errors = Signify::signify_error ();
+	    my $reason = $errors[0] // 'unknown error';
+	    chomp ($reason);
+	    push (@lines, "BAD SIGNATURE on $path ($reason)");
+	    $all_good = 0;
+	}
+	unlink ($copy, "$copy.sig");
+    }
+    return (\@lines, \@specs, $all_good);
+}
+
+# Copy a regular file (not through a symlink) and return its contents,
+# or undef if it cannot be read.
+sub _copy_file {
+    my ($from, $to) = @_;
+    my $data;
+
+    sysopen (my $in, $from, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) || return undef;
+    my @stat = stat ($in);
+    unless (@stat && S_ISREG ($stat[2])) {
+	close ($in);
+	return undef;
+    }
+    binmode ($in);
+    local $/;
+    $data = <$in>;
+    close ($in);
+    return undef unless (defined ($data));
+    sysopen (my $out, $to, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) ||
+	die "Could not create $to: $!\n";
+    binmode ($out);
+    print $out $data;
+    close ($out) || die "Could not write $to: $!\n";
+    return $data;
+}
+
+# 5. Compare the peers' verified specs. The specs are loaded in a child
+# that has dropped to _sigtree (and on OpenBSD pledged only stdio), and
+# its report comes back through a pipe.
+sub _compare_peers {
+    my ($cf, $verified, $uid, $gid, $osname) = @_;
+
+    return () if (keys (%{$verified}) < 2);
+    pipe (my $reader, my $writer) || die "pipe failed: $!\n";
+    my $pid = fork ();
+    die "fork failed: $!\n" unless (defined ($pid));
+    if ($pid == 0) {
+	close ($reader);
+	my $text = eval {
+	    POSIX::setgid ($gid) || die "setgid: $!\n";
+	    $) = "$gid $gid";
+	    POSIX::setuid ($uid) || die "setuid: $!\n";
+	    die "could not drop privileges\n" if ($< != $uid || $> != $uid || $( != $gid);
+	    if ($osname eq 'openbsd') {
+		main::pledge () || die "pledge: $!\n";
+	    }
+	    join ('', map { "$_\n" } _compare_specs ($cf, $verified));
+	};
+	$text = "ERROR: comparison failed: $@" unless (defined ($text));
+	while (length ($text)) {
+	    my $written = syswrite ($writer, $text);
+	    last unless ($written);
+	    substr ($text, 0, $written) = '';
+	}
+	POSIX::_exit (0);
+    }
+    close ($writer);
+    my @lines = <$reader>;
+    close ($reader);
+    waitpid ($pid, 0);
+    my $status = $?;
+    chomp (@lines);
+    push (@lines, "ERROR: comparison process ended with status $status") if ($status != 0);
+    return @lines;
+}
+
+sub _in_scope {
+    my ($cf, $path) = @_;
+    return 0 unless (grep { $path =~ $_->[1] } @{$cf->{COMMON}});
+    return 0 if (grep { $path =~ $_->[1] } @{$cf->{EXCEPT}});
+    return 1;
+}
+
+sub _compare_specs {
+    my ($cf, $verified) = @_;
+    my (%entries, %trees, @lines);
+    my @attrs = @{$cf->{ATTRIBUTES}};
+
+    foreach my $host (sort keys %{$verified}) {
+	foreach my $spec (@{$verified->{$host}}) {
+	    my ($name, $data) = @{$spec};
+	    open (my $mem, '<', \$data) || die "Cannot read spec $name from memory\n";
+	    my $obj = eval { fd_retrieve ($mem) };
+	    close ($mem);
+	    if (!ref ($obj) || !defined ($obj->{TREE}) || ref ($obj->{FILEATTR}) ne 'HASH') {
+		push (@lines, "$host: cannot load spec $name");
+		next;
+	    }
+	    my $tree = $obj->{TREE};
+	    push (@{$trees{$host}}, $tree);
+	    foreach my $key (keys %{$obj->{FILEATTR}}) {
+		my $full = ($key eq $tree) ? $tree : ($tree eq '/' ? "/$key" : "$tree/$key");
+		next unless (_in_scope ($cf, $full));
+		my $fa = $obj->{FILEATTR}{$key};
+		next unless (ref ($fa));
+		$entries{$full}{$host} = [ map { $fa->{$ATTR_FIELD{$_}} } @attrs ];
+	    }
+	}
+    }
+
+    my $covers = sub {
+	my ($host, $path) = @_;
+	return scalar (grep { $_ eq '/' || $path eq $_ || index ($path, "$_/") == 0 }
+		       @{$trees{$host} || []});
+    };
+    my @hosts = sort keys %{$verified};
+    my (%differs, %missing, %only, @no_majority);
+    foreach my $path (sort keys %entries) {
+	my $have = $entries{$path};
+	my @covering = grep { $covers->($_, $path) } @hosts;
+	next if (@covering < 2);
+	my @present = grep { $have->{$_} } @covering;
+	my @absent = grep { !$have->{$_} } @covering;
+	if (@present == 1 && @covering >= 3) {
+	    push (@{$only{$present[0]}}, $path);
+	    next;
+	}
+	if (@present * 2 > @covering) {
+	    push (@{$missing{$_}}, $path) foreach (@absent);
+	}
+	next if (@present < 2);
+	my %count;
+	my %value;
+	foreach my $host (@present) {
+	    $value{$host} = join ("\0", map { $_ // '-' } @{$have->{$host}});
+	}
+	$count{$value{$_}}++ foreach (@present);
+	my ($top) = sort { $count{$b} <=> $count{$a} } keys %count;
+	next if (keys (%count) == 1);
+	if ($count{$top} * 2 <= @present) {
+	    push (@no_majority, "$path: no majority among " . join (', ', @present));
+	    next;
+	}
+	my ($ref_host) = grep { $value{$_} eq $top } @present;
+	foreach my $host (grep { $value{$_} ne $top } @present) {
+	    my @which = grep { ($have->{$host}[$_] // '-') ne ($have->{$ref_host}[$_] // '-') } 0 .. $#attrs;
+	    push (@{$differs{$host}}, "$path (" . join (',', @attrs[@which]) . ")");
+	}
+    }
+
+    foreach my $host (@hosts) {
+	push (@lines, _limited ("$host differs from the other peers", $differs{$host}))
+	    if ($differs{$host});
+	push (@lines, _limited ("$host lacks", $missing{$host})) if ($missing{$host});
+	push (@lines, _limited ("only $host has", $only{$host})) if ($only{$host});
+    }
+    push (@lines, _limited ("no majority", [ map { (split (/: /, $_))[0] } @no_majority ]))
+	if (@no_majority);
+    return @lines;
+}
+
+# Remove the private temp dir and the plain files in it.
+sub _remove_dir {
+    my ($dir) = @_;
+    if (opendir (my $dh, $dir)) {
+	foreach my $name (readdir ($dh)) {
+	    next if ($name eq '.' || $name eq '..');
+	    unlink ("$dir/$name") if ($name =~ /^([\w.-]+)\z/);
+	}
+	closedir ($dh);
+    }
+    rmdir ($dir) || warn "Could not remove $dir: $!\n";
+}
+
+1;
+
+### End VerifyHosts package.
