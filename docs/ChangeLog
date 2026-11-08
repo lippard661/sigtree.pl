@@ -1,3 +1,5 @@
+8 November 2026 1.28a: Fix bug that causes extraneous error messages
+    on Linux when checking flags.
 7 November 2026 1.28: Improve performance by getting flags in batches,
     add primary- and secondary- versions of exception and exception-tree.
 6 November 2026 1.27: Bug fix of bug introduced in previous version where

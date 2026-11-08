@@ -364,8 +364,7 @@
 #    before. ChangedFile::add checked for a duplicate by scanning the
 #    tree's whole list, so recording N changes took N*N/2 comparisons
 #    (hours after a major OS upgrade); it now keeps a lookup hash, which
-#    is not stored.
-#    Additional feature: new config fields primary-exception:,
+#    is not stored. New config fields primary-exception:,
 #    secondary-exception:, primary-exception-tree: and
 #    secondary-exception-tree:, which apply only to primary specs (any
 #    run without -d secondary) or only to secondary specs, so a path can
@@ -375,6 +374,13 @@
 #    either a shared exception: line or per-mode lines, not both. The
 #    other mode's lines are checked as usual (so errors show in either
 #    mode) but not used, and do not warn about a missing path.
+# Modified 8 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.28a): under privsep on Linux, 1.28's batched
+#    lsattr ran in the unprivileged process on every path, including
+#    those it cannot open, and printed "lsattr: Permission denied While
+#    reading flags on ..." for each (the flags recorded were right: such
+#    a path was then read through the privileged parent). The batch now
+#    leaves those paths to the privileged parent, as 1.27 did.
 
 ### Required packages.
 
@@ -474,7 +480,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.28 of 7 November 2026';
+my $VERSION = 'sigtree 1.28a of 8 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -5651,8 +5657,10 @@ sub _get_file_flags {
     my ($full_path, $need_priv) = @_;
     my ($flags, $perms, $nlinks, $uid, $gid);
 
-    # Read already by prefetch_flags? (An unprivileged ls or lsattr reads
-    # the same flags root would, so this holds for $need_priv paths too.)
+    # Read already by prefetch_flags? (It reads only what the unprivileged
+    # process could read itself -- ls needs only stat, and lsattr is not
+    # run on a path that needs privileges -- and gets the same flags root
+    # would.)
     return delete $FLAGS_CACHE{$full_path} if (exists $FLAGS_CACHE{$full_path});
 
     if ($main::use_privsep && $need_priv) {
@@ -5767,12 +5775,21 @@ sub _prefetch_bsd_flags {
 
 # Linux: lsattr -d, skipping what _get_file_flags skips (symlinks,
 # character devices, filesystems without flags). lsattr prints
-# "flags path", so each line names its path.
+# "flags path", so each line names its path. lsattr has to open the
+# file, so under privsep a path the unprivileged process cannot read is
+# left to _get_file_flags, which asks the privileged parent, as before
+# 1.28. (ls -lod needs only stat, so the BSD batch has no such limit.)
 sub _prefetch_linux_flags {
     my (@batch) = @_;
     my (@candidates, %fs_type);
 
     @candidates = grep { !-l $_ && !-c $_ && -e $_ } @batch;
+    if ($main::use_privsep) {
+	@candidates = grep {
+	    my $mode = (lstat ($_))[2];
+	    defined ($mode) && can_access_unprivileged ($_, $mode, S_ISDIR ($mode));
+	} @candidates;
+    }
     return unless (@candidates);
     # One stat for the filesystem types, as _on_nonstd_fs runs one per path.
     if (open (my $outfh, '-|', $STAT, '-f', '-c', '%T %n', @candidates)) {

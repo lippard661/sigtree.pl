@@ -1,5 +1,8 @@
 BUGS:
 
+(1.28a fixed) Fix bug introduced in 1.28 for Linux that causes
+    extraneous error messages on flag checking.
+    
 (1.27 fixed) Fix bug introduced in 1.26 that causes no changedfile
     output if a single file has a read error.
 
