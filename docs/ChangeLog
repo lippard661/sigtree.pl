@@ -1,3 +1,5 @@
+7 November 2026 1.28: Improve performance by getting flags in batches,
+    add primary- and secondary- versions of exception and exception-tree.
 6 November 2026 1.27: Bug fix of bug introduced in previous version where
     a failed read on one file yields no output from an entire check run.
 15 October 2026 1.26: Bug fixes and improvements after Claude Opus 5.5 review:

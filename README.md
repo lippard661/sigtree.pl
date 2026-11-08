@@ -306,6 +306,10 @@ exception-tree: cups:IGNORE
 tree: /usr/local/bin:weekly,daily
 
 tree: /var/log:logs
+
+tree: /var/www:weekly,daily
+primary-exception-tree: logs:IGNORE
+secondary-exception-tree: logs:logs
 ```
 
 A tree takes a list of sets; the first is its primary set, which decides
@@ -318,6 +322,18 @@ Exceptions are only allowed for trees that are directories. Specifying
 `.` as an exception changes the primary set of the tree's root directory
 itself without affecting its contents — useful for directories like /etc
 whose mtime/ctime changes frequently.
+
+`primary-exception`, `secondary-exception`, `primary-exception-tree` and
+`secondary-exception-tree` work like `exception` and `exception-tree`, but
+apply only to primary specs (any run without `-d secondary`) or only to
+secondary specs. They are for paths that need a different set in each:
+above, web logs that must change daily are checked for stasis in the
+secondary specs but ignored in the primary specs, which are made in
+single-user mode when the web server is not running. A path has either an
+`exception` line, shared by both kinds of specs, or per-mode lines, not
+both. Lines for the other kind of specs are still checked for errors, but
+a missing path is only warned about for the kind being run. (Added in
+sigtree 1.29.)
 
 Trees may not overlap; no tree may be a subtree of another tree in the config.
 Symbolic links are never followed to avoid loops.

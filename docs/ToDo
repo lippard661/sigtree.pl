@@ -156,6 +156,9 @@ each tree (i.e., initialize_specs doesn't do it).
 
 Set user immutable or +i on changed file if immutable flags are used.
 
+(DONE 1.28) Improve performance by getting flags in batches;
+add primary- and secondary- versions of exception and exception-tree.
+
 (DONE 1.22) Optional privilege separation, with -p or privsep: yes in
 config file. Requires a _sigtree user and group.  Sigtree-managed
 files remain owned by root.

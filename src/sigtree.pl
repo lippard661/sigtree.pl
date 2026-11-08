@@ -352,6 +352,29 @@
 #    A privileged stat that fails with ENOTDIR (a directory in the spec has
 #    become a file) is no longer warned about, like ENOENT; the paths are
 #    still reported as deleted.
+# Modified 7 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.28): speed. Every path's flags were read by running
+#    ls (BSD, macOS) or lsattr (Linux, plus a stat for the filesystem
+#    type) on that one path, so each path forked the whole process, and a
+#    process holding a large spec forks slowly (most of the time of a
+#    macOS check or update). Flags are now read in batches of up to 200
+#    paths -- per directory in initialize and check, all changed paths at
+#    once in update -- and not at all for a path whose set does not check
+#    flags. A path a batch cannot account for is read on its own as
+#    before. ChangedFile::add checked for a duplicate by scanning the
+#    tree's whole list, so recording N changes took N*N/2 comparisons
+#    (hours after a major OS upgrade); it now keeps a lookup hash, which
+#    is not stored.
+#    Additional feature: new config fields primary-exception:,
+#    secondary-exception:, primary-exception-tree: and
+#    secondary-exception-tree:, which apply only to primary specs (any
+#    run without -d secondary) or only to secondary specs, so a path can
+#    be in a different set in each -- e.g. a log that must change daily,
+#    in a CRIT-LOGS set for the secondary specs, ignored in the primary
+#    specs because it does not exist in single-user mode. A path has
+#    either a shared exception: line or per-mode lines, not both. The
+#    other mode's lines are checked as usual (so errors show in either
+#    mode) but not used, and do not warn about a missing path.
 
 ### Required packages.
 
@@ -451,7 +474,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.27 of 6 November 2026';
+my $VERSION = 'sigtree 1.28 of 7 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1465,6 +1488,8 @@ sub create_tree {
 	$fileattr = $spec->add ($tree, $path);
     }
     if ($fileattr->{TYPE} eq 'dir') {
+	# Read the entries' flags in batches rather than one ls each.
+	FileAttr::prefetch_flags ($tree, map { $tree_root ? $_ : "$path/$_" } @{$fileattr->{FILES}});
         foreach $file (@{$fileattr->{FILES}}) {
 	    $full_path = $file;
 	    if (!$tree_root) {
@@ -1978,6 +2003,8 @@ sub check_tree {
     }
 
     if ($fileattr2->{TYPE} eq 'dir') {
+	# Read the entries' flags in batches rather than one ls each.
+	FileAttr::prefetch_flags ($tree, map { $tree_root ? $_ : "$path/$_" } @{$fileattr2->{FILES}});
         foreach $file (@{$fileattr2->{FILES}}) {
 	    $full_path = $file;
 	    if (!$tree_root) {
@@ -2117,6 +2144,8 @@ sub update_sets {
 	    }
 
 	    @changed_paths = $changedfile->get_paths ($tree);
+	    # Read the changed paths' flags in batches rather than one ls each.
+	    FileAttr::prefetch_flags ($tree, @changed_paths);
 	    foreach $changed_path (@changed_paths) {
 		if ($changed_path eq '.') {
 		    $fileattr2 = new FileAttr ($tree, '.', $config->path_sha_digest ($tree, '.'));
@@ -3678,7 +3707,7 @@ sub new {
     my ($set_long_name, $set_short_name, %used_set_names, %set_has_members,
 	$current_set, @keywords, $keyword, $path, $set_list,
 	@sets, $set_name, $arg_no, $error, %used_tree_paths, $current_tree,
-	%used_exception_paths, %used_tree_exception_paths, $tree, $other_tree);
+	%exception_modes, $tree, $other_tree);
 
     $self->{CRYPTO_SIGS} = 0;
     $self->{PGPKEYRING} = 0;
@@ -4032,18 +4061,28 @@ sub new {
 		${$self->{TREE_SETS}}{$path} = _set_array_to_set_list (@sets);
 
                 $current_tree = $path;
-
-                %used_exception_paths = ();
 	    }
-	    elsif ($field eq 'exception' || $field eq 'exception-tree') {
+	    elsif ($field =~ /^(primary-|secondary-)?(exception|exception-tree)\z/) {
+		# primary-exception: and secondary-exception: (and their -tree
+		# forms) apply only to primary specs (any run without
+		# "-d secondary") or only to secondary specs, so a path can be
+		# in one set for each: a log that must change daily, checked in
+		# the secondary specs, may not exist at all in single-user mode,
+		# when the primary specs are made. The other mode's lines are
+		# checked like any other and then not used.
+		my $mode = defined ($1) ? substr ($1, 0, -1) : '';
+		my $kind = $2;
+		my $an = ($field =~ /^[aeiou]/) ? 'An' : 'A'; # for messages
+		my $active = ($mode eq '' ||
+			      ($mode eq 'secondary') == ($secondary_specs ? 1 : 0));
 		if ($state != $TREES_LIST) {
-		    die "An \"$field:\" field in wrong section, line $line. $config_file\nLine: $raw_line";
+		    die "$an \"$field:\" field in wrong section, line $line. $config_file\nLine: $raw_line";
 		}
 		if ($value !~ /^.*:[\w-]+$/) {
 		    die "Invalid \"$field:\" field, line $line. $config_file\nLine: $raw_line";
 		}
 		if (!-d $current_tree) {
-		    die "An \"$field:\" field defined for a non-directory tree \"$current_tree\", line $line. $config_file\nLine: $raw_line";
+		    die "$an \"$field:\" field defined for a non-directory tree \"$current_tree\", line $line. $config_file\nLine: $raw_line";
 		}
 		($path, $set_list) = split (/:/, $value);
 		($arg_no, $error, @sets) = $self->valid_setlist ($set_list);
@@ -4065,10 +4104,17 @@ sub new {
 		foreach $set_name (@sets) {
 		    $set_has_members{$set_name} = 1;
 		}
-		if (($used_exception_paths{"$current_tree/$path"} && $field eq 'exception') ||
-		    ($used_tree_exception_paths{"$current_tree/$path"} && $field eq 'exception-tree')) {
+		# One line per path for each mode, and a path is either
+		# shared ("exception:") or per mode, not both.
+		my $seen = ($exception_modes{"$kind:$current_tree/$path"} //= {});
+		if ($seen->{$mode}) {
 		    die "Second \"$field:\" field \"$path\" for tree \"$current_tree\", line $line. $config_file\nLine: $raw_line";
 		}
+		if (($mode eq '' && ($seen->{primary} || $seen->{secondary})) ||
+		    ($mode ne '' && $seen->{''})) {
+		    die "Path \"$path\" for tree \"$current_tree\" has both \"$kind:\" and \"primary-$kind:\" or \"secondary-$kind:\"; use \"$kind:\" for both kinds of specs, or one line for each, line $line. $config_file\nLine: $raw_line";
+		}
+		$seen->{$mode} = 1;
 
 		# Exception paths are relative to the tree. An absolute one
 		# would be looked up as "$current_tree//abs/path" and never
@@ -4077,7 +4123,7 @@ sub new {
 		    my $relative = _relative_hint ($current_tree, $path);
 		    # The whole tree as an exception-tree is just the tree's own
 		    # set list, so there is no relative form to suggest.
-		    $path = $relative if (defined ($relative) && $relative eq '.' && $field eq 'exception-tree');
+		    $path = $relative if (defined ($relative) && $relative eq '.' && $kind eq 'exception-tree');
 		    if ($path ne '.') {
 			die "The \"$field:\" path \"$path\" for tree \"$current_tree\" must be relative to the tree" .
 			    (defined ($relative) ? " (\"$relative\")" : ", and this one is not in the tree") .
@@ -4089,24 +4135,29 @@ sub new {
 		if ($path eq '..') {
 		    die "Cannot use \"$path\" in \"$field:\" field for tree \"$current_tree\", line $line. $config_file\nLine: $raw_line";
 		}
-		if ($path eq '.' && $field eq 'exception-tree') {
-		    die "An \"exception-tree:\" for all of tree \"$current_tree\" is the same as the tree's own sets; change its \"tree:\" line instead (\"exception: .\" changes only the tree's root directory), line $line. $config_file\nLine: $raw_line";
+		if ($path eq '.' && $kind eq 'exception-tree') {
+		    if ($mode ne '') {
+			# The tree: line is shared, so there is nothing to point to.
+			die "A \"$field:\" for all of tree \"$current_tree\" would give the whole tree different sets in $mode specs, which is not supported; use $mode-exception: or $mode-exception-tree: lines for the paths in it, line $line. $config_file\nLine: $raw_line";
+		    }
+		    die "An \"$field:\" for all of tree \"$current_tree\" is the same as the tree's own sets; change its \"tree:\" line instead (\"exception: .\" changes only the tree's root directory), line $line. $config_file\nLine: $raw_line";
 		}
 
-		if ($field eq 'exception-tree') {
-		    $used_tree_exception_paths{"$current_tree/$path"} = 1;
+		# A line for the other kind of specs stops here.
+		next unless ($active);
+
+		if ($kind eq 'exception-tree') {
 		    $self->{TREE_DIR_EXCEPTION_SETS}->{$current_tree}->{$path} = _set_array_to_set_list (@sets);
 		}
 		else {
-		    $used_exception_paths{"$current_tree/$path"} = 1;
 		    $self->{TREE_EXCEPTION_SETS}->{$current_tree}->{$path} = _set_array_to_set_list (@sets);
 		}
 		# Move the test for directory or existence here, after it's set up, so we can respect the "ignore" keyword.
 		if (!$self->path_is_ignored ($current_tree, $path)) {
-		    if ($field eq 'exception-tree' && !-d $current_tree . '/' . $path) {
+		    if ($kind eq 'exception-tree' && !-d $current_tree . '/' . $path) {
 			print "Warning: Path \"$path\" in \"$field:\" field for tree \"$current_tree\" is not a directory or is inaccessible, line $line. $config_file\nLine: $raw_line";			
 		    }
-		    elsif ($field ne 'exception-tree' && !-e $current_tree . '/' . $path) {
+		    elsif ($kind ne 'exception-tree' && !-e $current_tree . '/' . $path) {
 			print "Warning: Path \"$path\" in \"$field:\" field for tree \"$current_tree\" does not exist or is inaccessible, line $line. $config_file\nLine: $raw_line";		    
 		    }
 		}
@@ -4468,6 +4519,17 @@ sub path_sha_digest {
     }
 
     return $sha_digest;
+}
+
+# Method to return 1 if the primary set for a path checks a keyword.
+sub path_uses_keyword {
+    my $self = shift;
+    my $class = ref ($self) || $self;
+    my ($tree, $path, $keyword) = @_;
+
+    my $primary_set = $self->primary_set_for_path ($tree, $path);
+    my ($description, $keywords, $priority) = $self->set_info ($primary_set);
+    return (grep { $_ eq $keyword } split (/,\s*/, $keywords // '')) ? 1 : 0;
 }
 
 # Method to return the primary set name for a given path.
@@ -5061,6 +5123,17 @@ use File::Spec;
 our $PRIV_IPC;
 our %DIR_ACCESS_CACHE;
 
+# Flags read in batches by prefetch_flags, keyed by full path, each used
+# (and removed) by the next _get_file_flags for that path. One flags
+# command per path forks this whole process, and a process holding a
+# large spec makes each fork slow (most of the time of a macOS check or
+# update).
+our %FLAGS_CACHE;
+# Paths per ls/lsattr run. A constant, not "my $x = 200": this package's
+# file-scoped assignments run only when execution reaches them, after
+# the main program above has already called in here.
+use constant FLAGS_BATCH => 200;
+
 ## Subroutines for privilege separation. Written by Claude.
 
 # Check if mode bits allow world read
@@ -5247,8 +5320,12 @@ sub new {
 	$self->{LINKTARGET_TYPE} = $linktarget_type;
     }
 
-    # Get immutable flags if supported (may need privilege).
-    $self->{FLAGS} = _get_file_flags ($full_path, $need_priv);
+    # Get immutable flags if supported (may need privilege), but only if
+    # this path's set checks them: reading them costs a fork per path
+    # unless prefetch_flags has already read them.
+    if ($config->path_uses_keyword ($tree, $path, 'flags')) {
+	$self->{FLAGS} = _get_file_flags ($full_path, $need_priv);
+    }
 
     bless $self, $class;
     return $self;
@@ -5574,6 +5651,10 @@ sub _get_file_flags {
     my ($full_path, $need_priv) = @_;
     my ($flags, $perms, $nlinks, $uid, $gid);
 
+    # Read already by prefetch_flags? (An unprivileged ls or lsattr reads
+    # the same flags root would, so this holds for $need_priv paths too.)
+    return delete $FLAGS_CACHE{$full_path} if (exists $FLAGS_CACHE{$full_path});
+
     if ($main::use_privsep && $need_priv) {
 	return PrivSep::request_immutable_get ($FileAttr::PRIV_IPC, $full_path);
     }
@@ -5622,6 +5703,108 @@ sub _get_file_flags {
     return ($flags);
 }
 
+# Subroutine to read the flags of many paths of a tree with one ls (BSD,
+# macOS) or lsattr (Linux) per $FLAGS_BATCH paths, into %FLAGS_CACHE,
+# for paths whose set checks flags. @paths are relative to $tree ('.'
+# for the tree itself). A path whose flags cannot be read this way is
+# left out, and _get_file_flags then reads it on its own as before.
+sub prefetch_flags {
+    my ($tree, @paths) = @_;
+    my @full_paths;
+
+    return unless (-e $CHFLAGS || -e $CHATTR);
+    foreach my $path (@paths) {
+	next if ($config->path_is_ignored ($tree, $path));
+	next unless ($config->path_uses_keyword ($tree, $path, 'flags'));
+	push (@full_paths, ($path eq '.') ? $tree : "$tree/$path");
+    }
+    while (my @batch = splice (@full_paths, 0, FLAGS_BATCH)) {
+	if (-e $CHFLAGS) {
+	    _prefetch_bsd_flags (@batch);
+	}
+	else {
+	    _prefetch_linux_flags (@batch);
+	}
+    }
+}
+
+# BSD/macOS: ls -lod/-lOd plus f, which keeps the operands in argument
+# order. Each line is matched to its path: a line for a path ends with
+# " path" (a symlink's has " path -> target"), so a line split by a
+# newline in a name, or a path ls could not stat, just goes uncached.
+# Matching in order, each line first against the next expected path,
+# means a symlink whose target text looks like another path is still
+# taken as its own line.
+sub _prefetch_bsd_flags {
+    my (@batch) = @_;
+
+    # -e, as _get_file_flags tests: a dangling symlink has always been
+    # recorded as <undefined>, so reading its flags now would report a
+    # change for every one.
+    my @existing = grep { -e $_ } @batch;
+    return unless (@existing);
+    open (my $outfh, '-|', $LIST_FLAGS_CMD, $LIST_FLAGS_OPT . 'f', @existing) or return;
+    my @lines = <$outfh>;
+    close ($outfh);
+    my $i = 0;
+    foreach my $line (@lines) {
+	chomp ($line);
+	for (my $j = $i; $j < @existing; $j++) {
+	    my $path = $existing[$j];
+	    my $names_path = ($line =~ /^l/) ?
+		(index ($line, " $path -> ") >= 0) :
+		(length ($line) > length ($path) &&
+		 substr ($line, -(length ($path) + 1)) eq " $path");
+	    next unless ($names_path);
+	    my $flags = (split (/\s+/, $line))[4];
+	    $flags = 'none' if (!defined ($flags) || $flags eq '-' || $flags !~ /^[\w,]+$/);
+	    $FLAGS_CACHE{$path} = $flags;
+	    $i = $j + 1;
+	    last;
+	}
+    }
+}
+
+# Linux: lsattr -d, skipping what _get_file_flags skips (symlinks,
+# character devices, filesystems without flags). lsattr prints
+# "flags path", so each line names its path.
+sub _prefetch_linux_flags {
+    my (@batch) = @_;
+    my (@candidates, %fs_type);
+
+    @candidates = grep { !-l $_ && !-c $_ && -e $_ } @batch;
+    return unless (@candidates);
+    # One stat for the filesystem types, as _on_nonstd_fs runs one per path.
+    if (open (my $outfh, '-|', $STAT, '-f', '-c', '%T %n', @candidates)) {
+	while (my $line = <$outfh>) {
+	    chomp ($line);
+	    $fs_type{$2} = $1 if ($line =~ /^(\S+) (.*)\z/s);
+	}
+	close ($outfh);
+    }
+    my @checkable;
+    foreach my $path (@candidates) {
+	next unless (defined ($fs_type{$path}));          # left to _get_file_flags
+	if (_nonstd_fs_type ($fs_type{$path})) {
+	    $FLAGS_CACHE{$path} = '<undefined>';          # what _get_file_flags gives
+	}
+	else {
+	    push (@checkable, $path);
+	}
+    }
+    return unless (@checkable);
+    my %wanted = map { $_ => 1 } @checkable;
+    open (my $outfh, '-|', $LSATTR, $LSATTR_FLAGS_OPT, @checkable) or return;
+    while (my $line = <$outfh>) {
+	chomp ($line);
+	next unless ($line =~ /^(\S+) (.*)\z/s && $wanted{$2});
+	my ($flags, $path) = ($1, $2);
+	$flags = 'none' if ($flags =~ /^[-]+$/);
+	$FLAGS_CACHE{$path} = $flags;
+    }
+    close ($outfh);
+}
+
 # Subroutine to tell if a file is on a fuse or msdos filesystem (where
 # Linux lsattr won't work). (This code was in two places, here in FileAttr
 # and also above with immutable_file, which now calls FileAttr's _get_file_flags
@@ -5634,11 +5817,21 @@ sub _on_nonstd_fs {
     $fs_type = <$outfh>;
     close ($outfh);
     chomp ($fs_type) if (defined ($fs_type));
+    return _nonstd_fs_type ($fs_type);
+}
+
+# Subroutine to tell if a stat -f %T filesystem type is one where Linux
+# lsattr won't work (shared by _on_nonstd_fs and _prefetch_linux_flags).
+sub _nonstd_fs_type {
+    my ($fs_type) = @_;
+
+    return 0 unless (defined ($fs_type));
     return 1 if ($fs_type eq 'fuse' || $fs_type eq 'msdos' ||
 		 $fs_type eq 'tmpfs' || $fs_type eq 'mqueue' ||
 		 $fs_type eq 'hugetlbfs' || $fs_type eq 'proc' ||
 		 $fs_type eq 'devpts');
 #    return 1 if ($fs_type ne 'ext2/ext3');
+    return 0;
 }
 
 # Internal method to compare one field of a FileAttr record
@@ -6303,6 +6496,7 @@ sub reset_changed_file {
     $self->{SET_TO_PATH_CHANGE} = {};
     $self->{SET_TO_PATH_CH_ATTR} = {};
     $self->{PATH} = {};
+    $self->{PATH_INDEX} = {};
     # don't reset TIME and USER
 }
 
@@ -6312,7 +6506,7 @@ sub add {
     my $self = shift;
     my $class = ref ($self) || $self;
     my ($tree, $path, $set, %differences) = @_;
-    my ($full_path, $changed_attrs, $present_path);
+    my ($full_path, $changed_attrs);
 
     if ($path eq '.') {
 	$full_path = $tree;
@@ -6340,11 +6534,24 @@ sub add {
     }
 
 
-    foreach $present_path (@{${$self->{PATH}}{$tree}}) {
-        return if ($path eq $present_path);
+    # Is the path already listed? A hash beside each tree's list answers
+    # that at once; scanning the list made recording N changes N*N/2
+    # comparisons (an hour or more after a major OS upgrade). The index is
+    # rebuilt whenever the list has changed under it (merge, delete,
+    # copy_tree_from, a changed file just read from disk), and is not
+    # stored (store_changedfile).
+    my $list = (${$self->{PATH}}{$tree} //= []);
+    my $index = ${$self->{PATH_INDEX}}{$tree};
+    if (!$index || $index->{COUNT} != scalar (@{$list})) {
+	$index = { SEEN => { map { ($_ => 1) } @{$list} },
+		   COUNT => scalar (@{$list}) };
+	${$self->{PATH_INDEX}}{$tree} = $index;
     }
+    return if (${$index->{SEEN}}{$path});
 
-    push (@{${$self->{PATH}}{$tree}}, $path);
+    push (@{$list}, $path);
+    ${$index->{SEEN}}{$path} = 1;
+    $index->{COUNT}++;
 }
 
 # Method to add a new check time (and user) for a particular tree.
@@ -6402,6 +6609,7 @@ sub copy_tree_from {
 	}
     }
     ${$self->{PATH}}{$tree} = [ @{${$other->{PATH}}{$tree}} ];
+    delete (${$self->{PATH_INDEX}}{$tree});
 }
 
 # Method to merge a changed file with the main changed file.
@@ -6650,6 +6858,7 @@ sub delete {
     my ($tree) = @_;
 
     delete (${$self->{PATH}}{$tree});
+    delete (${$self->{PATH_INDEX}}{$tree});
     delete (${$self->{TIME}}{$tree});
     delete (${$self->{USER}}{$tree});
 }
@@ -6682,6 +6891,11 @@ sub store_changedfile {
     my $class = ref ($self) || $self;
 
     my $is_temp_file = $self->{IS_TEMP};
+
+    # The lookup index add keeps is rebuilt as needed, so it is not
+    # written to disk.
+    local $self->{PATH_INDEX};
+    delete $self->{PATH_INDEX};
 
     if ($main::use_privsep && !$is_temp_file) {
 	# Main changed file - requires privileged write.
