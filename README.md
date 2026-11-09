@@ -92,6 +92,12 @@ mtimestasis-NN[smhd]  alert if mtime has NOT changed for NN seconds/minutes/hour
 ctime           inode change time
 shadigest       SHA-2 or SHA-3 digest (algorithm set globally, default 256-bit SHA-3)
 flags           filesystem flags (chflags on BSD, chattr on Linux)
+rdev            device number of a block or character device (1.30 and later;
+                shown as major,minor). Not in the default list: put it in
+                the set for device trees, such as a chroot's dev/. A spec
+                made before 1.30 has no device numbers, so re-initialize
+                those trees to start comparing; versions before 1.30
+                reject the keyword, so install 1.30 before adding it.
 ignore          exclude this file/tree from monitoring entirely
 ```
 
@@ -110,6 +116,8 @@ check_file <f>    Check a single file against its spec
 update            Update specs to reflect changes found by check
 changes           Show pending changes from last check before update
 verify_hosts      On a central server, check copies of other hosts' databases
+verify_hosts <host> [<spec> | </path>]
+                  On a central server, show what changed in a host's specs
 ```
 
 On initialize and update, the sigtree spec-of-specs is written and signed
@@ -120,7 +128,12 @@ tree's pending changes are kept). Check the exit status, or the output, of
 initialize and update.
 
 The changes command shows what check found before you commit to an update —
-review this before running update. For partial updates, only updated trees
+review this before running update. It exits 0 if changes are pending in
+the specified sets, 1 if none are, and 2 on an error, so a script can run
+update only when there is something to update. From sigtree 1.30 the
+changed file (and the secondary changed file) is kept when there is
+nothing in it, so its modification time is the time of the last check;
+test for pending changes with `changes`, not with the file's existence. For partial updates, only updated trees
 are removed from the pending changes file; unreviewed changes in other
 trees are preserved.
 
@@ -293,6 +306,10 @@ set: logs,lg
 description: Log files -- no hash, monitor for stasis.
 keywords: type,uid,gid,mode,size,nlink,mtime,mtimestasis-24h,flags
 
+set: dev,DEV
+description: Device nodes (rdev: 1.30 and later).
+keywords: type,uid,gid,mode,rdev
+
 set: IGNORE,IG
 description: Files to ignore entirely.
 keywords: ignore
@@ -309,6 +326,7 @@ tree: /usr/local/bin:weekly,daily
 tree: /var/log:logs
 
 tree: /var/www:weekly,daily
+exception-tree: dev:DEV
 primary-exception-tree: logs:IGNORE
 secondary-exception-tree: logs:logs
 ```
@@ -345,16 +363,20 @@ In `/etc/daily.local` (OpenBSD) or equivalent:
 ```sh
 host=`/bin/hostname -s`
 dayofweek=`/bin/date +"%a"`
-changedfile="/var/db/sigtree/secondary/$host.changedsec"
 case $dayofweek in
     Wed) sigtreetest="daily,weekly" ;;
     *)   sigtreetest="daily" ;;
 esac
 /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest check | \
     mail -s "$sigtreetest $host secondary sigtree report" your@email
-test -f $changedfile && \
+/usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest changes >/dev/null && \
     /usr/bin/perl /usr/local/bin/sigtree.pl -d secondary -s $sigtreetest update
 ```
+
+(Before 1.30 this example tested for the changed file with
+`test -f $changedfile`. From 1.30 the file always exists after a check,
+so that test would run update every day; harmless, since update with
+nothing to update just says so, but `changes` is the right test.)
 
 In `/etc/weekly.local` (OpenBSD) or equivalent (run on a different day
 than secondary weekly check):
@@ -382,12 +404,31 @@ reports:
   validly signed old spec put back, which no signature check can catch;
 - for a host whose signify public key is pinned in the config, any spec or
   spec-of-specs whose signature does not verify;
+- for each chroot configured (1.30 and later), on each host that has it:
+  setuid or setgid files, device nodes outside the chroot's `dev/`,
+  files in its system directories, `dev/` and `etc/` not owned by root or
+  writable by group or others, files in `etc/` (or another listed
+  directory) that are not on its list, and files in the directories that
+  are copies of the system's (`bin`, `usr/lib`, ...) that differ from
+  the host's own copy, or have none: a chroot left behind by a syspatch,
+  or a swapped binary or device node; and, across the hosts that have
+  it, files in those system parts that they all have and that differ;
+- for each file named in `reference:` (1.30 and later), every host whose
+  copy differs from the copy on the server running `verify_hosts`, or
+  whose specs have no copy (for configuration files kept in one place
+  and copied to every host, such as `/etc/rsync/rsync.conf`);
 - among hosts marked as peers (same OS release), files under the
   configured common paths that differ from what most peers have, that one
   host lacks, or that only one host has.
 
+The snapshot comparison runs from `previous-snapshot:` (default `daily.1`)
+to `current-snapshot:` (default `daily.0`), or, with `previous-age: 7`,
+from the newest snapshot at least 7 days older than the current one. From
+1.30 every snapshot in between is examined, so a spec put back and left in
+place for the rest of a week-long window is still found.
+
 It prints nothing when there is nothing to report, so it can run from
-`/etc/daily.local` on the central server:
+`/etc/daily.local` or `/etc/weekly.local` on the central server:
 ```sh
 /usr/bin/perl /usr/local/bin/sigtree.pl verify_hosts
 ```
@@ -398,6 +439,20 @@ which might be compromised. Nothing else a host wrote is loaded; the
 changed file is judged by its mtime and the snapshots by size and hash.
 Hosts that sign with GPG get the changed-file and snapshot checks but not
 the signature checks or the comparison.
+
+On demand (1.30 and later), `sigtree verify_hosts <host>` shows what
+changed in each of the host's specs between the same two snapshots: paths
+added, removed and changed, with each changed attribute's old and new
+value. `sigtree verify_hosts <host> <spec>` does it for one spec, and
+`sigtree verify_hosts <host> /path` for one file (and, for a
+`reference:` file, also a diff of the host's version against the
+server's copy): if the snapshots also
+hold backups of the host's files (as rsnapshot stores them, under their
+full paths), it finds the backup copies whose digests match the two
+versions the specs recorded and shows a diff of them. Both versions of a
+spec are verified before they are loaded, and anything a host wrote
+(names, paths, file contents) is printed with control characters
+escaped.
 
 ## Security Notes
 

@@ -393,6 +393,45 @@
 #    paths that differ from what most peers have, are missing, or exist on
 #    one host only. A spec is loaded only after its signature verifies,
 #    in a child running as _sigtree. Prints nothing when all is well.
+# Modified 8 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.30): the primary and secondary changed files are
+#    no longer deleted when empty; check, initialize and update leave
+#    them in place, so a changed file's mtime is the time of the last
+#    check (verify_hosts relies on it) and an empty one means nothing is
+#    pending. changes exits 0 if changes are pending in the specified
+#    sets and 1 if none are (or there is no changed file), so cron can
+#    run update only when needed; update with nothing to update says so
+#    and exits 0. verify_hosts: the rollback check walks every snapshot
+#    between the previous and current ones, so a spec put back within a
+#    week-long window is caught; previous-age: N picks the newest snapshot
+#    at least N days older than the current one; "verify_hosts host
+#    [spec | /path]" shows on demand what changed in that host's specs,
+#    or one spec, or one file, with a diff of its two versions when
+#    backups of both are found by their digests (SHA-3, then SHA-2, of
+#    the digest's size); host-written names, paths and file contents are
+#    printed with control characters escaped (1.29 printed them raw).
+#    Device nodes' device numbers are recorded, and compared by a new
+#    keyword, rdev (not in the defaults: for a set covering device nodes,
+#    such as a chroot's dev/); a spec from before 1.30 has
+#    none, so nothing is compared until the tree is re-initialized. They
+#    are shown as major,minor as the running OS encodes them (OpenBSD,
+#    macOS and Linux differ). verify_hosts checks chroots ("chroot:"
+#    blocks): no setuid or setgid files and no device nodes outside dev/;
+#    in the mirrored directories, dev/ and etc/, everything owned by root
+#    and not group or world writable (device nodes excepted); nothing
+#    under an allow-only: directory that is not listed; each file under
+#    a mirror: directory the same as the host's own copy at the same
+#    path (digest, mode, owner, device number, link target), and none
+#    without one unless in allow-extra:; and, in those system parts,
+#    files that every host's copy of the chroot has, the same on each
+#    (compare-except: for any that differ by design). "reference:" names
+#    files on the host running verify_hosts that every host (or those in
+#    reference-hosts:) must have the same; a host whose specs lack one is
+#    reported, and the detail query for such a path diffs the host's
+#    backed-up version against this host's copy.
+#    In the detail query, a version whose signature cannot be checked
+#    (a GPG signature from before the host moved to signify, say) is
+#    reported, named as such, and the other specs are still shown.
 
 ### Required packages.
 
@@ -492,7 +531,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.29 of 8 November 2026';
+my $VERSION = 'sigtree 1.30 of 8 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -717,6 +756,8 @@ if ($opts{'h'}) {
     print "update: Update specifications with changes found by check.\n";
     print "verify_hosts: Check copies of other hosts' sigtree databases (on a central server).\n";
     print "   (-c names its own config file, default $SYSCONF_DIR/$VERIFY_HOSTS_CONFIG.)\n";
+    print "   verify_hosts host [spec | /path]: show what changed in that host's specs\n";
+    print "   (or one spec, or one file, with a diff from the backups if both versions are there).\n";
     exit;
 }
 
@@ -726,7 +767,8 @@ if ($#ARGV >= 0) {
 }
 
 if (!defined ($command) || ($command eq 'check_file' && $#ARGV != 1) ||
-    ($command ne 'check_file' && $#ARGV != 0)) {
+    ($command eq 'verify_hosts' && $#ARGV > 2) ||
+    ($command ne 'check_file' && $command ne 'verify_hosts' && $#ARGV != 0)) {
     die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
 }
 
@@ -754,11 +796,24 @@ elsif ($command ne 'initialize' &&
     die "Unknown command \"$command\".\n"
 }
 
+# changes exits 0 if changes are pending and 1 if none are, so an error
+# must not exit 1. die's exit status is $! when that is set (it can be 1),
+# so for changes an error outside an eval exits 2.
+if ($command eq 'changes') {
+    $SIG{__DIE__} = sub {
+	# Inside an eval, or while code is being compiled (a module's
+	# eval { require ... } at load time): let it be handled as usual.
+	return if (!defined ($^S) || $^S);
+	print STDERR $_[0];
+	exit (2);
+    };
+}
+
 # verify_hosts reads other hosts' copied databases, not this host's
 # sigtree config, so it runs before that config is read.
 if ($command eq 'verify_hosts') {
     my $hosts_config = $opts{'c'} ? $config_file : $SYSCONF_DIR . '/' . $VERIFY_HOSTS_CONFIG;
-    exit (VerifyHosts::run ($hosts_config, $verbose, $OSNAME));
+    exit (VerifyHosts::run ($hosts_config, $verbose, $OSNAME, @ARGV[1 .. $#ARGV]));
 }
 
 $config = new Config ($config_file);
@@ -1135,7 +1190,14 @@ elsif ($command eq 'changes') {
 	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
 	pledge (@promises) || die "Cannot pledge read-only promises. $!\n";
     }
-    show_changes ($config, $no_macos_app_contents, @sets);
+    # 0: changes pending; 1: none; 2: an error. die's own exit status
+    # depends on $!, which could be 1, so an error is caught and mapped.
+    my $changes_status = eval { show_changes ($config, $no_macos_app_contents, @sets) };
+    if (!defined ($changes_status)) {
+	print STDERR $@;
+	exit (2);
+    }
+    exit ($changes_status);
 }
 elsif ($command eq 'check') {
     if ($^O eq 'openbsd') {
@@ -1543,9 +1605,13 @@ sub show_changes {
     my ($changedfile, $displayed_something, @changed_trees, $tree,
 	@times, @users, @paths, @attrs, $time, $user, $path, $attr);
 
+    # Exit status: 0 if changes are pending in the specified sets, 1 if
+    # none are (including no changed file), so cron can run update only
+    # when needed; an error dies (255).
     if ((!$use_privsep && !-e $changed_file) ||
 	($use_privsep && !grep { $_ eq $changed_file } @EXISTING_SPECS)) {
-	die "There is no changed file.\n";
+	print "No pending changes (there is no changed file).\n";
+	return 1;
     }
 
     $changedfile = new ChangedFile ($changed_file);
@@ -1596,12 +1662,14 @@ sub show_changes {
     }
 
     if (!$displayed_something) {
-	print "No trees in sets specified have been changed prior to last check.\n";
+	print "No pending changes in the specified sets.\n";
+	return 1;
     }
     elsif ($verbose) {
 	# Args are changedfile, verbose flag, write flag, no_macos_app_contents
 	show_change_details ($changedfile, 0, 0, $no_macos_app_contents);
     }
+    return 0;
 }
 
 # Subroutine to check sets.  We check all trees that contain references
@@ -1910,12 +1978,9 @@ sub show_change_details {
     if ($total_changes == 0 && $total_additions == 0 && $total_deletions == 0) {
 	print "\n" if ($verbose);
 	print "No changes found.\n";
-	# Only if it previously existed and is empty; the new changes haven't been
-	# stored yet.
-	$changedfile->delete_if_empty if ($write_flag &&
-					  ((!$use_privsep && -e $changed_file) ||
-					   ($use_privsep &&
-					    grep { $_ eq $changed_file } @EXISTING_SPECS)));
+	# Store it empty: the changed file always exists after a check,
+	# and its mtime is the time of the check.
+	$changedfile->store_changedfile if ($write_flag);
     }
     else {
 	print "\n" if ($verbose);
@@ -2111,7 +2176,11 @@ sub update_sets {
 	    last;
 	}
     }
-    die "Nothing changed in specified sets to update.\n" if (!$something_to_update);
+    if (!$something_to_update) {
+	# Not an error: since 1.30 the changed file is kept when empty.
+	print "Nothing changed in specified sets to update.\n";
+	return;
+    }
 
     $pgp_passphrase = get_pgp_passphrase() if ($use_pgp);
     # Stop now, before any spec is changed, if the passphrase cannot sign.
@@ -3732,7 +3801,8 @@ sub new {
 			'ctime',
 			'type',
 			'ignore',
-			'flags'
+			'flags',
+			'rdev'
 			);
 
     my $DEFAULT_KEYWORDS = 'gid,mode,nlink,shadigest,uid,size,link,mtime,ctime,type,flags';
@@ -5307,7 +5377,9 @@ sub new {
     $self->{NLINK} = $stat[3];
     $self->{UID} = $stat[4];
     $self->{GID} = $stat[5];
-#    $self->{RDEV} = $stat[6]; # unused
+    # Device number, for device nodes only (the rdev keyword compares it).
+    # Its encoding of major and minor differs by OS; see device_number.
+    $self->{RDEV} = $stat[6] if (S_ISCHR ($stat[2]) || S_ISBLK ($stat[2]));
     $self->{SIZE} = $stat[7];
 #    $self->{ATIME} = $stat[8]; # unused
     $self->{MTIME} = $stat[9];
@@ -5363,6 +5435,32 @@ sub new {
 
     bless $self, $class;
     return $self;
+}
+
+# A device number as "major,minor", decoded as this OS encodes it (as
+# OpenBSD's, macOS's and glibc's major() and minor() macros do), or the
+# raw number on another OS. A spec from another OS shows its own
+# encoding decoded wrongly, so verify_hosts shows raw numbers.
+sub device_number {
+    my ($rdev) = @_;
+    return '(none)' unless (defined ($rdev) && $rdev =~ /^\d+\z/);
+    my ($major, $minor);
+    if ($^O eq 'openbsd') {
+	$major = ($rdev >> 8) & 0xff;
+	$minor = ($rdev & 0xff) | (($rdev & 0xffff0000) >> 8);
+    }
+    elsif ($^O eq 'darwin') {
+	$major = ($rdev >> 24) & 0xff;
+	$minor = $rdev & 0xffffff;
+    }
+    elsif ($^O eq 'linux') {
+	$major = (($rdev >> 8) & 0xfff) | (($rdev >> 32) & 0xfffff000);
+	$minor = ($rdev & 0xff) | (($rdev >> 12) & 0xffffff00);
+    }
+    else {
+	return $rdev;
+    }
+    return "$major,$minor";
 }
 
 # Internal method to get file type.
@@ -6001,6 +6099,13 @@ sub compare {
 	$differences{'gid'} = $fileattr->{GID};
 	$differences{'any'} = 1;
     }
+    # Only if the spec has a device number: specs from before 1.30 have
+    # none, and re-initializing a tree records them.
+    if ($keywords{'rdev'} && defined ($self->{RDEV}) &&
+	($self->_compare ($self->{RDEV}, $fileattr->{RDEV}))) {
+	$differences{'rdev'} = $fileattr->{RDEV} // '(none)';
+	$differences{'any'} = 1;
+    }
     if ($keywords{'size'} && ($self->_compare ($self->{SIZE}, $fileattr->{SIZE}))) {
 	$differences{'size'} = $fileattr->{SIZE};
 	$differences{'any'} = 1;
@@ -6232,6 +6337,10 @@ sub display_diffs {
     if ($differences{'flags'}) {
 	$self->_display_diff ('flags', $self->{FLAGS}, $differences{'flags'});
     }
+    if ($differences{'rdev'}) {
+	$self->_display_diff ('device number', device_number ($self->{RDEV}),
+			      device_number ($differences{'rdev'}));
+    }
     if ($differences{'link'}) {
 	$self->_display_diff ('symbolic link target', $self->{LINK}, $differences{'link'});
     }
@@ -6260,6 +6369,7 @@ sub display {
     print "size: $self->{SIZE}\n";
     print "shadigest: $self->{SHADIGEST}\n" if ($self->{TYPE} eq 'file' && defined ($self->{SHADIGEST}));
     print "flags: $self->{FLAGS}\n";
+    print "device: " . device_number ($self->{RDEV}) . "\n" if (defined ($self->{RDEV}));
     print "link to: $self->{LINK}\n" if ($self->{TYPE} eq 'link');
     print "files: @{$self->{FILES}}\n" if ($self->{TYPE} eq 'dir');
 }
@@ -6908,25 +7018,21 @@ sub delete {
     delete (${$self->{USER}}{$tree});
 }
 
-# Method to delete the changed file if there are no changed trees left
-# in it.
+# Method to delete a worker's temp changed file if there are no changed
+# trees left in it. Since 1.30 the main (primary or secondary) changed
+# file is kept even when empty: callers store it first, so it always
+# exists after a check, initialize or update, and its mtime is the time
+# of the last of them (verify_hosts uses that). An empty one means
+# nothing is pending.
 sub delete_if_empty {
     my $self = shift;
     my $class = ref ($self) || $self;
     my (@trees);
 
+    return unless ($self->{IS_TEMP});
     @trees = keys (%{$self->{PATH}});
     if ($#trees < 0) {
-	my $is_temp_file = $self->{IS_TEMP};
-
-	if ($main::use_privsep && !$is_temp_file) {
-	    # Main changed file - needs privileged delete
-	    PrivSep::request_delete_file ($FileAttr::PRIV_IPC,
-					  $self->{CHANGEDFILE});
-	}
-	else {
-	    unlink ($self->{CHANGEDFILE});
-	}
+	unlink ($self->{CHANGEDFILE});
     }
 }
 
@@ -6991,6 +7097,10 @@ sub store_changedfile {
 #   - for hosts marked as peers, files under the configured common paths
 #     that differ from what most peers have, are missing, or exist on one
 #     host only.
+# "verify_hosts <host> [spec | /path]" instead shows, on demand, what
+# changed in each of that host's specs between the two snapshots (one
+# spec, or one file, which with backups of both versions is shown as a
+# diff).
 # Specs are Storable files written by the hosts, so a spec is loaded only
 # after its signature has verified, and only in a child process that has
 # dropped to _sigtree. Nothing else a host wrote is deserialized: the
@@ -7001,6 +7111,8 @@ package VerifyHosts;
 use strict;
 use warnings;
 use Digest::SHA;
+use Digest::SHA3;
+use File::Basename ();
 use Fcntl qw( :DEFAULT O_NOFOLLOW :mode );
 use POSIX ();
 use Storable qw( fd_retrieve );
@@ -7011,6 +7123,8 @@ use constant DEFAULT_SNAPSHOT_SUBDIR => 'var/db/sigtree';
 use constant DEFAULT_CURRENT => 'daily.0';
 use constant DEFAULT_PREVIOUS => 'daily.1';
 use constant LIST_LIMIT => 25;               # lines per host per category
+use constant DIFF => '/usr/bin/diff';
+use constant DAY => 86400;
 
 # Spec attribute names that can be compared, and the FileAttr field each
 # one is stored in.
@@ -7019,48 +7133,38 @@ our %ATTR_FIELD;
 sub _attr_fields {
     %ATTR_FIELD = (type => 'TYPE', shadigest => 'SHADIGEST', mode => 'MODE',
 		   uid => 'UID', gid => 'GID', link => 'LINK', size => 'SIZE',
-		   flags => 'FLAGS', nlink => 'NLINK') unless (%ATTR_FIELD);
+		   flags => 'FLAGS', nlink => 'NLINK', rdev => 'RDEV') unless (%ATTR_FIELD);
 }
 
 # Entry point. Returns the exit status: 0 if nothing was reported, 1 if
 # anything was.
 sub run {
-    my ($config_file, $verbose, $osname) = @_;
+    my ($config_file, $verbose, $osname, @args) = @_;
     my (@out, $reported);
 
     _attr_fields ();
     my $cf = _parse_config ($config_file);
+    return _details ($cf, $verbose, $osname, @args) if (@args);
 
-    main::require_module ('Signify') or
-	die "Could not require Signify. $@\n";
-    eval { Signify->VERSION ('1.4'); 1 } or
-	die "Signify.pm " . (Signify->VERSION // 'without a version') .
-	    " is too old, 1.4 or later is required.\n";
+    _require_signify ();
 
     # Specs are only ever loaded as _sigtree.
     my ($uid, $gid) = ((getpwnam ('_sigtree'))[2], (getgrnam ('_sigtree'))[2]);
-    if (grep { $_->{PEER} } @{$cf->{HOSTS}}) {
-	die "verify_hosts needs the _sigtree user and group to compare hosts.\n"
+    # Hosts whose specs are needed beyond the peer comparison.
+    my %chroot_host = map { $_ => 1 } (map { @{$_->{HOSTS}} } @{$cf->{CHROOTS}}),
+	@{$cf->{REFERENCE_HOSTS}};
+    if ((grep { $_->{PEER} } @{$cf->{HOSTS}}) || %chroot_host) {
+	die "verify_hosts needs the _sigtree user and group to compare hosts or check chroots.\n"
 	    unless (defined ($uid) && defined ($gid));
-	die "verify_hosts must be run as root to compare hosts.\n" if ($> != 0);
+	die "verify_hosts must be run as root to compare hosts or check chroots.\n" if ($> != 0);
     }
 
-    if ($osname eq 'openbsd') {
-	main::pledge ('rpath', 'wpath', 'cpath', 'proc', 'exec', 'id', 'unveil') ||
-	    die "Cannot pledge promises. $!\n";
-	main::unveil ($cf->{SPEC_ROOT}, 'r');
-	main::unveil ($cf->{SNAPSHOT_ROOT}, 'r') if (defined ($cf->{SNAPSHOT_ROOT}));
-	foreach my $host (@{$cf->{HOSTS}}) {
-	    main::unveil ($host->{KEY_COPY}, 'r') if (defined ($host->{KEY_COPY}));
-	}
-	{ no warnings 'once'; main::unveil ($Signify::SIGNIFY_PATH, 'rx'); }
-	main::unveil ('/tmp', 'rwc');
-	main::unveil ();
-    }
+    _restrict ($cf, $osname, 0);
 
     my $temp_dir = main::mkdtemp ('/tmp/sigtree.XXXXXXXX') or
 	die "Could not create a temp dir: $!\n";
     my %verified;  # host => [ [name, data], ... ] for peers whose specs all verified
+    my %chroot_specs;  # the same, for hosts with a chroot to check
     my %hash_cache;
     my $ok = eval {
 	my $snapshots = _list_snapshots ($cf);
@@ -7072,17 +7176,22 @@ sub run {
 	    if (defined ($host->{KEY})) {
 		my ($sig_lines, $specs, $all_good) = _check_signatures ($cf, $host, $temp_dir);
 		push (@lines, @{$sig_lines});
-		if ($host->{PEER}) {
-		    if ($all_good) {
-			$verified{$host->{NAME}} = $specs;
-		    }
-		    else {
-			push (@lines, "not compared with peers: not every spec has a good signature");
-		    }
+		if ($all_good) {
+		    $verified{$host->{NAME}} = $specs if ($host->{PEER});
+		    $chroot_specs{$host->{NAME}} = $specs if ($chroot_host{$host->{NAME}});
+		}
+		else {
+		    push (@lines, "not compared with peers: not every spec has a good signature")
+			if ($host->{PEER});
+		    push (@lines, "chroots and reference files not checked: not every spec has a good signature")
+			if ($chroot_host{$host->{NAME}});
 		}
 	    }
-	    elsif ($host->{PEER}) {
-		push (@lines, "not compared with peers: no signify key in the config");
+	    else {
+		push (@lines, "not compared with peers: no signify key in the config")
+		    if ($host->{PEER});
+		push (@lines, "chroots and reference files not checked: no signify key in the config")
+		    if ($chroot_host{$host->{NAME}});
 	    }
 	    if (@lines) {
 		push (@out, "$host->{NAME}:", map { "   $_" } @lines);
@@ -7101,6 +7210,30 @@ sub run {
 	elsif ($verbose && keys (%verified) >= 2) {
 	    push (@out, "Comparison of peers (" . join (', ', sort keys %verified) . "): OK");
 	}
+	if (@{$cf->{REFERENCE}}) {
+	    my $ref_digests = _reference_digests ($cf);
+	    my @ref_lines = _in_child ($uid, $gid, $osname,
+				       sub { _check_references ($cf, \%chroot_specs, $ref_digests) });
+	    if (@ref_lines) {
+		push (@out, "Reference files (" . join (', ', map { _esc ($_) } @{$cf->{REFERENCE}}) . "):",
+		      map { "   $_" } @ref_lines);
+		$reported = 1;
+	    }
+	    elsif ($verbose) {
+		push (@out, "Reference files: OK");
+	    }
+	}
+	if (@{$cf->{CHROOTS}} && %chroot_specs) {
+	    my @chroot_lines = _in_child ($uid, $gid, $osname,
+					  sub { _check_chroots ($cf, \%chroot_specs) });
+	    if (@chroot_lines) {
+		push (@out, @chroot_lines);
+		$reported = 1;
+	    }
+	    elsif ($verbose) {
+		push (@out, "Chroots (" . join (', ', map { $_->{ROOT} } @{$cf->{CHROOTS}}) . "): OK");
+	    }
+	}
 	1;
     };
     my $error = $@;
@@ -7111,11 +7244,50 @@ sub run {
     return ($reported ? 1 : 0);
 }
 
+sub _require_signify {
+    main::require_module ('Signify') or
+	die "Could not require Signify. $@\n";
+    eval { Signify->VERSION ('1.4'); 1 } or
+	die "Signify.pm " . (Signify->VERSION // 'without a version') .
+	    " is too old, 1.4 or later is required.\n";
+}
+
+# pledge and unveil on OpenBSD: read the two roots (and any key copies),
+# run signify (and diff, for the detail query), and use a private dir in
+# /tmp. A child that loads specs drops to _sigtree and pledges only stdio.
+sub _restrict {
+    my ($cf, $osname, $need_diff) = @_;
+
+    return unless ($osname eq 'openbsd');
+    main::pledge ('rpath', 'wpath', 'cpath', 'proc', 'exec', 'id', 'unveil') ||
+	die "Cannot pledge promises. $!\n";
+    main::unveil ($cf->{SPEC_ROOT}, 'r');
+    main::unveil ($cf->{SNAPSHOT_ROOT}, 'r') if (defined ($cf->{SNAPSHOT_ROOT}));
+    foreach my $host (@{$cf->{HOSTS}}) {
+	main::unveil ($host->{KEY_COPY}, 'r') if (defined ($host->{KEY_COPY}));
+    }
+    main::unveil ($_, 'r') foreach (@{$cf->{REFERENCE}});
+    { no warnings 'once'; main::unveil ($Signify::SIGNIFY_PATH, 'rx'); }
+    main::unveil (DIFF, 'rx') if ($need_diff);
+    main::unveil ('/tmp', 'rwc');
+    main::unveil ();
+}
+
+# Escape what a host wrote (file names, paths, link targets, file
+# contents) before it is printed: control characters, including newline,
+# as \xNN, so it cannot start a line or reach the terminal raw.
+sub _esc {
+    my ($text) = @_;
+    return '' unless (defined ($text));
+    $text =~ s/([\x00-\x1f\x7f])/sprintf ('\\x%02x', ord ($1))/ge;
+    return $text;
+}
+
 # Parse the verify_hosts config. "field: value" lines, # comments. Host
 # settings (key, key-copy, peer) follow their "host:" line.
 sub _parse_config {
     my ($config_file) = @_;
-    my (%cf, $current, $line_no);
+    my (%cf, $current, $chroot, $line_no);
 
     open (my $fh, '<', $config_file) ||
 	die "Cannot open config file. $!. $config_file\n";
@@ -7157,6 +7329,11 @@ sub _parse_config {
 		unless ($value =~ /^[\w-]+\.\d+\z/);
 	    $cf{$which} = $value;
 	}
+	elsif ($field eq 'previous-age') {
+	    die "\"previous-age:\" must be a number of days, line $line_no. $config_file\nLine: $raw"
+		unless ($value =~ /^\d+\z/ && $value > 0);
+	    $cf{PREVIOUS_AGE} = $value;
+	}
 	elsif ($field eq 'max-age') {
 	    die "\"max-age:\" must be a number of hours, line $line_no. $config_file\nLine: $raw"
 		unless ($value =~ /^\d+\z/ && $value > 0);
@@ -7184,6 +7361,55 @@ sub _parse_config {
 	    die "Second \"host: $value\", line $line_no. $config_file\nLine: $raw" if ($seen{$value}++);
 	    $current = { NAME => $value, PEER => 0 };
 	    push (@{$cf{HOSTS}}, $current);
+	}
+	elsif ($field eq 'reference') {
+	    foreach my $path (split (/\s+/, $value)) {
+		die "\"reference:\" paths must be absolute, without \"..\" or patterns, line $line_no. $config_file\nLine: $raw"
+		    unless ($path =~ m{^/[^/]} && $path !~ m{(?:^|/)\.\.(?:/|\z)} && $path !~ /[*?]/);
+		push (@{$cf{REFERENCE}}, $path);
+	    }
+	}
+	elsif ($field eq 'reference-hosts') {
+	    push (@{$cf{REFERENCE_HOSTS}}, grep { $_ ne '' } split (/[\s,]+/, $value));
+	}
+	elsif ($field eq 'system-root') {
+	    die "\"system-root:\" must be an absolute path, line $line_no. $config_file\nLine: $raw"
+		unless ($value =~ m{^/} && $value !~ m{(?:^|/)\.\.(?:/|\z)});
+	    $value =~ s{/+\z}{} unless ($value eq '/');
+	    $cf{SYSTEM_ROOT} = $value;
+	}
+	elsif ($field eq 'chroot') {
+	    die "\"chroot:\" must be an absolute path other than /, line $line_no. $config_file\nLine: $raw"
+		unless ($value =~ m{^/[^/]} && $value !~ m{(?:^|/)\.\.(?:/|\z)});
+	    $value =~ s{/+\z}{};
+	    die "Second \"chroot: $value\", line $line_no. $config_file\nLine: $raw"
+		if (grep { $_->{ROOT} eq $value } @{$cf{CHROOTS} || []});
+	    $chroot = { ROOT => $value, HOSTS => [], MIRROR => [], MIRROR_EXCEPT => [],
+			ALLOW_ONLY => [], ALLOW_EXTRA => [], RULES_EXCEPT => [], COMPARE_EXCEPT => [] };
+	    push (@{$cf{CHROOTS}}, $chroot);
+	}
+	elsif ($field =~ /^(chroot-hosts|mirror|mirror-except|allow-only|allow-extra|rules-except|compare-except)\z/) {
+	    die "\"$field:\" before any \"chroot:\", line $line_no. $config_file\nLine: $raw"
+		unless (defined ($chroot));
+	    if ($field eq 'chroot-hosts') {
+		push (@{$chroot->{HOSTS}}, grep { $_ ne '' } split (/[\s,]+/, $value));
+	    }
+	    else {
+		(my $key = uc ($field)) =~ s/-/_/g;
+		foreach my $rel (split (/\s+/, $value)) {
+		    die "\"$field:\" paths are relative to the chroot and without \"..\", line $line_no. $config_file\nLine: $raw"
+			if ($rel =~ m{^/} || $rel =~ m{(?:^|/)\.\.(?:/|\z)});
+		    $rel =~ s{/+\z}{};
+		    if ($key eq 'MIRROR') {
+			die "\"mirror:\" takes directories or files, not patterns, line $line_no. $config_file\nLine: $raw"
+			    if ($rel =~ /[*?]/);
+			push (@{$chroot->{MIRROR}}, $rel);
+		    }
+		    else {
+			push (@{$chroot->{$key}}, [$rel, _glob_to_regex ("$chroot->{ROOT}/$rel")]);
+		    }
+		}
+	    }
 	}
 	elsif ($field eq 'key' || $field eq 'key-copy' || $field eq 'peer') {
 	    die "\"$field:\" before any \"host:\", line $line_no. $config_file\nLine: $raw"
@@ -7221,10 +7447,35 @@ sub _parse_config {
     $cf{MAX_AGE} //= DEFAULT_MAX_AGE;
     $cf{ATTRIBUTES} //= [split (/,/, DEFAULT_ATTRIBUTES)];
     $cf{SNAPSHOT_SUBDIR} //= DEFAULT_SNAPSHOT_SUBDIR;
+    die "\"previous-snapshot:\" and \"previous-age:\" cannot both be used. $config_file\n"
+	if (defined ($cf{PREVIOUS}) && defined ($cf{PREVIOUS_AGE}));
     $cf{CURRENT} //= DEFAULT_CURRENT;
-    $cf{PREVIOUS} //= DEFAULT_PREVIOUS;
+    $cf{PREVIOUS} //= DEFAULT_PREVIOUS unless (defined ($cf{PREVIOUS_AGE}));
     if ((grep { $_->{PEER} } @{$cf{HOSTS}}) && !@{$cf{COMMON}}) {
 	die "Peers are marked but there is no \"common:\" path. $config_file\n";
+    }
+    $cf{SYSTEM_ROOT} //= '/';
+    $cf{CHROOTS} //= [];
+    $cf{REFERENCE} //= [];
+    if (@{$cf{REFERENCE}}) {
+	$cf{REFERENCE_HOSTS} //= [ map { $_->{NAME} } @{$cf{HOSTS}} ];
+	foreach my $name (@{$cf{REFERENCE_HOSTS}}) {
+	    die "\"reference-hosts:\" names \"" . _esc ($name) . "\", which has no \"host:\" line. $config_file\n"
+		unless (grep { $_->{NAME} eq $name } @{$cf{HOSTS}});
+	}
+    }
+    else {
+	die "\"reference-hosts:\" without \"reference:\". $config_file\n" if ($cf{REFERENCE_HOSTS});
+	$cf{REFERENCE_HOSTS} = [];
+    }
+    foreach my $chroot (@{$cf{CHROOTS}}) {
+	die "\"chroot: $chroot->{ROOT}\" has no \"chroot-hosts:\". $config_file\n"
+	    unless (@{$chroot->{HOSTS}});
+	foreach my $name (@{$chroot->{HOSTS}}) {
+	    die "\"chroot-hosts:\" for $chroot->{ROOT} names \"" . _esc ($name) .
+		"\", which has no \"host:\" line. $config_file\n"
+		unless (grep { $_->{NAME} eq $name } @{$cf{HOSTS}});
+	}
     }
     return \%cf;
 }
@@ -7333,50 +7584,98 @@ sub _same_file {
     return (defined ($ha) && defined ($hb) && $ha eq $hb);
 }
 
-# 2 and 3. Spec files changed between the previous and current snapshots,
-# and changed ones that match an older snapshot instead.
+# The current and previous snapshots, and every snapshot by time: the
+# window (previous to current, oldest first) and the history before it.
+# previous-age picks the newest snapshot at least that many days older
+# than the current one. Returns (current, previous, window, history) or
+# an error message.
+sub _select_window {
+    my ($cf, $snapshots) = @_;
+    my %snap = map { $_->{NAME} => $_ } @{$snapshots};
+
+    my $cur = $snap{$cf->{CURRENT}} or
+	return ("snapshot $cf->{CURRENT} not found under $cf->{SNAPSHOT_ROOT}");
+    my $prev;
+    if (defined ($cf->{PREVIOUS_AGE})) {
+	my $limit = $cur->{TIME} - $cf->{PREVIOUS_AGE} * DAY;
+	($prev) = grep { $_->{TIME} <= $limit } @{$snapshots};     # newest first
+	return ("no snapshot is $cf->{PREVIOUS_AGE} days older than $cur->{NAME}") unless ($prev);
+    }
+    else {
+	$prev = $snap{$cf->{PREVIOUS}} or
+	    return ("snapshot $cf->{PREVIOUS} not found under $cf->{SNAPSHOT_ROOT}");
+    }
+    return ("snapshot $prev->{NAME} is not older than $cur->{NAME}")
+	unless ($prev->{TIME} < $cur->{TIME});
+    my @by_time = reverse @{$snapshots};                           # oldest first
+    my @window = grep { $_->{TIME} >= $prev->{TIME} && $_->{TIME} <= $cur->{TIME} } @by_time;
+    my @history = grep { $_->{TIME} < $prev->{TIME} } @by_time;
+    return (undef, $cur, $prev, \@window, \@history);
+}
+
+sub _snapshot_dir {
+    my ($cf, $snap, $host) = @_;
+    return "$cf->{SNAPSHOT_ROOT}/$snap->{NAME}/$host/$cf->{SNAPSHOT_SUBDIR}";
+}
+
+# 2 and 3. Spec files changed between the previous and current
+# snapshots; and any spec that, anywhere in the window, goes back to a
+# version it had before (an older signed spec put back). Specs record
+# mtimes and ctimes, so an update cannot legitimately recreate an earlier
+# copy. Walking every snapshot in the window, not just its two ends,
+# catches a spec put back to the version that was current before the
+# latest update, which the two ends would show as unchanged.
 sub _check_snapshots {
     my ($cf, $host, $snapshots, $cache) = @_;
-    my (@lines, %snap);
+    my (@lines, %files);
 
-    %snap = map { $_->{NAME} => $_ } @{$snapshots};
-    my $cur = $snap{$cf->{CURRENT}};
-    my $prev = $snap{$cf->{PREVIOUS}};
-    unless ($cur && $prev) {
-	return ("snapshot $cf->{CURRENT} or $cf->{PREVIOUS} not found under $cf->{SNAPSHOT_ROOT}");
-    }
-    my $dir = sub { "$cf->{SNAPSHOT_ROOT}/$_[0]{NAME}/$host->{NAME}/$cf->{SNAPSHOT_SUBDIR}" };
-    my $cur_dir = $dir->($cur);
+    my ($error, $cur, $prev, $window, $history) = _select_window ($cf, $snapshots);
+    return ($error) if (defined ($error));
+    my $cur_dir = _snapshot_dir ($cf, $cur, $host->{NAME});
     unless (-d "$cur_dir/specs") {
 	return ("no sigtree specs in snapshot $cur->{NAME} ($cur_dir/specs)");
     }
-    my $cur_files = _spec_files ($cur_dir, $host->{NAME});
-    my $prev_files = _spec_files ($dir->($prev), $host->{NAME});
-    my @older = grep { $_->{TIME} < $prev->{TIME} } @{$snapshots};
-    my %older_files;
+    foreach my $snap (@{$history}, @{$window}) {
+	$files{$snap->{NAME}} = _spec_files (_snapshot_dir ($cf, $snap, $host->{NAME}), $host->{NAME});
+    }
+    my ($cur_files, $prev_files) = ($files{$cur->{NAME}}, $files{$prev->{NAME}});
 
     my (@changed, @added, @removed, @rolled_back);
     foreach my $name (sort keys %{$cur_files}) {
 	if (!$prev_files->{$name}) {
-	    push (@added, $name);
-	    next;
+	    push (@added, _esc ($name));
 	}
-	next if (_same_file ($cur_files->{$name}, $prev_files->{$name}, $cache));
-	push (@changed, $name);
-	# A changed spec that is byte for byte an older one has been put
-	# back: specs record mtimes and ctimes, so an update cannot
-	# legitimately recreate an earlier copy.
-	foreach my $old (@older) {
-	    $older_files{$old->{NAME}} //= _spec_files ($dir->($old), $host->{NAME});
-	    my $file = $older_files{$old->{NAME}}{$name} or next;
-	    if (_same_file ($cur_files->{$name}, $file, $cache)) {
-		push (@rolled_back, "$name in $cur->{NAME} is identical to the copy in $old->{NAME} (" .
-		      _when ($old->{TIME}) . "), not to $prev->{NAME}'s: an older spec has been put back");
-		last;
+	elsif (!_same_file ($cur_files->{$name}, $prev_files->{$name}, $cache)) {
+	    push (@changed, _esc ($name));
+	}
+    }
+    @removed = map { _esc ($_) } grep { !$cur_files->{$_} } sort keys %{$prev_files};
+
+    my %in_window = map { $_->{NAME} => 1 } @{$window};
+    my %names;
+    foreach my $snap (@{$window}) {
+	$names{$_} = 1 foreach (keys %{$files{$snap->{NAME}}});
+    }
+    foreach my $name (sort keys %names) {
+	my (@versions, $current);   # versions: [file, snapshot] seen so far
+	foreach my $snap (@{$history}, @{$window}) {
+	    my $file = $files{$snap->{NAME}}{$name} or next;
+	    next if ($current && _same_file ($file, $current->[0], $cache));
+	    my ($earlier) = grep { (!$current || $_ != $current) && _same_file ($file, $_->[0], $cache) } @versions;
+	    if ($earlier && $in_window{$snap->{NAME}} && $snap != $prev) {
+		push (@rolled_back, _esc ($name) . " in $snap->{NAME} (" . _when ($snap->{TIME}) .
+		      ") is identical to the copy in $earlier->[1]{NAME} (" . _when ($earlier->[1]{TIME}) .
+		      "), after a different version in $current->[1]{NAME}: an older spec has been put back");
+	    }
+	    if ($earlier) {
+		$current = $earlier;
+	    }
+	    else {
+		$current = [$file, $snap];
+		push (@versions, $current);
 	    }
 	}
     }
-    @removed = grep { !$cur_files->{$_} } sort keys %{$prev_files};
 
     my $span = "between $prev->{NAME} (" . _when ($prev->{TIME}) . ") and $cur->{NAME} (" .
 	_when ($cur->{TIME}) . ")";
@@ -7407,12 +7706,7 @@ sub _check_signatures {
     my $name = $host->{NAME};
     my $all_good = 1;
 
-    my $key_file = "$temp_dir/$name.pub";
-    sysopen (my $kfh, $key_file, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) ||
-	die "Could not create $key_file: $!\n";
-    print $kfh "untrusted comment: sigtree verify_hosts key for $name\n$host->{KEY}\n";
-    close ($kfh) || die "Could not write $key_file: $!\n";
-
+    my $key_file = _write_key ($host, $temp_dir);
     if (defined ($host->{KEY_COPY})) {
 	if (open (my $cfh, '<', $host->{KEY_COPY})) {
 	    my @key_lines = <$cfh>;
@@ -7432,37 +7726,67 @@ sub _check_signatures {
 	push (@lines, "no spec-of-specs $cf->{SPEC_ROOT}/specs/$name.spec");
 	$all_good = 0;
     }
-    my $n = 0;
     foreach my $spec (sort keys %{$files}) {
-	my $path = $files->{$spec}[0];
-	my $copy = "$temp_dir/" . ++$n;
-	my $data = _copy_file ($path, $copy);
-	my $sig = _copy_file ("$path.sig", "$copy.sig");
-	if (!defined ($data)) {
-	    push (@lines, "cannot read $path");
-	    $all_good = 0;
-	    next;
-	}
-	if (!defined ($sig)) {
-	    push (@lines, "no signature for $path");
-	    $all_good = 0;
-	    unlink ($copy);
-	    next;
-	}
-	if (Signify::verify ($copy, { public_key_path => $key_file,
-				      skip_signify_check => 1 })) {
-	    push (@specs, [$spec, $data]) unless ($spec eq "$name.spec");
-	}
-	else {
-	    my @errors = Signify::signify_error ();
-	    my $reason = $errors[0] // 'unknown error';
-	    chomp ($reason);
-	    push (@lines, "BAD SIGNATURE on $path ($reason)");
+	my ($data, $problem) = _verify_copy ($files->{$spec}[0], $temp_dir, $key_file);
+	if (defined ($problem)) {
+	    push (@lines, $problem);
 	    $all_good = 0;
 	}
-	unlink ($copy, "$copy.sig");
+	elsif ($spec ne "$name.spec") {
+	    push (@specs, [$spec, $data]);
+	}
     }
     return (\@lines, \@specs, $all_good);
+}
+
+# Write the host's pinned key as a signify public key file in the
+# private temp dir, once, and return its path.
+sub _write_key {
+    my ($host, $temp_dir) = @_;
+    my $key_file = "$temp_dir/$host->{NAME}.pub";
+
+    return $key_file if (-e $key_file);
+    sysopen (my $kfh, $key_file, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) ||
+	die "Could not create $key_file: $!\n";
+    print $kfh "untrusted comment: sigtree verify_hosts key for $host->{NAME}\n$host->{KEY}\n";
+    close ($kfh) || die "Could not write $key_file: $!\n";
+    return $key_file;
+}
+
+# Copy a spec and its .sig into the private temp dir and verify the copy,
+# so what is verified is what is later loaded. Returns the data, or undef
+# and a line saying what was wrong.
+sub _verify_copy {
+    my ($path, $temp_dir, $key_file) = @_;
+    state $copy_count = 0;
+    my $copy = "$temp_dir/spec." . ++$copy_count;
+    my ($data, $problem);
+
+    $data = _copy_file ($path, $copy);
+    my $sig = _copy_file ("$path.sig", "$copy.sig");
+    if (!defined ($data)) {
+	$problem = "cannot read " . _esc ($path);
+    }
+    elsif (!defined ($sig)) {
+	$problem = "no signature for " . _esc ($path);
+    }
+    elsif ($sig !~ /\Auntrusted comment: /) {
+	# A GPG signature as sigtree writes one: the base64 lines of an
+	# armored signature, ending in the "=" checksum line.
+	my $gpg = ($sig =~ /\A-----BEGIN PGP SIGNATURE-----/ ||
+		   $sig =~ m{\A[A-Za-z0-9+/=\s]+\n=[A-Za-z0-9+/]{4}\s*\z});
+	$problem = "cannot verify " . _esc ($path) . ": its .sig is not a signify signature" .
+	    ($gpg ? " but a GPG one (signed before this host moved to signify?)" : "");
+    }
+    elsif (!Signify::verify ($copy, { public_key_path => $key_file,
+				      skip_signify_check => 1 })) {
+	my @errors = Signify::signify_error ();
+	my $reason = $errors[0] // 'unknown error';
+	chomp ($reason);
+	$problem = "BAD SIGNATURE on " . _esc ($path) . " (" . _esc ($reason) . ")";
+    }
+    unlink ($copy, "$copy.sig");
+    return (defined ($problem) ? (undef, $problem) : ($data, undef));
 }
 
 # Copy a regular file (not through a symlink) and return its contents,
@@ -7490,13 +7814,20 @@ sub _copy_file {
     return $data;
 }
 
-# 5. Compare the peers' verified specs. The specs are loaded in a child
-# that has dropped to _sigtree (and on OpenBSD pledged only stdio), and
-# its report comes back through a pipe.
+# 5. Compare the peers' verified specs, in a child running as _sigtree.
 sub _compare_peers {
     my ($cf, $verified, $uid, $gid, $osname) = @_;
 
     return () if (keys (%{$verified}) < 2);
+    return _in_child ($uid, $gid, $osname, sub { _compare_specs ($cf, $verified) });
+}
+
+# Run $code in a child that has dropped to _sigtree and, on OpenBSD,
+# pledged only stdio, and return the lines it returns, through a pipe.
+# Specs are loaded only in such a child.
+sub _in_child {
+    my ($uid, $gid, $osname, $code) = @_;
+
     pipe (my $reader, my $writer) || die "pipe failed: $!\n";
     my $pid = fork ();
     die "fork failed: $!\n" unless (defined ($pid));
@@ -7510,9 +7841,9 @@ sub _compare_peers {
 	    if ($osname eq 'openbsd') {
 		main::pledge () || die "pledge: $!\n";
 	    }
-	    join ('', map { "$_\n" } _compare_specs ($cf, $verified));
+	    join ('', map { "$_\n" } $code->());
 	};
-	$text = "ERROR: comparison failed: $@" unless (defined ($text));
+	$text = "ERROR: " . _esc ($@) . "\n" unless (defined ($text));
 	while (length ($text)) {
 	    my $written = syswrite ($writer, $text);
 	    last unless ($written);
@@ -7526,7 +7857,7 @@ sub _compare_peers {
     waitpid ($pid, 0);
     my $status = $?;
     chomp (@lines);
-    push (@lines, "ERROR: comparison process ended with status $status") if ($status != 0);
+    push (@lines, "ERROR: the process loading specs ended with status $status") if ($status != 0);
     return @lines;
 }
 
@@ -7549,7 +7880,7 @@ sub _compare_specs {
 	    my $obj = eval { fd_retrieve ($mem) };
 	    close ($mem);
 	    if (!ref ($obj) || !defined ($obj->{TREE}) || ref ($obj->{FILEATTR}) ne 'HASH') {
-		push (@lines, "$host: cannot load spec $name");
+		push (@lines, "$host: cannot load spec " . _esc ($name));
 		next;
 	    }
 	    my $tree = $obj->{TREE};
@@ -7578,11 +7909,11 @@ sub _compare_specs {
 	my @present = grep { $have->{$_} } @covering;
 	my @absent = grep { !$have->{$_} } @covering;
 	if (@present == 1 && @covering >= 3) {
-	    push (@{$only{$present[0]}}, $path);
+	    push (@{$only{$present[0]}}, _esc ($path));
 	    next;
 	}
 	if (@present * 2 > @covering) {
-	    push (@{$missing{$_}}, $path) foreach (@absent);
+	    push (@{$missing{$_}}, _esc ($path)) foreach (@absent);
 	}
 	next if (@present < 2);
 	my %count;
@@ -7594,13 +7925,13 @@ sub _compare_specs {
 	my ($top) = sort { $count{$b} <=> $count{$a} } keys %count;
 	next if (keys (%count) == 1);
 	if ($count{$top} * 2 <= @present) {
-	    push (@no_majority, "$path: no majority among " . join (', ', @present));
+	    push (@no_majority, _esc ($path));
 	    next;
 	}
 	my ($ref_host) = grep { $value{$_} eq $top } @present;
 	foreach my $host (grep { $value{$_} ne $top } @present) {
 	    my @which = grep { ($have->{$host}[$_] // '-') ne ($have->{$ref_host}[$_] // '-') } 0 .. $#attrs;
-	    push (@{$differs{$host}}, "$path (" . join (',', @attrs[@which]) . ")");
+	    push (@{$differs{$host}}, _esc ($path) . " (" . join (',', @attrs[@which]) . ")");
 	}
     }
 
@@ -7610,9 +7941,596 @@ sub _compare_specs {
 	push (@lines, _limited ("$host lacks", $missing{$host})) if ($missing{$host});
 	push (@lines, _limited ("only $host has", $only{$host})) if ($only{$host});
     }
-    push (@lines, _limited ("no majority", [ map { (split (/: /, $_))[0] } @no_majority ]))
+    push (@lines, _limited ("no majority among the peers", \@no_majority))
 	if (@no_majority);
     return @lines;
+}
+
+# The detail query, on demand: "verify_hosts <host>" shows what changed
+# in each of the host's specs that differ between the previous and
+# current snapshots; "verify_hosts <host> <spec>" does it for one spec;
+# "verify_hosts <host> /path" for one file, and if the snapshots hold
+# backups of both versions of it (found by their digests), shows a diff.
+# Both versions of each spec are verified with the host's pinned key and
+# loaded only as _sigtree.
+sub _details {
+    my ($cf, $verbose, $osname, $host_name, $target, @extra) = @_;
+
+    die "Usage: sigtree.pl [-c config] verify_hosts [host [spec | /path]]\n" if (@extra);
+    my ($host) = grep { $_->{NAME} eq $host_name } @{$cf->{HOSTS}};
+    die "Host \"" . _esc ($host_name) . "\" is not in the config.\n" unless ($host);
+    my $name = $host->{NAME};
+    die "Host $name has no signify key in the config; specs are loaded only after their signatures verify.\n"
+	unless (defined ($host->{KEY}));
+    die "The detail query needs \"snapshot-root:\" in the config.\n"
+	unless (defined ($cf->{SNAPSHOT_ROOT}));
+    my $path_mode = (defined ($target) && $target =~ m{^/});
+    if ($path_mode) {
+	die "Invalid path \"" . _esc ($target) . "\".\n"
+	    if ($target =~ m{(?:^|/)\.\.(?:/|\z)} || $target =~ /[\x00-\x1f\x7f]/ || $target eq '/');
+	$target =~ s{/+\z}{};
+    }
+    elsif (defined ($target)) {
+	die "Invalid spec name \"" . _esc ($target) . "\".\n"
+	    unless ($target =~ m{^(?:[\w-][\w.-]*/)?[\w-][\w.-]*\z});
+    }
+    _require_signify ();
+    my ($uid, $gid) = ((getpwnam ('_sigtree'))[2], (getgrnam ('_sigtree'))[2]);
+    die "The detail query needs the _sigtree user and group.\n"
+	unless (defined ($uid) && defined ($gid));
+    die "The detail query must be run as root.\n" if ($> != 0);
+    _restrict ($cf, $osname, $path_mode);
+
+    my $temp_dir = main::mkdtemp ('/tmp/sigtree.XXXXXXXX') or
+	die "Could not create a temp dir: $!\n";
+    my @out;
+    my $ok = eval {
+	my $snapshots = _list_snapshots ($cf);
+	my ($error, $cur, $prev) = _select_window ($cf, $snapshots);
+	die "$error\n" if (defined ($error));
+	my %cache;
+	my $cur_files = _spec_files (_snapshot_dir ($cf, $cur, $name), $name);
+	my $prev_files = _spec_files (_snapshot_dir ($cf, $prev, $name), $name);
+
+	my @names;
+	if ($path_mode) {
+	    # Every tree spec whose tree could hold the path.
+	    my $dir = $target;
+	    while ($dir ne '/' && $dir ne '.' && $dir ne '') {
+		my $spec = "$name/" . main::path_to_spec ($dir);
+		push (@names, $spec) if ($cur_files->{$spec} || $prev_files->{$spec});
+		$dir = File::Basename::dirname ($dir);
+	    }
+	    die "No spec of $name in $cur->{NAME} or $prev->{NAME} covers " . _esc ($target) . ".\n"
+		unless (@names);
+	}
+	elsif (defined ($target)) {
+	    my $spec = ($cur_files->{$target} || $prev_files->{$target}) ? $target : "$name/$target";
+	    die "No spec \"" . _esc ($target) . "\" for $name in $cur->{NAME} or $prev->{NAME}.\n"
+		unless ($cur_files->{$spec} || $prev_files->{$spec});
+	    @names = ($spec);
+	}
+	else {
+	    my %all = (%{$cur_files}, %{$prev_files});
+	    @names = grep { !$cur_files->{$_} || !$prev_files->{$_} ||
+			    !_same_file ($cur_files->{$_}, $prev_files->{$_}, \%cache) } sort keys %all;
+	}
+
+	my $key_file = _write_key ($host, $temp_dir);
+	# A spec is shown only if every version of it present verifies; the
+	# others are listed with the reason, and the rest are still shown.
+	my (@pairs, @problems);
+	foreach my $spec (@names) {
+	    my (@versions, @spec_problems);
+	    foreach my $files ($prev_files, $cur_files) {
+		my $data;
+		if ($files->{$spec}) {
+		    ($data, my $problem) = _verify_copy ($files->{$spec}[0], $temp_dir, $key_file);
+		    push (@spec_problems, $problem) if (defined ($problem));
+		}
+		push (@versions, $data);
+	    }
+	    if (@spec_problems) {
+		push (@problems, @spec_problems, "   so changes in " . _esc ($spec) . " are not shown");
+	    }
+	    else {
+		push (@pairs, [$spec, @versions]);
+	    }
+	}
+
+	push (@out, "$name: $prev->{NAME} (" . _when ($prev->{TIME}) . ") to $cur->{NAME} (" .
+	      _when ($cur->{TIME}) . ")");
+	push (@out, map { "   $_" } @problems);
+	if (!@pairs && !@problems) {
+	    push (@out, "   no spec changed");
+	}
+	my @lines = @pairs ? _in_child ($uid, $gid, $osname,
+					sub { _spec_details (\@pairs, $path_mode ? $target : undef) }) : ();
+	my $digests;
+	if ($path_mode && @lines && $lines[0] =~ /^\x01/) {
+	    $digests = shift (@lines);
+	}
+	push (@out, map { "   $_" } @lines);
+	push (@out, _backup_diff ($cf, $name, $target, $digests, $snapshots, \%cache))
+	    if ($path_mode && defined ($digests));
+	push (@out, _reference_diff ($cf, $name, $target, $digests, $snapshots, \%cache))
+	    if ($path_mode && grep { $_ eq $target } @{$cf->{REFERENCE}});
+	1;
+    };
+    my $error = $@;
+    _remove_dir ($temp_dir);
+    die $error unless ($ok);
+    print "$_\n" foreach (@out);
+    return 0;
+}
+
+# FileAttr fields shown by the detail query, in order.
+sub _detail_fields {
+    return qw(TYPE MODE UID GID SIZE NLINK MTIME CTIME SHADIGEST LINK LINKTARGET_TYPE FLAGS RDEV);
+}
+
+sub _show_value {
+    my ($field, $value) = @_;
+    return '(none)' unless (defined ($value));
+    return sprintf ('%o', $value) if ($field eq 'MODE' && $value =~ /^\d+\z/);
+    return _when ($value) if (($field eq 'MTIME' || $field eq 'CTIME') && $value =~ /^\d+\z/);
+    return _esc ($value);
+}
+
+# The FileAttr entries of a loaded spec, by full path.
+sub _entries {
+    my ($obj) = @_;
+    my %entries;
+    my $tree = $obj->{TREE};
+    foreach my $key (keys %{$obj->{FILEATTR}}) {
+	my $full = ($key eq $tree) ? $tree : ($tree eq '/' ? "/$key" : "$tree/$key");
+	$entries{$full} = $obj->{FILEATTR}{$key} if (ref ($obj->{FILEATTR}{$key}));
+    }
+    return \%entries;
+}
+
+sub _load_spec {
+    my ($data) = @_;
+    return undef unless (defined ($data));
+    open (my $mem, '<', \$data) || return undef;
+    my $obj = eval { fd_retrieve ($mem) };
+    close ($mem);
+    return undef unless (ref ($obj) && defined ($obj->{TREE}) && ref ($obj->{FILEATTR}) eq 'HASH');
+    return $obj;
+}
+
+# Runs in the _sigtree child. For a path, the first line returned is
+# "\x01" followed by the old and new digests and sizes ("-" if none).
+sub _spec_details {
+    my ($pairs, $path) = @_;
+    my @lines;
+
+    if (defined ($path)) {
+	# The longest tree that holds the path.
+	my ($best, $best_tree);
+	foreach my $pair (@{$pairs}) {
+	    foreach my $obj (map { _load_spec ($_) } @{$pair}[1, 2]) {
+		next unless ($obj);
+		my $tree = $obj->{TREE};
+		next unless ($path eq $tree || index ($path, "$tree/") == 0);
+		($best, $best_tree) = ($pair, $tree) if (!defined ($best_tree) || length ($tree) > length ($best_tree));
+	    }
+	}
+	return ("no spec holds " . _esc ($path)) unless ($best);
+	my ($spec, $old_data, $new_data) = @{$best};
+	my ($old, $new) = map { my $o = _load_spec ($_); $o ? _entries ($o)->{$path} : undef }
+	    ($old_data, $new_data);
+	my $tok = sub { my ($fa, $field) = @_;
+			my $v = $fa ? $fa->{$field} : undef;
+			return (defined ($v) && $v =~ /^[0-9a-f]+\z/i) ? lc ($v) : '-' };
+	my $size = sub { my ($fa) = @_;
+			 return ($fa && defined ($fa->{SIZE}) && $fa->{SIZE} =~ /^\d+\z/) ? $fa->{SIZE} : '-' };
+	push (@lines, "\x01" . join (' ', $tok->($old, 'SHADIGEST'), $tok->($new, 'SHADIGEST'),
+				     $size->($old), $size->($new)));
+	push (@lines, _esc ($path) . " (in spec " . _esc ($spec) . "):");
+	if (!$old && !$new) {
+	    push (@lines, "   not in either version of the spec");
+	}
+	elsif (!$old) {
+	    push (@lines, "   added: " . _attr_summary ($new));
+	}
+	elsif (!$new) {
+	    push (@lines, "   removed (was " . _attr_summary ($old) . ")");
+	}
+	else {
+	    my @diffs = _attr_changes ($old, $new);
+	    push (@lines, @diffs ? map { "   $_" } @diffs : "   unchanged");
+	}
+	return @lines;
+    }
+
+    foreach my $pair (@{$pairs}) {
+	my ($spec, $old_data, $new_data) = @{$pair};
+	my ($old, $new) = map { _load_spec ($_) } ($old_data, $new_data);
+	if (!$old && !$new) {
+	    push (@lines, _esc ($spec) . ": cannot load either version");
+	    next;
+	}
+	if (!$old || !$new) {
+	    push (@lines, _esc ($spec) . ": " . ($old ? "removed" : "added") . " (tree " .
+		  _esc (($old || $new)->{TREE}) . ")");
+	    next;
+	}
+	my ($oe, $ne) = (_entries ($old), _entries ($new));
+	my @changes;
+	my %all = (%{$oe}, %{$ne});
+	foreach my $path (sort keys %all) {
+	    if (!$oe->{$path}) {
+		push (@changes, "   added " . _esc ($path) . ": " . _attr_summary ($ne->{$path}));
+	    }
+	    elsif (!$ne->{$path}) {
+		push (@changes, "   removed " . _esc ($path));
+	    }
+	    else {
+		my @diffs = _attr_changes ($oe->{$path}, $ne->{$path});
+		push (@changes, "   changed " . _esc ($path) . ": " . join ('; ', @diffs)) if (@diffs);
+	    }
+	}
+	push (@lines, _esc ($spec) . " (tree " . _esc ($new->{TREE}) . "): " .
+	      (@changes ? scalar (@changes) . " paths" : "no paths changed"), @changes);
+    }
+    return @lines;
+}
+
+sub _attr_summary {
+    my ($fa) = @_;
+    return join (', ', map { lc ($_) . ' ' . _show_value ($_, $fa->{$_}) }
+		 grep { defined ($fa->{$_}) } qw(TYPE MODE UID GID SIZE));
+}
+
+sub _attr_changes {
+    my ($old, $new) = @_;
+    my @diffs;
+    foreach my $field (_detail_fields ()) {
+	my ($o, $n) = ($old->{$field}, $new->{$field});
+	next if (!defined ($o) && !defined ($n));
+	next if (defined ($o) && defined ($n) && $o eq $n);
+	push (@diffs, lc ($field) . ' ' . _show_value ($field, $o) . ' -> ' . _show_value ($field, $n));
+    }
+    return @diffs;
+}
+
+# Hash a backup copy with the digest the spec's hex length implies:
+# SHA-3 first (sigtree's default), then SHA-2 of the same size. Returns
+# true if either matches. Cached by inode and digest.
+sub _backup_matches {
+    my ($path, $digest, $cache) = @_;
+    my %bits = (56 => 224, 64 => 256, 96 => 384, 128 => 512);
+    my $bits = $bits{length ($digest)} or return 0;
+    my @stat = lstat ($path);
+    return 0 unless (@stat && S_ISREG ($stat[2]));
+    foreach my $family ('sha3', 'sha2') {
+	my $key = "$stat[0]:$stat[1]:$family-$bits";
+	if (!exists ($cache->{$key})) {
+	    $cache->{$key} = undef;
+	    if (sysopen (my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {
+		binmode ($fh);
+		my $ctx = ($family eq 'sha3') ? Digest::SHA3->new ($bits) : Digest::SHA->new ($bits);
+		eval { $ctx->addfile ($fh); $cache->{$key} = $ctx->hexdigest; 1 } or
+		    warn "Could not read " . _esc ($path) . ": $@";
+		close ($fh);
+	    }
+	}
+	return 1 if (defined ($cache->{$key}) && $cache->{$key} eq $digest);
+    }
+    return 0;
+}
+
+# For the detail query on one file: find a backup copy of each version
+# (by digest, size first) in the snapshots and show a diff of the two.
+sub _backup_diff {
+    my ($cf, $name, $path, $digests, $snapshots, $cache) = @_;
+    my @lines;
+
+    my ($old_digest, $new_digest, $old_size, $new_size) =
+	($digests =~ /^\x01([0-9a-f]+|-) ([0-9a-f]+|-) (\d+|-) (\d+|-)\z/);
+    return ("   (no digests to look for in the backups)") unless (defined ($new_size));
+    return () if ($old_digest eq '-' && $new_digest eq '-');
+    return ("   (the file's digest did not change)") if ($old_digest eq $new_digest);
+    return ("   (only one version has a digest, so no diff)") if ($old_digest eq '-' || $new_digest eq '-');
+
+    my %found;
+    foreach my $snap (@{$snapshots}) {           # newest first
+	my $copy = "$cf->{SNAPSHOT_ROOT}/$snap->{NAME}/$name$path";
+	my @stat = lstat ($copy);
+	next unless (@stat && S_ISREG ($stat[2]));
+	foreach my $want (['old', $old_digest, $old_size], ['new', $new_digest, $new_size]) {
+	    my ($which, $digest, $size) = @{$want};
+	    next if ($found{$which});
+	    next if ($size ne '-' && $stat[7] != $size);
+	    $found{$which} = [$copy, $snap] if (_backup_matches ($copy, $digest, $cache));
+	}
+	last if ($found{old} && $found{new});
+    }
+    foreach my $which ('old', 'new') {
+	push (@lines, "   no backup copy matches the $which version") unless ($found{$which});
+    }
+    return @lines if (@lines);
+
+    my ($old_copy, $old_snap) = @{$found{old}};
+    my ($new_copy, $new_snap) = @{$found{new}};
+    push (@lines, "   backups: old version in $old_snap->{NAME}, new version in $new_snap->{NAME}");
+    push (@lines, _diff_files ($old_copy, "$old_snap->{NAME}:$path", $new_copy, "$new_snap->{NAME}:$path"));
+    return @lines;
+}
+
+# diff -u of two files, escaped; for a binary file, just the sizes.
+sub _diff_files {
+    my ($x, $xlabel, $y, $ylabel) = @_;
+    my @lines;
+
+    foreach my $file ($x, $y) {
+	if (open (my $fh, '<', $file)) {
+	    binmode ($fh);
+	    my $head = '';
+	    read ($fh, $head, 8192);
+	    close ($fh);
+	    if (index ($head, "\0") >= 0) {
+		return ("   binary file: sizes " . (-s $x) . " and " . (-s $y));
+	    }
+	}
+    }
+    open (my $dfh, '-|', DIFF, '-u', '-L', $xlabel, '-L', $ylabel, $x, $y) ||
+	return ("   could not run " . DIFF . ": $!");
+    while (my $line = <$dfh>) {
+	chomp ($line);
+	push (@lines, '   ' . _esc_keep_tabs ($line));
+    }
+    close ($dfh);
+    my $status = $?;
+    push (@lines, "   " . DIFF . " failed (status $status)") if ($status >> 8 > 1 || ($status & 127));
+    return @lines;
+}
+
+# For the detail query on a reference file: compare the host's current
+# version (its digest in the current snapshot's spec) with the reference
+# copy on this host, and if they differ, diff the backup copy of the
+# host's version against it.
+sub _reference_diff {
+    my ($cf, $name, $path, $digests, $snapshots, $cache) = @_;
+
+    return ("   reference copy: $name" . "'s specs do not record " . _esc ($path))
+	unless (defined ($digests));
+    my ($new_digest, $new_size) = ($digests =~ /^\x01(?:[0-9a-f]+|-) ([0-9a-f]+|-) (?:\d+|-) (\d+|-)\z/);
+    return ("   reference copy: no digest recorded for $name" . "'s current version")
+	if (!defined ($new_digest) || $new_digest eq '-');
+    return ("   same as the reference copy") if (_backup_matches ($path, $new_digest, $cache));
+    foreach my $snap (@{$snapshots}) {           # newest first
+	my $copy = "$cf->{SNAPSHOT_ROOT}/$snap->{NAME}/$name$path";
+	my @stat = lstat ($copy);
+	next unless (@stat && S_ISREG ($stat[2]));
+	next if ($new_size ne '-' && $stat[7] != $new_size);
+	next unless (_backup_matches ($copy, $new_digest, $cache));
+	return ("   differs from the reference copy (" . _esc ($path) . " here); $name" .
+		"'s version is in $snap->{NAME}:",
+		_diff_files ($copy, "$snap->{NAME}:$path", $path, "reference:$path"));
+    }
+    return ("   differs from the reference copy; no backup copy of $name" . "'s version to diff");
+}
+
+sub _esc_keep_tabs {
+    my ($text) = @_;
+    $text =~ s/([\x00-\x08\x0a-\x1f\x7f])/sprintf ('\\x%02x', ord ($1))/ge;
+    return $text;
+}
+
+# 7. Reference files: files on this host (where verify_hosts runs) that
+# every host in reference-hosts: (default all) must have, the same. The
+# digests of this host's copies are taken first, in each form a spec may
+# hold (SHA-3 or SHA-2, by size); each host's verified specs are then
+# compared with them in the _sigtree child.
+sub _reference_digests {
+    my ($cf) = @_;
+    my %digests;
+
+    foreach my $path (@{$cf->{REFERENCE}}) {
+	my @stat = lstat ($path);
+	unless (@stat && S_ISREG ($stat[2])) {
+	    $digests{$path} = undef;
+	    next;
+	}
+	foreach my $bits (224, 256, 384, 512) {
+	    foreach my $ctx (Digest::SHA3->new ($bits), Digest::SHA->new ($bits)) {
+		sysopen (my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) || next;
+		binmode ($fh);
+		eval { $ctx->addfile ($fh); $digests{$path}{$ctx->hexdigest} = 1; 1 };
+		close ($fh);
+	    }
+	}
+    }
+    return \%digests;
+}
+
+sub _check_references {
+    my ($cf, $verified, $digests) = @_;
+    my (@lines, %lacks, %differs, %no_digest);
+
+    foreach my $path (@{$cf->{REFERENCE}}) {
+	push (@lines, "cannot read the reference copy " . _esc ($path) . " here")
+	    unless ($digests->{$path});
+    }
+    foreach my $host (@{$cf->{REFERENCE_HOSTS}}) {
+	next unless ($verified->{$host});
+	my %entries;
+	foreach my $spec (@{$verified->{$host}}) {
+	    my $obj = _load_spec ($spec->[1]) or next;
+	    my $e = _entries ($obj);
+	    @entries{keys %{$e}} = values %{$e};
+	}
+	foreach my $path (@{$cf->{REFERENCE}}) {
+	    next unless ($digests->{$path});
+	    my $fa = $entries{$path};
+	    if (!$fa || ($fa->{TYPE} // '') ne 'file') {
+		push (@{$lacks{$host}}, _esc ($path));
+	    }
+	    elsif (!defined ($fa->{SHADIGEST}) || $fa->{SHADIGEST} !~ /^[0-9a-f]+\z/i) {
+		push (@{$no_digest{$host}}, _esc ($path));
+	    }
+	    elsif (!$digests->{$path}{lc ($fa->{SHADIGEST})}) {
+		push (@{$differs{$host}}, _esc ($path));
+	    }
+	}
+    }
+    foreach my $host (@{$cf->{REFERENCE_HOSTS}}) {
+	push (@lines, _limited ("$host differs from the reference copy", $differs{$host})) if ($differs{$host});
+	push (@lines, _limited ("$host lacks (not in its specs)", $lacks{$host})) if ($lacks{$host});
+	push (@lines, _limited ("$host records no digest for", $no_digest{$host})) if ($no_digest{$host});
+    }
+    return @lines;
+}
+
+# 6. Chroots, from the verified specs of the hosts that have them, in the
+# _sigtree child. For each host's copy of each chroot:
+#   - no setuid or setgid file anywhere in it, and no device node outside
+#     its dev/;
+#   - in the mirrored directories, dev/ and etc/: everything owned by
+#     root and not group or world writable (other areas, such as htdocs,
+#     keep their own owners and are left to the ordinary checks);
+#   - under each directory named in allow-only:, nothing that is not
+#     listed;
+#   - under each mirror: directory, each file the same (type, digest,
+#     mode, owner, group, device number, link target) as the file at the
+#     same path on the host's own system, and none without one unless
+#     listed in allow-extra: (mirror-except: skips files that differ by
+#     design, such as a wrapper installed in place of the system's copy;
+#     a relinked system library that its chroot copy no longer matches is
+#     reported, as a sign that the chroot needs rebuilding);
+# and, across the hosts that have the chroot, files they all have in its
+# system parts (mirrored directories, dev/, etc/) must match one another;
+# compare-except: leaves out paths there that differ by design.
+# rules-except: exempts paths from the first two.
+# Device nodes are exempt from the writable rule (dev/null is mode 666).
+sub _check_chroots {
+    my ($cf, $verified) = @_;
+    my (@lines, %entries);
+
+    foreach my $host (sort keys %{$verified}) {
+	foreach my $spec (@{$verified->{$host}}) {
+	    my $obj = _load_spec ($spec->[1]);
+	    if (!$obj) {
+		push (@lines, "$host: cannot load spec " . _esc ($spec->[0]));
+		next;
+	    }
+	    my $e = _entries ($obj);
+	    @{$entries{$host}}{keys %{$e}} = values %{$e};
+	}
+    }
+    my $sysroot = $cf->{SYSTEM_ROOT};
+    my @categories = (['setuid or setgid', 'SETID'], ['device node outside dev/', 'DEVICE'],
+		      ['not owned by root', 'OWNER'], ['group or world writable', 'WRITABLE'],
+		      ['not in allow-only', 'NOT_ALLOWED'],
+		      ['no copy on the system (not in allow-extra)', 'NO_COUNTERPART'],
+		      ['differs from the system copy', 'DIFFERS']);
+
+    foreach my $chroot (@{$cf->{CHROOTS}}) {
+	my $root = $chroot->{ROOT};
+	my @hosts = grep { $entries{$_} } @{$chroot->{HOSTS}};
+	my %allow_dir = map { (my $d = $_->[0]) =~ s{/[^/]*\z}{}; ($_->[0] =~ m{/} ? $d : '') => 1 }
+	    @{$chroot->{ALLOW_ONLY}};
+	foreach my $host (@hosts) {
+	    my $e = $entries{$host};
+	    my @paths = sort grep { $_ eq $root || index ($_, "$root/") == 0 } keys %{$e};
+	    if (!@paths) {
+		push (@lines, "Chroot $root on $host:", "   not in $host" . "'s specs");
+		next;
+	    }
+	    my %found;
+	    foreach my $path (@paths) {
+		my $fa = $e->{$path};
+		my $rel = ($path eq $root) ? '' : substr ($path, length ($root) + 1);
+		my $type = $fa->{TYPE} // '';
+		my $mode = $fa->{MODE};
+		my $under = sub { $rel eq $_[0] || index ($rel, "$_[0]/") == 0 };
+		my $exempt = grep { $path =~ $_->[1] } @{$chroot->{RULES_EXCEPT}};
+		my $shown = _esc ($rel eq '' ? '.' : $rel);
+		if (!$exempt && $type eq 'file' && defined ($mode) && ($mode & 06000)) {
+		    push (@{$found{SETID}}, $shown . sprintf (' (%o)', $mode & 07777));
+		}
+		if (!$exempt && $type =~ /device/ && !$under->('dev')) {
+		    push (@{$found{DEVICE}}, $shown);
+		}
+		my $mirrored = grep { $under->($_) } @{$chroot->{MIRROR}};
+		if (!$exempt && $type ne 'link' && ($mirrored || $under->('dev') || $under->('etc'))) {
+		    push (@{$found{OWNER}}, "$shown (uid $fa->{UID})")
+			if (defined ($fa->{UID}) && $fa->{UID} != 0);
+		    # Device nodes such as dev/null are writable by design; their
+		    # modes are checked against the system's by the mirror check.
+		    push (@{$found{WRITABLE}}, $shown . sprintf (' (%o)', $mode & 07777))
+			if ($type !~ /device/ && defined ($mode) && ($mode & 022));
+		}
+		foreach my $dir (keys %allow_dir) {
+		    # '' is the chroot's top level: its direct entries only.
+		    next unless ($dir eq '' ? ($rel ne '' && $rel !~ m{/}) : index ($rel, "$dir/") == 0);
+		    push (@{$found{NOT_ALLOWED}}, $shown)
+			unless (grep { $path =~ $_->[1] } @{$chroot->{ALLOW_ONLY}});
+		}
+		next unless ($mirrored);
+		next if (grep { $path =~ $_->[1] } @{$chroot->{MIRROR_EXCEPT}});
+		my $sys = ($sysroot eq '/') ? "/$rel" : "$sysroot/$rel";
+		my $sfa = $e->{$sys};
+		if (!$sfa) {
+		    push (@{$found{NO_COUNTERPART}}, $shown)
+			unless (grep { $path =~ $_->[1] } @{$chroot->{ALLOW_EXTRA}});
+		    next;
+		}
+		my @diffs = _copy_diff ($fa, $root, $sfa, $sysroot);
+		push (@{$found{DIFFERS}}, "$shown (" . join (',', @diffs) . ")") if (@diffs);
+	    }
+	    my @found = map { _limited ($_->[0], $found{$_->[1]}) } grep { $found{$_->[1]} } @categories;
+	    push (@lines, "Chroot $root on $host:", map { "   $_" } @found) if (@found);
+	}
+
+	# Files that every host's copy of the chroot has must be the same,
+	# in the system parts only (the mirrored directories, dev/ and
+	# etc/): the rest (htdocs, cgi-bin, logs) serves each host's own
+	# purpose. compare-except: leaves out paths that differ by design.
+	next if (@hosts < 2);
+	my ($first, @rest) = @hosts;
+	my @diffs;
+	foreach my $path (sort grep { index ($_, "$root/") == 0 } keys %{$entries{$first}}) {
+	    next if (grep { !$entries{$_}{$path} } @rest);
+	    my $rel = substr ($path, length ($root) + 1);
+	    next unless (grep { $rel eq $_ || index ($rel, "$_/") == 0 } (@{$chroot->{MIRROR}}, 'dev', 'etc'));
+	    next if (grep { $path =~ $_->[1] } @{$chroot->{COMPARE_EXCEPT}});
+	    foreach my $other (@rest) {
+		my @d = _copy_diff ($entries{$first}{$path}, $root, $entries{$other}{$path}, $root);
+		push (@diffs, _esc ($rel) . " ($first and $other: " . join (',', @d) . ")") if (@d);
+	    }
+	}
+	push (@lines, "Chroot $root across " . join (', ', @hosts) . ":",
+	      "   " . _limited ('differs between the hosts', \@diffs)) if (@diffs);
+    }
+    return @lines;
+}
+
+# The attributes in which two copies of a file differ: for directories
+# their type, mode and owner; for anything else also digest, device
+# number and link target, with link targets read relative to each copy's
+# root (a link in a chroot points into the chroot).
+sub _copy_diff {
+    my ($x, $xroot, $y, $yroot) = @_;
+    my @fields = (($x->{TYPE} // '') eq 'dir' && ($y->{TYPE} // '') eq 'dir') ?
+	qw(TYPE MODE UID GID) : qw(TYPE SHADIGEST MODE UID GID RDEV LINK);
+    my $rel_link = sub {
+	my ($link, $root) = @_;
+	return $link if (!defined ($link) || $root eq '/');
+	return '/' if ($link eq $root);
+	return (index ($link, "$root/") == 0) ? substr ($link, length ($root)) : $link;
+    };
+    my @diffs;
+    foreach my $field (@fields) {
+	my ($a1, $b1) = ($x->{$field}, $y->{$field});
+	($a1, $b1) = ($rel_link->($a1, $xroot), $rel_link->($b1, $yroot)) if ($field eq 'LINK');
+	next if (!defined ($a1) && !defined ($b1));
+	next if (defined ($a1) && defined ($b1) && $a1 eq $b1);
+	push (@diffs, lc ($field));
+    }
+    return @diffs;
 }
 
 # Remove the private temp dir and the plain files in it.

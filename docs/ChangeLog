@@ -1,3 +1,13 @@
+8 November 2026 1.30:  No longer delete changed files when empty
+    (use for verify_hosts), make changes exit 0 if changes are
+    pending, 1 if changed file is empty, other nonzero for errors.
+    verify_hosts rollback check walks snapshots between the previous
+    and current, verify_hosts with a spec will show what paths
+    changed and with a path will compare, if possible to snapshots to
+    show an actual diff. Record device numbers for device nodes in specs.
+    Do chroot checks with verify_hosts when configured.
+8 November 2026 1.29: Add verify_hosts for checking specs from multiple
+    hosts vs. each other and backup snapshots.
 8 November 2026 1.28a: Fix bug that causes extraneous error messages
     on Linux when checking flags.
 7 November 2026 1.28: Improve performance by getting flags in batches,

@@ -145,19 +145,28 @@ update to permit updating a changed spec directory with version 1.14.)
 
 FEATURES TO ADD:
 
-Add a way to run check against a non-local host using a copy of the
-specs, that has a different file system prefix (e.g., a backup or
-separately mounted file system); it would pre-pend the prefix on the
-files being checked. (Also support for update?) Need to think through
-the pros and cons of verifying rsynced specs from the original host vs.
-just running a separate initialize/check/update on the backup, which
-would require a separate config.
-
 Add sign_specs that signs (or re-signs) them all, perhaps as an option
 to initialize_specs. Currently the only way to do that is re-initializing
 each tree (i.e., initialize_specs doesn't do it).
 
 Set user immutable or +i on changed file if immutable flags are used.
+
+(DONE 1.30) No longer delete changed files when empty (use for verify_hosts),
+make changes exit 0 if changes are pending, 1 if changed file is empty,
+other nonzero for errors. verify_hosts rollback check walks snapshots between
+the previous and current, verify_hosts with a spec will show what paths
+changed and with a path will compare, if possible to snapshots to show
+an actual diff. Record device numbers for device nodes in specs. Do
+chroot checks with verify_hosts when configured.
+
+(DONE 1.29) Add a way to run check against a non-local host using a copy of the
+specs, that has a different file system prefix (e.g., a backup or
+separately mounted file system); it would pre-pend the prefix on the
+files being checked. (Also support for update?) Need to think through
+the pros and cons of verifying rsynced specs from the original host vs.
+just running a separate initialize/check/update on the backup, which
+would require a separate config. Implemented as verify_hosts with its
+own separate config.
 
 (DONE 1.28) Improve performance by getting flags in batches;
 add primary- and secondary- versions of exception and exception-tree.
