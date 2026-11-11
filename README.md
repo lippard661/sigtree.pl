@@ -72,8 +72,8 @@ to rsync specs from multiple hosts to a central server for aggregation.
 - **mtimestasis**: monitors for files that have NOT changed within a
   specified time window — useful for detecting silenced log files
 - **SHA-2 and SHA-3**: configurable digest algorithm and digest length
-- **macOS application support**: -m option to suppress application bundle
-  contents while still processing them
+- **macOS application support**: -m option to summarize changes inside
+  application bundles as counts per app, while still processing them
 
 ## Monitored Attributes (Keywords)
 
@@ -115,6 +115,9 @@ check_specs       Check the spec-of-specs for changes
 check_file <f>    Check a single file against its spec
 update            Update specs to reflect changes found by check
 changes           Show pending changes from last check before update
+changes <spec> | </path>
+                  Show the pending changes in one spec's tree, or at or
+                  beneath a path, with values, and any since undone (1.31)
 verify_hosts      On a central server, check copies of other hosts' databases
 verify_hosts <host> [<spec> | </path>]
                   On a central server, show what changed in a host's specs
@@ -136,6 +139,32 @@ nothing in it, so its modification time is the time of the last check;
 test for pending changes with `changes`, not with the file's existence. For partial updates, only updated trees
 are removed from the pending changes file; unreviewed changes in other
 trees are preserved.
+
+From 1.31, check stores the spec's value and the value it found for each
+changed attribute, so check's closing summary and `changes -v` (which
+are the same) show them, with digests cut to 12 characters:
+
+```
+   /etc/rc.conf.local (mode 0644 -> 0600; shadigest 3f2a9c4b1d0e... -> 8be01d7a2c44...)
+```
+
+Plain `changes` lists each changed path with the names of its changed
+attributes, `(added)` or `(deleted)`. A changed file written by an
+earlier version has names but no values, and is shown with names only
+until the next check replaces it.
+
+`changes etc` (a spec file's name: `etc` for /etc, `usr.local` for
+/usr/local) or `changes /etc/rc.conf.local` (a file, or a directory for
+everything pending at or beneath it) shows those paths one by one, with
+full values, or with `-v` in check's long form. Each path is also looked
+at again (and digested, if its digest changed), and sigtree reports
+whether the change has been undone since the check ("since reverted: as
+in the spec again", an added file since removed, a deleted one restored)
+or the path has changed again, with the new values. Reading flags this
+way runs ls (or lsattr), as check does. `-k mode,uid,shadigest` limits
+`changes`, its summary and these queries to the attributes named; the
+paths it leaves out are counted. Options go before the command:
+`sigtree.pl -v changes /etc`.
 
 sigtree exits non-zero when a command fails, including when one tree's
 worker fails (the other trees are still processed and the failed tree's
@@ -161,10 +190,18 @@ passphrase changes nothing.
                   initialize_specs, check_specs, or check_file.
 -f N              Number of child worker processes: 0 (no workers) or
                   2 up to max_child_procs. Only for initialize and check.
--m                Don't show macOS application bundle contents
+-m                Don't list changes inside macOS application bundles
+                  one by one: check -v, the summary and changes count
+                  them per app instead (1.31; before, they were left
+                  out, so an app whose bundle directory itself had not
+                  changed did not appear at all). A changes /path query
+                  for an app, or a path inside one, lists them in full.
 -p                Use privilege separation (must run as root; _sigtree
                   user and group required); same as "privsep: yes"
 -v                Verbose: show old and new values of changed attributes
+-k keyword_list   changes and the verify_hosts detail query (1.31): the
+                  attributes to show, as sigtree keywords (e.g.
+                  mode,uid,gid,rdev)
 -V                Show version (alone, with no other option or command)
 -h                Help
 -D                Debugging output
@@ -453,6 +490,17 @@ versions the specs recorded and shows a diff of them. Both versions of a
 spec are verified before they are loaded, and anything a host wrote
 (names, paths, file contents) is printed with control characters
 escaped.
+
+A spec records a path's type, mode, owner, group, size, link count and
+times whatever the keywords of its set, so the detail query would list
+changes the host itself never checks. From 1.31 it leaves out changes
+in mtime and ctime, and says how many paths changed only in those; `-v`
+shows them, and `-k mode,uid,gid,rdev` (sigtree keywords) shows just
+the attributes named. It does not read the host's sigtree config, which
+is unsigned and written by the host. When the oldest snapshot's copy of
+a spec cannot be verified (a GPG signature from before the host moved
+to signify, say), the changes are shown from the oldest later snapshot
+in the window whose copy does verify, and the report says which.
 
 ## Security Notes
 

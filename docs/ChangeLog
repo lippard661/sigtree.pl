@@ -1,3 +1,23 @@
+10 November 2026 1.31: verify_hosts detail query steps forward past
+    snapshots whose spec signatures can't be verified (e.g., GPG-signed
+    before the move to signify), hides mtime/ctime changes unless -v,
+    and takes -k to name the attributes to show. check stores old and
+    new values of changed attributes in the changed file; check's
+    summary and changes -v show them, plain changes shows changed
+    attribute names per path. changes spec or changes /path shows the
+    pending changes in a spec's tree or at/beneath a path, with values
+    (check's long form with -v), and reports changes since undone or
+    changed again. -k works with changes. Change display shared by
+    check, changes, and verify_hosts; modes shown as four octal digits,
+    control characters escaped. Fix bugs: partial update or initialize
+    left updated trees' paths in the changed file's per-set lists, so
+    changes -v still showed them; -m put changed attribute names out of
+    step with paths in the summary; check recorded no check time for the
+    spec dir, so changes died when the spec dir had changed; update
+    could miss removing a tree no longer in the config from the changed
+    file. -m now counts changes inside each macOS app ("Inside macOS
+    apps") in check's summary and changes rather than omitting them,
+    and check -v no longer lists them one by one.
 8 November 2026 1.30:  No longer delete changed files when empty
     (use for verify_hosts), make changes exit 0 if changes are
     pending, 1 if changed file is empty, other nonzero for errors.

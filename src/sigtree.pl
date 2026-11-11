@@ -432,6 +432,48 @@
 #    In the detail query, a version whose signature cannot be checked
 #    (a GPG signature from before the host moved to signify, say) is
 #    reported, named as such, and the other specs are still shown.
+# Modified 10 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.31): in the verify_hosts detail query, when the
+#    previous snapshot's copy of a spec cannot be verified (a GPG
+#    signature from before the host moved to signify, say), its changes
+#    are shown from the oldest later snapshot in the window whose copy
+#    does verify, and the report says which; before, that spec was
+#    skipped. The detail query no longer lists changes in mtime and ctime
+#    (which specs record whatever the host's keywords) unless -v is
+#    given, and counts the paths that changed only in those; -k names
+#    the attributes to show instead, as sigtree keywords.
+#    check now stores, for each changed attribute, the spec's value and
+#    the value found, in the changed file (a changed file from before
+#    1.31 has only the names, and is shown with names only). check's
+#    closing summary and changes -v show the values, with digests
+#    shortened; plain changes lists each path's changed attributes, or
+#    that it was added or deleted. "changes spec" (a spec file's name,
+#    such as etc or usr.local) and "changes /path" (a file, or the
+#    pending paths at or beneath a directory) show the values in full,
+#    or with -v in check's long form, and look at each path again: a
+#    change since undone (the path as in the spec again, or an added
+#    file removed or a deleted one restored) or a further change since
+#    the check is reported. -k limits changes, its summary and these to
+#    the attributes named. The display of a change is shared by check,
+#    changes and verify_hosts (AttrDisplay package); modes are shown as
+#    permission bits in four octal digits throughout, and file names and
+#    values with control characters escaped. Fixed: after an update or
+#    initialize of some trees, their paths stayed in the changed file's
+#    per-set lists, so changes -v still listed them; and with -m,
+#    a path left out of the summary put the following paths' changed
+#    attribute names out of step.
+#    -m now does what it was meant to: changes inside a macOS app are
+#    counted per app ("Inside macOS apps": n changed, added, deleted) in
+#    check's summary, changes -v and plain changes, instead of being
+#    left out, which hid an app altogether when its bundle directory
+#    had not itself changed; check -v no longer shows them one by one
+#    (it did, while leaving out only the mtimestasis-only case); a tree
+#    that is itself an app is handled the same way; changes /path for
+#    an app or inside one lists them in full. Also fixed: check recorded
+#    no check time for the spec dir, so changes died (exit 2) whenever
+#    check had found the spec dir changed; and update stopped scanning
+#    the changed file at the first tree to update, so a tree no longer
+#    in the config was removed from it only if found before that.
 
 ### Required packages.
 
@@ -531,7 +573,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.30 of 8 November 2026';
+my $VERSION = 'sigtree 1.31 of 10 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -655,6 +697,7 @@ our ($root_dir,     # Root dir to use.
      $debug_flag,   # For debugging messages.
      $fork_children,# number of children to fork.
      $no_macos_app_contents, # don't show stuff that is inside an app directory.
+     $changes_query, # "changes spec" or "changes /path": the spec or path.
      $use_pgp,      # If PGP, GPG, or signify should be used.
      $use_signify,  # If signify should be used.
      $signify_pubkey, # signify public key file.
@@ -672,7 +715,7 @@ our ($root_dir,     # Root dir to use.
 umask 077;
 
 # Get/set options.
-getopts ('r:c:s:d:f:vhmpVD', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+getopts ('r:c:s:d:f:k:vhmpVD', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
 
 # Debugging.
 $debug_flag = $opts{'D'} || 0;
@@ -743,12 +786,15 @@ if ($opts{'h'}) {
     print "-m don't show macOS app dir content changes\n";
     print "-p use privilege separation\n";
     print "-v verbose\n";
+    print "-k keyword list (CSV; changes and the verify_hosts detail query: the attributes to show)\n";
     print "-V show version (must be standalone option with no command)\n";
     print "-h help and show version\n";
     print "Commands:\n";
     print "initialize: Initialize specifications for a set of trees.\n";
     print "initialize_specs: Initialize specification for the specification dir.\n";
     print "changes: Show non-updated or reinitialized changes found by check.\n";
+    print "   changes spec | /path: show the pending changes in that spec's tree, or at or\n";
+    print "   beneath that path, with values, and any since undone or changed again.\n";
     print "check: Check specifications for a set of trees.\n";
     print "check_file: Check an individual file against a specification.\n";
     print "   (The file name is specified on the command line after \"check_file\".)\n";
@@ -768,7 +814,9 @@ if ($#ARGV >= 0) {
 
 if (!defined ($command) || ($command eq 'check_file' && $#ARGV != 1) ||
     ($command eq 'verify_hosts' && $#ARGV > 2) ||
-    ($command ne 'check_file' && $command ne 'verify_hosts' && $#ARGV != 0)) {
+    ($command eq 'changes' && $#ARGV > 1) ||
+    ($command ne 'check_file' && $command ne 'verify_hosts' && $command ne 'changes' &&
+     $#ARGV != 0)) {
     die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
 }
 
@@ -790,11 +838,21 @@ elsif ($command eq 'verify_hosts') {
     foreach my $opt ('r', 's', 'd', 'f', 'm', 'p') {
 	die "The -$opt option cannot be used with verify_hosts.\n" if ($opts{$opt});
     }
+    die "The -k option is for the verify_hosts detail query (verify_hosts host ...).\n"
+	if (defined ($opts{'k'}) && $#ARGV < 1);
 }
 elsif ($command ne 'initialize' &&
        $command ne 'check') {
     die "Unknown command \"$command\".\n"
 }
+die "The -k option can only be used with changes and verify_hosts.\n"
+    if (defined ($opts{'k'}) && $command ne 'verify_hosts' && $command ne 'changes');
+# changes -k: show only these attributes.
+AttrDisplay::set_filter (AttrDisplay::keyword_attrs ($opts{'k'}))
+    if (defined ($opts{'k'}) && $command eq 'changes');
+# changes spec or changes /path: the spec name or path asked about. The
+# paths are looked at again, which for flags runs ls or lsattr.
+$changes_query = $ARGV[1] if ($command eq 'changes' && $#ARGV == 1);
 
 # changes exits 0 if changes are pending and 1 if none are, so an error
 # must not exit 1. die's exit status is $! when that is set (it can be 1),
@@ -813,7 +871,7 @@ if ($command eq 'changes') {
 # sigtree config, so it runs before that config is read.
 if ($command eq 'verify_hosts') {
     my $hosts_config = $opts{'c'} ? $config_file : $SYSCONF_DIR . '/' . $VERIFY_HOSTS_CONFIG;
-    exit (VerifyHosts::run ($hosts_config, $verbose, $OSNAME, @ARGV[1 .. $#ARGV]));
+    exit (VerifyHosts::run ($hosts_config, $verbose, $OSNAME, $opts{'k'}, @ARGV[1 .. $#ARGV]));
 }
 
 $config = new Config ($config_file);
@@ -1188,11 +1246,13 @@ elsif ($command eq 'changes') {
 	# Now need special treatment with privsep.
 	my @promises = (@READONLY_PROMISES, @FLOCK_PROMISE);
 	push (@promises, @PRIVSEP_NONPRIV_PROMISES) if ($use_privsep);
+	# A spec or path asked about: its paths' flags are read with ls.
+	push (@promises, @EXEC_PROMISES) if (defined ($changes_query));
 	pledge (@promises) || die "Cannot pledge read-only promises. $!\n";
     }
     # 0: changes pending; 1: none; 2: an error. die's own exit status
     # depends on $!, which could be 1, so an error is caught and mapped.
-    my $changes_status = eval { show_changes ($config, $no_macos_app_contents, @sets) };
+    my $changes_status = eval { show_changes ($config, $no_macos_app_contents, $changes_query, @sets) };
     if (!defined ($changes_status)) {
 	print STDERR $@;
 	exit (2);
@@ -1601,13 +1661,14 @@ sub create_tree {
 
 # Subroutine to display contents of changed file (for specified sets).
 sub show_changes {
-    my ($config, $no_macos_app_contents, @sets) = @_;
+    my ($config, $no_macos_app_contents, $query, @sets) = @_;
     my ($changedfile, $displayed_something, @changed_trees, $tree,
-	@times, @users, @paths, @attrs, $time, $user, $path, $attr);
+	@times, @users, @paths, $time, $user, $path, %entries, $hidden);
 
-    # Exit status: 0 if changes are pending in the specified sets, 1 if
-    # none are (including no changed file), so cron can run update only
-    # when needed; an error dies (255).
+    # Exit status: 0 if changes are pending in the specified sets (and
+    # under the spec or path asked about), 1 if none are (including no
+    # changed file), so cron can run update only when needed; an error
+    # exits 2.
     if ((!$use_privsep && !-e $changed_file) ||
 	($use_privsep && !grep { $_ eq $changed_file } @EXISTING_SPECS)) {
 	print "No pending changes (there is no changed file).\n";
@@ -1619,9 +1680,13 @@ sub show_changes {
 	die "Failed to load changed file: $changed_file\n";
     }
 
+    return show_change_query ($config, $changedfile, $no_macos_app_contents, $query, @sets)
+	if (defined ($query));
+
     $displayed_something = 0;
 
     @changed_trees = $changedfile->get_trees;
+    %entries = map { ($_->{PATH} => $_) } $changedfile->get_entries;
 
     foreach $tree (@changed_trees) {
 	if ($tree ne $spec_dir && !$config->tree_for_path ($tree)) {
@@ -1644,20 +1709,34 @@ sub show_changes {
 	    }
 	    print "The following paths in this tree have changed:\n";
 	    @paths = $changedfile->get_paths ($tree);
-	    # This code did try to display changed attrs (from $changedfile->get_set_changed_attrs),
-	    # but that subroutine takes a set, not a tree, as an argument.  We aren't looking at
-	    # sets unless the details are displayed.
+	    $hidden = 0;
+	    my %apps;
+	    # Each with what changed: its changed attributes (only those -k
+	    # names, if it is given), or that it was added or deleted.
 	    foreach $path (@paths) {
-		if (!$no_macos_app_contents ||
-		    $path !~ /$MACOS_APP_CONTENTS/) {
-		    if ($no_macos_app_contents && $path =~ /$MACOS_APP/) {
-			print "   $path (macOS app)\n";
-		    }
-		    else {
-			print "   $path\n";
-		    }
+		my $full = ($path eq '.') ? $tree : "$tree/$path";
+		my $entry = $entries{$full};
+		if ($no_macos_app_contents && defined (my $app = _macos_app ($full))) {
+		    $apps{$app}{$entry ? $entry->{KIND} : 'changed'}++;
+		    next;
 		}
+		my $note = '';
+		if ($entry && $entry->{KIND} ne 'changed') {
+		    $note = " ($entry->{KIND})";
+		}
+		elsif ($entry) {
+		    my @shown = AttrDisplay::shown (_ordered_attrs (@{$entry->{ATTRS}}));
+		    if (!@shown && @{$entry->{ATTRS}}) {
+			$hidden++;
+			next;
+		    }
+		    $note = " (" . join (',', @shown) . ")" if (@shown);
+		}
+		$note .= " (macOS app)" if ($no_macos_app_contents && $path =~ /$MACOS_APP/);
+		print "   " . AttrDisplay::esc ($path) . "$note\n";
 	    }
+	    print "   ($hidden more changed only in attributes -k leaves out)\n" if ($hidden);
+	    print map { "   $_\n" } _macos_app_lines (\%apps);
 	}
     }
 
@@ -1670,6 +1749,211 @@ sub show_changes {
 	show_change_details ($changedfile, 0, 0, $no_macos_app_contents);
     }
     return 0;
+}
+
+# Attributes in the order they are shown (any unknown ones last, as
+# recorded).
+sub _ordered_attrs {
+    my (@attrs) = @_;
+    my $n = 0;
+    my %order = map { ($_ => $n++) } AttrDisplay::attrs ();
+    return sort { ($order{$a} // $n) <=> ($order{$b} // $n) } @attrs;
+}
+
+# A changed path's attributes as the summary shows them: with the values
+# in the spec and found by the check, digests shortened, if the changed
+# file has them (1.31 and later), or else their names. Only those -k
+# names; undef if it names none of them.
+sub _change_summary {
+    my ($attrs, $values) = @_;
+    my @attrs = _ordered_attrs (@{$attrs});
+    my @shown = AttrDisplay::shown (@attrs);
+
+    return undef if (@attrs && !@shown);
+    return join (',', @shown) unless ($values);
+    return join ('; ', map { ($values && $values->{$_}) ?
+				 AttrDisplay::change ($_, @{$values->{$_}}, 'short' => 1) : $_ } @shown);
+}
+
+# Subroutine for "changes spec" and "changes /path": each pending path in
+# that spec's tree, or at or beneath that path, with what the check found
+# (the spec's value and the value found, for each changed attribute;
+# with -v, in check's long form), and whether the path is still as the
+# check found it. For that it is looked at again now (and digested, if
+# its digest changed), so a change that has been undone since, or a
+# further change, is reported.
+sub show_change_query {
+    my ($config, $changedfile, $no_macos_app_contents, $query, @sets) = @_;
+    my (@trees, %tree_ok, @entries, $label, $hidden, $last_tree);
+
+    @trees = grep { $_ eq $spec_dir || ($config->tree_for_path ($_) && $config->tree_uses_sets ($_, @sets)) }
+	$changedfile->get_trees;
+    %tree_ok = map { ($_ => 1) } @trees;
+    @entries = grep { $tree_ok{$_->{TREE}} } $changedfile->get_entries;
+
+    if ($query =~ m{^/}) {
+	($label = $query) =~ s{(?<=.)/+\z}{};
+	my $prefix = ($label eq '/') ? '/' : "$label/";
+	@entries = grep { $_->{PATH} eq $label || index ($_->{PATH}, $prefix) == 0 } @entries;
+    }
+    else {
+	# A spec name, as the spec files are named (etc for /etc,
+	# usr.local for /usr/local), or the spec of specs.
+	my @named = grep { path_to_spec ($_) eq $query } $config->all_trees;
+	push (@named, $spec_dir) if ($query eq $spec_spec || $query eq path_to_spec ($spec_dir));
+	die "No tree in the config has the spec name \"" . AttrDisplay::esc ($query) .
+	    "\" (they are: " . join (', ', sort (map { path_to_spec ($_) } $config->all_trees)) .
+	    "; or a path, starting with /).\n" unless (@named);
+	my %named = map { ($_ => 1) } @named;
+	@entries = grep { $named{$_->{TREE}} } @entries;
+	$label = "spec $query";
+    }
+    # With -m, paths inside a macOS app are counted per app, unless the
+    # path asked about is that app or inside it.
+    my %apps;
+    if ($no_macos_app_contents) {
+	@entries = grep {
+	    my $app = _macos_app ($_->{PATH});
+	    my $collapse = defined ($app) &&
+		!($query =~ m{^/} && ($label eq $app || index ($label, "$app/") == 0));
+	    $apps{$app}{$_->{KIND}}++ if ($collapse);
+	    !$collapse } @entries;
+    }
+
+    unless (@entries || %apps) {
+	print "No pending changes for " . AttrDisplay::esc ($label) .
+	    ((@sets && $set) ? " in the specified sets" : '') . ".\n";
+	return 1;
+    }
+
+    $hidden = 0;
+    foreach my $entry (sort { $a->{TREE} cmp $b->{TREE} || $a->{PATH} cmp $b->{PATH} } @entries) {
+	my $tree = $entry->{TREE};
+	my $rel = ($entry->{PATH} eq $tree) ? '.' :
+	    substr ($entry->{PATH}, length ($tree) + (($tree eq '/') ? 0 : 1));
+	my (@lines, @shown);
+
+	if ($entry->{KIND} eq 'changed') {
+	    my @attrs = _ordered_attrs (@{$entry->{ATTRS}});
+	    @shown = AttrDisplay::shown (@attrs);
+	    if (@attrs && !@shown) {
+		$hidden++;
+		next;
+	    }
+	}
+
+	if (!defined ($last_tree) || $last_tree ne $tree) {
+	    my @times = $changedfile->get_times ($tree);
+	    my @users = $changedfile->get_users ($tree);
+	    print "\n" if (defined ($last_tree));
+	    print "tree: $tree" . (($tree eq $spec_dir) ? " (specification dir)" : '');
+	    print ", checked " . localtime ($times[-1]) . " by $users[-1]" if (@times);
+	    print "\n";
+	    $last_tree = $tree;
+	}
+
+	my ($description, $keywords, $priority) = $config->set_info ($entry->{SET});
+	print "" . AttrDisplay::esc ($entry->{PATH}) . " (set $entry->{SET}" .
+	    (defined ($priority) ? ", priority $priority" : '') . "):\n";
+
+	if ($entry->{KIND} eq 'added') {
+	    push (@lines, "   added");
+	}
+	elsif ($entry->{KIND} eq 'deleted') {
+	    push (@lines, "   deleted");
+	}
+	elsif (!$entry->{VALUES}) {
+	    push (@lines, "   changed: " . join (', ', @shown) .
+		  " (the changed file is from before 1.31 and holds no values)");
+	}
+	else {
+	    foreach my $attr (@shown) {
+		my $pair = $entry->{VALUES}{$attr} or next;
+		push (@lines, $verbose ? AttrDisplay::long_lines ($attr, @{$pair}) :
+		      "   " . AttrDisplay::change ($attr, @{$pair}));
+	    }
+	}
+	push (@lines, _since_check ($config, $entry, $tree, $rel));
+	print map { "$_\n" } @lines;
+    }
+    print "($hidden more changed only in attributes -k leaves out)\n" if ($hidden);
+    if (%apps) {
+	print "\n" if (@entries);
+	print map { "$_\n" } _macos_app_lines (\%apps);
+    }
+    return 0;
+}
+
+# The macOS app a path is inside (the outermost, for an app within an
+# app), or undef. Used with -m, which shows changes inside an app as
+# counts for the app rather than one by one.
+sub _macos_app {
+    my ($path) = @_;
+    return ($path =~ m{^(.*?\.app)/}) ? $1 : undef;
+}
+
+# Lines counting the changes inside each macOS app (-m), from app =>
+# { changed => n, added => n, deleted => n }.
+sub _macos_app_lines {
+    my ($apps) = @_;
+    return () unless (%{$apps});
+    return ("Inside macOS apps (not listed with -m):",
+	    map { my $count = $apps->{$_};
+		  "   " . AttrDisplay::esc ($_) . ": " .
+		      join (', ', map { "$count->{$_} $_" } grep { $count->{$_} } qw(changed added deleted)) }
+	    sort (keys (%{$apps})));
+}
+
+# How a pending path differs now from what the check found, as lines to
+# show (none if it is as the check found it).
+sub _since_check {
+    my ($config, $entry, $tree, $rel) = @_;
+    my (@attrs, $digest, $now, @again, $reverted, $modified);
+
+    if ($entry->{KIND} eq 'changed') {
+	return () unless ($entry->{VALUES});
+	@attrs = grep { $entry->{VALUES}{$_} } _ordered_attrs (@{$entry->{ATTRS}});
+	return () unless (@attrs);
+    }
+    # The digest only if the check found it changed.
+    $digest = (grep { $_ eq 'shadigest' } @attrs) ? $config->path_sha_digest ($tree, $rel) : 0;
+    $now = new FileAttr ($tree, $rel, $digest);
+
+    if ($entry->{KIND} eq 'added') {
+	return ($now->{TYPE} eq 'nonexistent') ? ("   since removed: as in the spec again") : ();
+    }
+    if ($entry->{KIND} eq 'deleted') {
+	return ($now->{TYPE} ne 'nonexistent') ? ("   since restored: exists again (now a $now->{TYPE})") : ();
+    }
+    return ("   since deleted") if ($now->{TYPE} eq 'nonexistent');
+
+    my $same = sub { my ($x, $y) = @_;
+		     return (!defined ($x) && !defined ($y)) ||
+			 (defined ($x) && defined ($y) && $x eq $y) };
+    $reverted = 1;
+    foreach my $attr (@attrs) {
+	my ($old, $new) = @{$entry->{VALUES}{$attr}};
+	my $current = $now->{AttrDisplay::field ($attr)};
+	if ($attr eq 'mtimestasis') {
+	    # Modified at last: no longer unchanged since $old.
+	    $reverted = 0;
+	    $modified = AttrDisplay::value ('mtime', $current) unless ($same->($current, $old));
+	}
+	elsif ($same->($current, $old)) {
+	    next;
+	}
+	else {
+	    $reverted = 0;
+	    # In the form of the lines above it, indented under it.
+	    push (@again, $verbose ? (map { "   $_" } AttrDisplay::long_lines ($attr, $new, $current)) :
+		  "      " . AttrDisplay::change ($attr, $new, $current))
+		unless ($same->($current, $new));
+	}
+    }
+    return ("   since reverted: as in the spec again (an update would record no change)")
+	if ($reverted);
+    return (($modified ? ("   modified since the check (mtime now $modified)") : ()),
+	    (@again ? ("   changed again since the check:", @again) : ()));
 }
 
 # Subroutine to check sets.  We check all trees that contain references
@@ -1726,6 +2010,9 @@ sub check_sets {
 	sigtree_verify ("$spec_dir_dir/$spec_spec");
     }
     check_tree ($config, $TREE_ROOT, $spec_dir, '.', '', $changedfile, "$spec_dir_dir/$spec_spec");
+    # As for every tree: before 1.31 the spec dir had no check time, so
+    # changes died (exit 2) whenever check had found it changed.
+    $changedfile->add_time ($spec_dir);
 
     print "\nChecking individual specifications." if ($verbose && !$specs_only);
     if ($subtree_only) {
@@ -1992,38 +2279,64 @@ sub show_change_details {
 	printf "TOTAL                 %-7s %-7s %-7s\n", $total_changes, $total_additions, $total_deletions;
 	print "\nChanged Objects:";
 	foreach $set (@changed_sets) {
+	    # With -m, paths inside each macOS app, counted.
+	    my %apps;
 	    ($priority, $description, $changes, $additions, $deletions) = $changedfile->get_set_info ($set);
 	    print "\n$description (set $set, priority $priority)\n";
 	    print "Changes: $changes, Additions: $additions, Deletions: $deletions\n";
 	    if ($changes > 0) {
-		print "Changes:\n";
+		# Each changed path with the spec's value and the value found
+		# for each changed attribute (or only their names, from a
+		# changed file from before 1.31), and only those -k names.
+		# The lists are parallel; before 1.31 a path left out by -m
+		# put the rest of the attributes out of step.
+		my (@values, @lines, $hidden, $app);
 		@paths = $changedfile->get_set_changes ($set);
 		@attrs = $changedfile->get_set_changed_attrs ($set);
-		foreach $path (@paths) {
-		    if (!$no_macos_app_contents || $path !~ /$MACOS_APP_CONTENTS/) {
-			$attr = shift (@attrs);
-			print "   $path ($attr)\n";
+		@values = $changedfile->get_set_changed_values ($set);
+		$hidden = 0;
+		foreach my $i (0 .. $#paths) {
+		    if ($no_macos_app_contents && defined ($app = _macos_app ($paths[$i]))) {
+			$apps{$app}{'changed'}++;
+			next;
 		    }
+		    my $shown = _change_summary ([ split (/,/, $attrs[$i] // '') ], $values[$i]);
+		    if (!defined ($shown)) {
+			$hidden++;
+			next;
+		    }
+		    push (@lines, "   " . AttrDisplay::esc ($paths[$i]) . " ($shown)\n");
 		}
+		print "Changes:\n", @lines if (@lines || $hidden);
+		print "   ($hidden more changed only in attributes -k leaves out)\n" if ($hidden);
 	    }
 	    if ($additions > 0) {
-		print "Additions:\n";
+		my @lines;
 		@paths = $changedfile->get_set_additions ($set);
 		foreach $path (@paths) {
-		    if (!$no_macos_app_contents || $path !~ /$MACOS_APP_CONTENTS/) {
-			print "   $path\n";
+		    if ($no_macos_app_contents && defined (my $app = _macos_app ($path))) {
+			$apps{$app}{'added'}++;
+		    }
+		    else {
+			push (@lines, "   " . AttrDisplay::esc ($path) . "\n");
 		    }
 		}
+		print "Additions:\n", @lines if (@lines);
 	    }
 	    if ($deletions > 0) {
-		print "Deletions:\n";
+		my @lines;
 		@paths = $changedfile->get_set_deletions ($set);
 		foreach $path (@paths) {
-		    if (!$no_macos_app_contents || $path !~ /$MACOS_APP_CONTENTS/) {
-			print "   $path\n";
+		    if ($no_macos_app_contents && defined (my $app = _macos_app ($path))) {
+			$apps{$app}{'deleted'}++;
+		    }
+		    else {
+			push (@lines, "   " . AttrDisplay::esc ($path) . "\n");
 		    }
 		}
+		print "Deletions:\n", @lines if (@lines);
 	    }
+	    print map { "$_\n" } _macos_app_lines (\%apps);
 	}
 
 	# Save list of changed items.
@@ -2072,17 +2385,20 @@ sub check_tree {
         $primary_set = $config->primary_set_for_path ($tree, $path);
     }
 
+    # With -m, changes inside a macOS app are not shown one by one; the
+    # summary counts them per app. (The full path: the tree itself may
+    # be an app, or inside one.)
     $macos_OK_flag = (!$no_macos_app_contents ||
-		      $path !~ /$MACOS_APP_CONTENTS/);
+		      !defined (_macos_app (($path eq '.') ? $tree : "$tree/$path")));
 
     ($description, $keywords, $priority) = $config->set_info ($primary_set);
 
     %differences = $fileattr->compare ($fileattr2, $keywords);
 
     if ($differences{'any'}) {
-	$changedfile->add ($tree, $path, $primary_set, %differences);
+	$changedfile->add ($tree, $path, $primary_set, $fileattr, %differences);
 
-	$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose);
+	$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose && $macos_OK_flag);
     }
     elsif ($differences{'mtimestasis'}) { # special case for where only change is a noticeable lack of change.
 	$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose && $macos_OK_flag);
@@ -2171,9 +2487,11 @@ sub update_sets {
 	    $changedfile->delete_if_empty;
 	    $removed_old_trees = 1;
 	}
+	# No "last" here: every tree is looked at, so that trees no longer
+	# in the config are always removed (before 1.31 they were missed if
+	# a tree to update came first).
 	elsif ($config->tree_uses_sets ($tree, @sets)) {
 	    $something_to_update = 1;
-	    last;
 	}
     }
     if (!$something_to_update) {
@@ -3247,6 +3565,8 @@ sub setup_privsep_per_worker {
 	    # flock, or execute external commands.
 	    if ($command eq 'changes') {
 		@promises = (@READONLY_PROMISES, @PRIVSEP_PRIV_PROMISES);
+		# Reading flags it is asked for runs ls.
+		push (@promises, @EXEC_PROMISES) if (defined ($changes_query));
 	    }
 	    
 	    pledge (@promises) || die "Cannot pledge privileged parent promises. $!\n";
@@ -6185,89 +6505,6 @@ sub compare {
     return (%differences);
 }
 
-# Internal method to display a specific differing attribute.
-sub _display_diff {
-    my $self = shift;
-    my $class = ref ($self) || $self;
-    my ($attr, $original, $new) = @_;
-    my ($spaces, $number, $unit);
-    my %NUMBERS = (
-		   1, 'one',
-		   2, 'two',
-		   3, 'three',
-		   4, 'four',
-		   5, 'five',
-		   6, 'six',
-		   7, 'seven',
-		   8, 'eight',
-		   9, 'nine',
-		   10, 'ten'
-		   );
-    my %TIME_UNITS = (
-		      's', 'second',
-		      'm', 'minute',
-		      'h', 'hour',
-		      'd', 'day'
-		      );
-
-    if (!defined ($original)) {
-	$original = '<undefined>';
-    }
-    if (!defined ($new)) {
-	$new = '<undefined>';
-    }
-
-    if ($attr eq 'mode') {
-	if ($original ne '<undefined>') {
-	    $original = sprintf "%0lo", $original;
-	    $original = substr ($original, 2, 4);
-	}
-	if ($new ne '<undefined>') {
-	    $new = sprintf "%0lo", $new;
-	    $new = substr ($new, 2, 4);
-	}
-    }
-    elsif ($attr =~ /time/) {
-	if ($original ne '<undefined>') {
-	    $original = localtime ($original);
-	}
-	if ($attr eq 'modification time stasis') {
-	    ($number, $unit) = split (/,/, $new);
-	    $unit = $TIME_UNITS{$unit};
-	    if ($number > 1) {
-		$unit .= 's';
-	    }
-	    if ($number < 11) {
-		$number = $NUMBERS{$number};
-	    }
-	    $new = "$number $unit";
-	}
-	elsif ($new ne '<undefined>') {
-	    $new = localtime ($new);
-	}
-    }
-
-    if (length ($original) > 20 || length ($new) > 20) {
-	$spaces = length ($attr) + 14;
-	if ($attr eq 'modification time stasis') {
-	    print "   modification time has not changed from $original for more than\n";
-	    printf "   %" . $spaces . "s%s\n", ' ', $new;
-	}
-	else {
-	    print "   $attr changed from $original to\n";
-	    printf "   %" . $spaces . "s%s\n", ' ', $new;
-	}
-    }
-    else {
-	if ($attr eq 'modification time stasis') {
-	    print "   modification time has not changed from $original for more than $new.\n";
-	}
-	else {
-	    print "   $attr changed from $original to $new.\n";
-	}
-    }
-}
-
 # Method to display differences between two FileAttr records
 # that have been compared.
 sub display_diffs {
@@ -6287,7 +6524,7 @@ sub display_diffs {
     else {
 	$display_path = $self->{PATH};
     }
-    print "\n   $display_path (set $primary_set, priority $priority)\n";
+    print "\n   " . AttrDisplay::esc ($display_path) . " (set $primary_set, priority $priority)\n";
     if ($differences{'added'}) {
 	if ($differences{'type'} eq 'nonexistent') {
 	    print "   new file was added but has subsequently been deleted.\n";
@@ -6301,48 +6538,13 @@ sub display_diffs {
 	print "   $self->{TYPE} deleted.\n";
     }
 
-    if ($differences{'type'}) {
-	print "   type changed from $self->{TYPE} to $differences{'type'}.\n";
-    }
-    if ($differences{'linktarget_type'}) {
-	print "   link target type changed from $self->{LINKTARGET_TYPE} to $differences{'linktarget_type'}.\n";
-    }
-    if ($differences{'mode'}) {
-	$self->_display_diff ('mode', $self->{MODE}, $differences{'mode'});
-    }
-    if ($differences{'uid'}) {
-	$self->_display_diff ('uid', $self->{UID}, $differences{'uid'});
-    }
-    if ($differences{'gid'}) {
-	$self->_display_diff ('gid', $self->{GID}, $differences{'gid'});
-    }
-    if ($differences{'size'}) {
-	$self->_display_diff ('size', $self->{SIZE}, $differences{'size'});
-    }
-    if ($differences{'mtime'}) {
-	$self->_display_diff ('modification time', $self->{MTIME}, $differences{'mtime'});
-    }
-    elsif ($differences{'mtimestasis'}) {
-	$self->_display_diff ('modification time stasis', $self->{MTIME}, $differences{'mtimestasis'});
-    }
-    if ($differences{'ctime'}) {
-	$self->_display_diff ('inode change time', $self->{CTIME}, $differences{'ctime'});
-    }
-    if ($differences{'nlink'}) {
-	$self->_display_diff ('nlink', $self->{NLINK}, $differences{'nlink'});
-    }
-    if ($differences{'shadigest'}) {
-	$self->_display_diff ('shadigest', $self->{SHADIGEST}, $differences{'shadigest'});
-    }
-    if ($differences{'flags'}) {
-	$self->_display_diff ('flags', $self->{FLAGS}, $differences{'flags'});
-    }
-    if ($differences{'rdev'}) {
-	$self->_display_diff ('device number', device_number ($self->{RDEV}),
-			      device_number ($differences{'rdev'}));
-    }
-    if ($differences{'link'}) {
-	$self->_display_diff ('symbolic link target', $self->{LINK}, $differences{'link'});
+    # Each change in its long form, as changes -v shows it for a named
+    # path (AttrDisplay).
+    foreach my $attr (AttrDisplay::attrs ()) {
+	next unless ($differences{$attr});
+	next if ($attr eq 'mtimestasis' && $differences{'mtime'});
+	print map { "$_\n" } AttrDisplay::long_lines ($attr, $self->{AttrDisplay::field ($attr)},
+						       $differences{$attr});
     }
 }
 
@@ -6610,6 +6812,8 @@ sub new {
 	# Always use the current path, not what's serialized
 	# (handles case where file was moved or path config changed)
 	$self->{CHANGEDFILE} = $changed_file;
+	# A changed file from before 1.31 has no values.
+	$self->{SET_TO_PATH_CH_VALUES} //= {};
     }
     else {
 	$self = _initialize_empty_changedfile ($changed_file);
@@ -6633,6 +6837,7 @@ sub _initialize_empty_changedfile {
     $self->{SET_TO_PATH_DEL} = {}; 
     $self->{SET_TO_PATH_CHANGE} = {}; 
     $self->{SET_TO_PATH_CH_ATTR} = {};
+    $self->{SET_TO_PATH_CH_VALUES} = {};
     $self->{PATH} = {};
     
     return $self;
@@ -6650,18 +6855,22 @@ sub reset_changed_file {
     $self->{SET_TO_PATH_DEL} = {};
     $self->{SET_TO_PATH_CHANGE} = {};
     $self->{SET_TO_PATH_CH_ATTR} = {};
+    $self->{SET_TO_PATH_CH_VALUES} = {};
     $self->{PATH} = {};
     $self->{PATH_INDEX} = {};
     # don't reset TIME and USER
 }
 
 # Method to add a path to the changed file (unless already present).
-# Update counters for changes for this check.  Set is primary set.
+# Update counters for changes for this check.  Set is primary set. $old
+# is the path's FileAttr from the spec: for a changed path, each changed
+# attribute's value in the spec and the value found are stored (since
+# 1.31), so that the summary and changes can show them.
 sub add {
     my $self = shift;
     my $class = ref ($self) || $self;
-    my ($tree, $path, $set, %differences) = @_;
-    my ($full_path, $changed_attrs);
+    my ($tree, $path, $set, $old, %differences) = @_;
+    my ($full_path, $changed_attrs, @attrs);
 
     if ($path eq '.') {
 	$full_path = $tree;
@@ -6684,8 +6893,12 @@ sub add {
         ${$self->{CHANGES}}{'_total_'}++;
         ${$self->{CHANGES}}{$set}++;
         push (@{${$self->{SET_TO_PATH_CHANGE}}{$set}}, "$full_path");
-        $changed_attrs = join (',', grep (!/^any$|^added|^deleted/, keys (%differences)));
+        @attrs = grep { exists ($differences{$_}) } AttrDisplay::attrs ();
+        $changed_attrs = join (',', @attrs);
         push (@{${$self->{SET_TO_PATH_CH_ATTR}}{$set}}, $changed_attrs);
+        push (@{${$self->{SET_TO_PATH_CH_VALUES}}{$set}},
+	      { map { ($_ => [ ($old ? $old->{AttrDisplay::field ($_)} : undef),
+			       $differences{$_} ]) } @attrs });
     }
 
 
@@ -6751,14 +6964,18 @@ sub copy_tree_from {
 	    ${$self->{$counts}}{'_total_'} += @paths;
 	}
     }
-    # Changed paths and their changed attributes are parallel lists.
+    # Changed paths and their changed attributes and values are parallel
+    # lists (the values may be missing, from a changed file from before
+    # 1.31).
     foreach my $set (keys (%{$other->{SET_TO_PATH_CHANGE} || {}})) {
 	my $paths = ${$other->{SET_TO_PATH_CHANGE}}{$set};
 	my $attrs = ${$other->{SET_TO_PATH_CH_ATTR}}{$set} || [];
+	my $values = ${$other->{SET_TO_PATH_CH_VALUES} || {}}{$set} || [];
 	foreach my $i (0 .. $#{$paths}) {
 	    next unless ($paths->[$i] =~ $in_tree);
 	    push (@{${$self->{SET_TO_PATH_CHANGE}}{$set}}, $paths->[$i]);
 	    push (@{${$self->{SET_TO_PATH_CH_ATTR}}{$set}}, $attrs->[$i] // '');
+	    push (@{${$self->{SET_TO_PATH_CH_VALUES}}{$set}}, $values->[$i]);
 	    ${$self->{CHANGES}}{$set}++;
 	    ${$self->{CHANGES}}{'_total_'}++;
 	}
@@ -6795,6 +7012,12 @@ sub merge {
 	    ${$self->{CHANGES}}{$set} +=  ${$other->{CHANGES}}{$set};
 	    push (@{${$self->{SET_TO_PATH_CHANGE}}{$set}}, @{${$other->{SET_TO_PATH_CHANGE}}{$set}}) unless ($set eq '_total_');
 	    push (@{${$self->{SET_TO_PATH_CH_ATTR}}{$set}}, @{${$other->{SET_TO_PATH_CH_ATTR}}{$set}}) unless ($set eq '_total_');
+	    # Values, kept parallel to the paths.
+	    unless ($set eq '_total_') {
+		my $count = scalar (@{${$other->{SET_TO_PATH_CHANGE}}{$set}});
+		my $values = ${$other->{SET_TO_PATH_CH_VALUES} || {}}{$set} || [];
+		push (@{${$self->{SET_TO_PATH_CH_VALUES}}{$set}}, @{$values}[0 .. $count - 1]);
+	    }
         }
     }
 
@@ -6934,6 +7157,73 @@ sub get_set_changed_attrs {
     return (@attrs);
 }
 
+# Method to get array of changed attributes' values for paths in a set,
+# parallel to get_set_changes: for each path, a hash of attribute =>
+# [value in the spec, value found by the check], or undef if the changed
+# file is from before 1.31.
+sub get_set_changed_values {
+    my $self = shift;
+    my $class = ref ($self) || $self;
+    my ($set) = @_;
+    my ($changes, $values);
+
+    $changes = ${$self->{CHANGES}}{$set} || 0;
+    return () unless ($changes > 0);
+    $values = ${$self->{SET_TO_PATH_CH_VALUES} || {}}{$set} || [];
+    return (@{$values}[0 .. $#{${$self->{SET_TO_PATH_CHANGE}}{$set}}]);
+}
+
+# Method to return the pending paths of the trees in the changed file,
+# sorted, one hash each: TREE, PATH (the full path), SET, KIND
+# ('changed', 'added' or 'deleted'), and for a changed path ATTRS (a
+# list of the changed attributes) and VALUES (as get_set_changed_values).
+sub get_entries {
+    my $self = shift;
+    my $class = ref ($self) || $self;
+    my (@trees, @entries, %sets);
+
+    @trees = keys (%{$self->{PATH}});
+    foreach my $lists ('SET_TO_PATH_ADD', 'SET_TO_PATH_DEL', 'SET_TO_PATH_CHANGE') {
+	$sets{$_} = 1 foreach (keys (%{$self->{$lists} || {}}));
+    }
+    foreach my $set (keys (%sets)) {
+	foreach my $path ($self->get_set_additions ($set)) {
+	    push (@entries, { PATH => $path, SET => $set, KIND => 'added' });
+	}
+	foreach my $path ($self->get_set_deletions ($set)) {
+	    push (@entries, { PATH => $path, SET => $set, KIND => 'deleted' });
+	}
+	my @paths = $self->get_set_changes ($set);
+	my @attrs = $self->get_set_changed_attrs ($set);
+	my @values = $self->get_set_changed_values ($set);
+	foreach my $i (0 .. $#paths) {
+	    push (@entries, { PATH => $paths[$i], SET => $set, KIND => 'changed',
+			      ATTRS => [ split (/,/, $attrs[$i] // '') ],
+			      VALUES => $values[$i] });
+	}
+    }
+    # Each path's tree, the longest that holds it. A path of a tree no
+    # longer in the changed file (a changed file from before 1.31, after
+    # an update of some of its trees) is left out.
+    foreach my $entry (@entries) {
+	$entry->{TREE} = _path_tree ($entry->{PATH}, @trees);
+    }
+    return (sort { $a->{PATH} cmp $b->{PATH} } grep { defined ($_->{TREE}) } @entries);
+}
+
+# The tree, of those given, that holds a full path (the longest, since
+# one tree may lie within another).
+sub _path_tree {
+    my ($path, @trees) = @_;
+    my $best;
+
+    foreach my $tree (@trees) {
+	next unless ($path eq $tree || index ($path, ($tree eq '/') ? '/' : "$tree/") == 0);
+	$best = $tree if (!defined ($best) || length ($tree) > length ($best));
+    }
+    return $best;
+}
+
 # Method to return an array of tree names in the changed file.
 sub get_trees {
     my $self = shift;
@@ -6990,7 +7280,7 @@ sub get_times {
     my ($tree) = @_;
     my (@times);
 
-    @times = @{${$self->{TIME}}{$tree}};
+    @times = @{${$self->{TIME}}{$tree} || []};
     return (@times);
 }
 
@@ -7002,7 +7292,7 @@ sub get_users {
     my ($tree) = @_;
     my (@users);
 
-    @users = @{${$self->{USER}}{$tree}};
+    @users = @{${$self->{USER}}{$tree} || []};
     return (@users);
 }
 
@@ -7011,6 +7301,33 @@ sub delete {
     my $self = shift;
     my $class = ref ($self) || $self;
     my ($tree) = @_;
+    my @trees = keys (%{$self->{PATH}});
+
+    # And the tree's paths from the per-set lists and counts, which
+    # before 1.31 were left behind, so that after an update of some
+    # trees, changes -v still listed the updated trees' paths.
+    foreach my $kind (['ADDITIONS', 'SET_TO_PATH_ADD'],
+		      ['DELETIONS', 'SET_TO_PATH_DEL'],
+		      ['CHANGES', 'SET_TO_PATH_CHANGE', 'SET_TO_PATH_CH_ATTR',
+		       'SET_TO_PATH_CH_VALUES']) {
+	my ($counts, $lists, @parallel) = @{$kind};
+	foreach my $set (keys (%{$self->{$lists} || {}})) {
+	    my $paths = ${$self->{$lists}}{$set};
+	    my @keep = grep { (_path_tree ($paths->[$_], @trees) // '') ne $tree } (0 .. $#{$paths});
+	    my $removed = scalar (@{$paths}) - scalar (@keep);
+	    next unless ($removed);
+	    foreach my $list ($lists, @parallel) {
+		my $old = ${$self->{$list} || {}}{$set} || [];
+		${$self->{$list}}{$set} = [ @{$old}[@keep] ];
+	    }
+	    ${$self->{$counts}}{$set} -= $removed;
+	    ${$self->{$counts}}{'_total_'} -= $removed;
+	    if (${$self->{$counts}}{$set} <= 0) {
+		delete (${$self->{$counts}}{$set});
+		delete (${$self->{$_}}{$set}) foreach ($lists, @parallel);
+	    }
+	}
+    }
 
     delete (${$self->{PATH}}{$tree});
     delete (${$self->{PATH_INDEX}}{$tree});
@@ -7081,6 +7398,173 @@ sub store_changedfile {
 
 ### End ChangedFile package.
 
+### AttrDisplay package.
+
+# How a change in an attribute is shown, shared by check's per-path
+# output (-v) and closing summary, changes, and the verify_hosts detail
+# query. Attributes are named as in the changed file, by their sigtree
+# keywords, and each is held in a FileAttr field. Nothing here is set up
+# by the package body, which the main program never reaches (it exits
+# first), so the tables are returned by subs.
+package AttrDisplay;
+
+use strict;
+use warnings;
+use POSIX ();
+
+# The attributes, in the order they are shown.
+sub attrs {
+    return qw(type linktarget_type mode uid gid size mtime mtimestasis ctime
+	      nlink shadigest flags rdev link);
+}
+
+# The FileAttr field an attribute is held in (for mtimestasis, the
+# modification time that has not changed).
+sub field {
+    my ($attr) = @_;
+    return ($attr eq 'mtimestasis') ? 'MTIME' : uc ($attr);
+}
+
+sub _label {
+    my ($attr) = @_;
+    my %label = (linktarget_type => 'link target type', mtime => 'modification time',
+		 ctime => 'inode change time', rdev => 'device number',
+		 link => 'symbolic link target');
+    return $label{$attr} // $attr;
+}
+
+# Control characters escaped, so that a file name or link target cannot
+# write to the terminal.
+sub esc {
+    my ($text) = @_;
+    return '' unless (defined ($text));
+    $text =~ s/([\x00-\x1f\x7f])/sprintf ('\\x%02x', ord ($1))/ge;
+    return $text;
+}
+
+# The attributes that -k names, as sigtree keywords (sha2digest and
+# sha3digest mean shadigest, and mtime includes mtimestasis). Dies on an
+# unknown keyword.
+sub keyword_attrs {
+    my ($keywords) = @_;
+    my %alias = (sha2digest => 'shadigest', sha3digest => 'shadigest');
+    my %known = map { ($_ => 1) } grep { $_ ne 'mtimestasis' } attrs ();
+    my %want;
+
+    foreach my $keyword (split (/\s*,\s*/, $keywords)) {
+	next if ($keyword eq '');
+	my $attr = $alias{$keyword} // $keyword;
+	die "Unknown keyword \"" . esc ($keyword) . "\" in -k (expected any of " .
+	    join (',', sort (keys (%known), keys (%alias))) . ").\n" unless ($known{$attr});
+	$want{$attr} = 1;
+	$want{'mtimestasis'} = 1 if ($attr eq 'mtime');
+    }
+    die "No keywords given with -k.\n" unless (%want);
+    return grep { $want{$_} } attrs ();
+}
+
+# The attributes shown: all of them, unless set_filter has named some.
+our $FILTER;
+sub set_filter {
+    my (@attrs) = @_;
+    $FILTER = { map { ($_ => 1) } @attrs };
+}
+
+sub shown {
+    my (@attrs) = @_;
+    return @attrs unless ($FILTER);
+    return grep { $FILTER->{$_} } @attrs;
+}
+
+# Words for an mtimestasis limit ("2,d" is "two days").
+sub _stasis {
+    my ($limit) = @_;
+    my %numbers = (1 => 'one', 2 => 'two', 3 => 'three', 4 => 'four', 5 => 'five',
+		   6 => 'six', 7 => 'seven', 8 => 'eight', 9 => 'nine', 10 => 'ten');
+    my %units = (s => 'second', m => 'minute', h => 'hour', d => 'day');
+    my ($number, $unit) = split (/,/, $limit // '');
+    return esc ($limit) unless (defined ($unit) && $units{$unit} && $number =~ /^\d+\z/);
+    $unit = $units{$unit};
+    $unit .= 's' if ($number > 1);
+    $number = $numbers{$number} if ($number < 11 && $numbers{$number});
+    return "$number $unit";
+}
+
+# A value as shown: modes as permission bits in octal, times as dates
+# (in full with long), device numbers as major,minor (raw with raw_rdev:
+# verify_hosts may be showing a spec from another OS), and digests cut
+# to 12 characters with short.
+sub value {
+    my ($attr, $value, %opt) = @_;
+    my $field = field ($attr);
+
+    return '(none)' unless (defined ($value));
+    if ($field eq 'MODE' && $value =~ /^\d+\z/) {
+	return sprintf ('%04o', $value & 07777);
+    }
+    if (($field eq 'MTIME' || $field eq 'CTIME') && $value =~ /^\d+\z/) {
+	return $opt{'long'} ? scalar (localtime ($value)) :
+	    POSIX::strftime ('%Y-%m-%d %H:%M', localtime ($value));
+    }
+    if ($field eq 'RDEV' && !$opt{'raw_rdev'}) {
+	return FileAttr::device_number ($value);
+    }
+    $value = esc ($value);
+    if ($field eq 'SHADIGEST' && $opt{'short'} && length ($value) > 15) {
+	return substr ($value, 0, 12) . '...';
+    }
+    return $value;
+}
+
+# One change, on one line: "mode 0644 -> 0600".
+sub change {
+    my ($attr, $old, $new, %opt) = @_;
+
+    if ($attr eq 'mtimestasis') {
+	return 'mtime unchanged since ' . value ('mtime', $old, %opt) .
+	    ', more than ' . _stasis ($new);
+    }
+    my ($o, $n) = (value ($attr, $old, %opt), value ($attr, $new, %opt));
+    # Two times in the same minute: with the seconds.
+    if ($o eq $n && ($attr eq 'mtime' || $attr eq 'ctime') && !$opt{'long'}) {
+	($o, $n) = map { /^\d+\z/ ? POSIX::strftime ('%Y-%m-%d %H:%M:%S', localtime ($_)) : value ($attr, $_) }
+	    ($old, $new);
+    }
+    return "$attr $o -> $n";
+}
+
+# One change in check's long form: one line, or two when a value is
+# long (a digest, a time or a link target), with the new value on the
+# second.
+sub long_lines {
+    my ($attr, $old, $new) = @_;
+    my $label = _label ($attr);
+    my ($stasis, $indent);
+
+    if ($attr eq 'mtimestasis') {
+	$stasis = 1;
+	$old = value ('mtime', $old, 'long' => 1);
+	$new = _stasis ($new);
+    }
+    else {
+	$old = value ($attr, $old, 'long' => 1);
+	$new = value ($attr, $new, 'long' => 1);
+    }
+
+    if (length ($old) > 20 || length ($new) > 20) {
+	$indent = '   ' . (' ' x (length ($label) + 14));
+	return ("   modification time has not changed from $old for more than", "$indent$new")
+	    if ($stasis);
+	return ("   $label changed from $old to", "$indent$new");
+    }
+    return ("   modification time has not changed from $old for more than $new.") if ($stasis);
+    return ("   $label changed from $old to $new.");
+}
+
+1;
+
+### End AttrDisplay package.
+
 ### VerifyHosts package.
 
 # The verify_hosts command, run on a server that collects other hosts'
@@ -7139,12 +7623,15 @@ sub _attr_fields {
 # Entry point. Returns the exit status: 0 if nothing was reported, 1 if
 # anything was.
 sub run {
-    my ($config_file, $verbose, $osname, @args) = @_;
+    my ($config_file, $verbose, $osname, $keywords, @args) = @_;
     my (@out, $reported);
 
     _attr_fields ();
     my $cf = _parse_config ($config_file);
-    return _details ($cf, $verbose, $osname, @args) if (@args);
+    if (@args) {
+	_set_show_fields ($verbose, $keywords);
+	return _details ($cf, $verbose, $osname, @args);
+    }
 
     _require_signify ();
 
@@ -7277,10 +7764,7 @@ sub _restrict {
 # contents) before it is printed: control characters, including newline,
 # as \xNN, so it cannot start a line or reach the terminal raw.
 sub _esc {
-    my ($text) = @_;
-    return '' unless (defined ($text));
-    $text =~ s/([\x00-\x1f\x7f])/sprintf ('\\x%02x', ord ($1))/ge;
-    return $text;
+    return AttrDisplay::esc (@_);
 }
 
 # Parse the verify_hosts config. "field: value" lines, # comments. Host
@@ -7986,9 +8470,15 @@ sub _details {
     my @out;
     my $ok = eval {
 	my $snapshots = _list_snapshots ($cf);
-	my ($error, $cur, $prev) = _select_window ($cf, $snapshots);
+	my ($error, $cur, $prev, $window) = _select_window ($cf, $snapshots);
 	die "$error\n" if (defined ($error));
 	my %cache;
+	# The snapshots strictly between the two ends, oldest first: if the
+	# previous copy of a spec cannot be verified (a GPG signature from
+	# before the host moved to signify, say), the oldest of these whose
+	# copy does verify becomes that spec's old end.
+	my @later = grep { $_->{TIME} > $prev->{TIME} && $_->{TIME} < $cur->{TIME} } @{$window};
+	my %later_files;
 	my $cur_files = _spec_files (_snapshot_dir ($cf, $cur, $name), $name);
 	my $prev_files = _spec_files (_snapshot_dir ($cf, $prev, $name), $name);
 
@@ -8021,20 +8511,41 @@ sub _details {
 	# others are listed with the reason, and the rest are still shown.
 	my (@pairs, @problems);
 	foreach my $spec (@names) {
-	    my (@versions, @spec_problems);
-	    foreach my $files ($prev_files, $cur_files) {
-		my $data;
-		if ($files->{$spec}) {
-		    ($data, my $problem) = _verify_copy ($files->{$spec}[0], $temp_dir, $key_file);
-		    push (@spec_problems, $problem) if (defined ($problem));
+	    my (@spec_problems, $old_data, $new_data);
+	    if ($cur_files->{$spec}) {
+		($new_data, my $problem) = _verify_copy ($cur_files->{$spec}[0], $temp_dir, $key_file);
+		push (@spec_problems, $problem) if (defined ($problem));
+	    }
+	    if ($prev_files->{$spec}) {
+		($old_data, my $problem) = _verify_copy ($prev_files->{$spec}[0], $temp_dir, $key_file);
+		if (defined ($problem) && !@spec_problems) {
+		    my $from;
+		    foreach my $snap (@later) {
+			$later_files{$snap->{NAME}} //=
+			    _spec_files (_snapshot_dir ($cf, $snap, $name), $name);
+			my $file = $later_files{$snap->{NAME}}{$spec} or next;
+			my ($data, $later_problem) = _verify_copy ($file->[0], $temp_dir, $key_file);
+			next if (defined ($later_problem));
+			($old_data, $from) = ($data, $snap);
+			last;
+		    }
+		    if ($from) {
+			push (@problems, $problem, "   so changes in " . _esc ($spec) . " are shown from " .
+			      "$from->{NAME} (" . _when ($from->{TIME}) . "), the oldest copy in the window that verifies");
+		    }
+		    else {
+			push (@spec_problems, $problem);
+		    }
 		}
-		push (@versions, $data);
+		elsif (defined ($problem)) {
+		    push (@spec_problems, $problem);
+		}
 	    }
 	    if (@spec_problems) {
 		push (@problems, @spec_problems, "   so changes in " . _esc ($spec) . " are not shown");
 	    }
 	    else {
-		push (@pairs, [$spec, @versions]);
+		push (@pairs, [$spec, $old_data, $new_data]);
 	    }
 	}
 
@@ -8065,16 +8576,23 @@ sub _details {
 }
 
 # FileAttr fields shown by the detail query, in order.
-sub _detail_fields {
-    return qw(TYPE MODE UID GID SIZE NLINK MTIME CTIME SHADIGEST LINK LINKTARGET_TYPE FLAGS RDEV);
-}
-
-sub _show_value {
-    my ($field, $value) = @_;
-    return '(none)' unless (defined ($value));
-    return sprintf ('%o', $value) if ($field eq 'MODE' && $value =~ /^\d+\z/);
-    return _when ($value) if (($field eq 'MTIME' || $field eq 'CTIME') && $value =~ /^\d+\z/);
-    return _esc ($value);
+# The attributes the detail query shows (AttrDisplay's filter). A spec
+# records type, mode, owner, group, size, link count and times for every
+# path, whatever its set's keywords, so a change in an attribute the host
+# never checks (most often mtime and ctime) would otherwise be listed
+# too. By default every attribute but mtime and ctime is shown; -v shows
+# them as well; -k names the ones to show, as sigtree keywords. The
+# host's own config is not read: it is unsigned and written by the host.
+our $TIMES_HINT;
+sub _set_show_fields {
+    my ($verbose, $keywords) = @_;
+    $TIMES_HINT = !defined ($keywords) && !$verbose;
+    if (defined ($keywords)) {
+	AttrDisplay::set_filter (AttrDisplay::keyword_attrs ($keywords));
+    }
+    elsif (!$verbose) {
+	AttrDisplay::set_filter (grep { $_ ne 'mtime' && $_ ne 'ctime' } AttrDisplay::attrs ());
+    }
 }
 
 # The FileAttr entries of a loaded spec, by full path.
@@ -8139,7 +8657,10 @@ sub _spec_details {
 	}
 	else {
 	    my @diffs = _attr_changes ($old, $new);
-	    push (@lines, @diffs ? map { "   $_" } @diffs : "   unchanged");
+	    my @all = _attr_changes ($old, $new, 1);
+	    push (@lines, @diffs ? map { "   $_" } @diffs :
+		  @all ? "   changed only in attributes not shown (" .
+		  join (', ', map { (split (/ /, $_))[0] } @all) . ")" : "   unchanged");
 	}
 	return @lines;
     }
@@ -8158,6 +8679,7 @@ sub _spec_details {
 	}
 	my ($oe, $ne) = (_entries ($old), _entries ($new));
 	my @changes;
+	my $hidden = 0;
 	my %all = (%{$oe}, %{$ne});
 	foreach my $path (sort keys %all) {
 	    if (!$oe->{$path}) {
@@ -8168,29 +8690,42 @@ sub _spec_details {
 	    }
 	    else {
 		my @diffs = _attr_changes ($oe->{$path}, $ne->{$path});
-		push (@changes, "   changed " . _esc ($path) . ": " . join ('; ', @diffs)) if (@diffs);
+		if (@diffs) {
+		    push (@changes, "   changed " . _esc ($path) . ": " . join ('; ', @diffs));
+		}
+		elsif (_attr_changes ($oe->{$path}, $ne->{$path}, 1)) {
+		    $hidden++;
+		}
 	    }
 	}
 	push (@lines, _esc ($spec) . " (tree " . _esc ($new->{TREE}) . "): " .
-	      (@changes ? scalar (@changes) . " paths" : "no paths changed"), @changes);
+	      (@changes ? scalar (@changes) . " paths" : "no paths changed") .
+	      ($hidden ? ", and $hidden changed only in attributes not shown" .
+	       ($TIMES_HINT ? ' (-v shows mtime and ctime)' : '') : ''),
+	      @changes);
     }
     return @lines;
 }
 
 sub _attr_summary {
     my ($fa) = @_;
-    return join (', ', map { lc ($_) . ' ' . _show_value ($_, $fa->{$_}) }
-		 grep { defined ($fa->{$_}) } qw(TYPE MODE UID GID SIZE));
+    return join (', ', map { "$_ " . AttrDisplay::value ($_, $fa->{uc ($_)}) }
+		 grep { defined ($fa->{uc ($_)}) } qw(type mode uid gid size));
 }
 
+# The changes between two versions of a path's record, as AttrDisplay
+# shows them (device numbers raw: the spec may be from another OS), for
+# the attributes shown, or for all with $all_fields.
 sub _attr_changes {
-    my ($old, $new) = @_;
+    my ($old, $new, $all_fields) = @_;
     my @diffs;
-    foreach my $field (_detail_fields ()) {
+    foreach my $attr (grep { $_ ne 'mtimestasis' } AttrDisplay::attrs ()) {
+	next unless ($all_fields || AttrDisplay::shown ($attr));
+	my $field = AttrDisplay::field ($attr);
 	my ($o, $n) = ($old->{$field}, $new->{$field});
 	next if (!defined ($o) && !defined ($n));
 	next if (defined ($o) && defined ($n) && $o eq $n);
-	push (@diffs, lc ($field) . ' ' . _show_value ($field, $o) . ' -> ' . _show_value ($field, $n));
+	push (@diffs, AttrDisplay::change ($attr, $o, $n, 'raw_rdev' => 1));
     }
     return @diffs;
 }
