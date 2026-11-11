@@ -17,7 +17,12 @@
     could miss removing a tree no longer in the config from the changed
     file. -m now counts changes inside each macOS app ("Inside macOS
     apps") in check's summary and changes rather than omitting them,
-    and check -v no longer lists them one by one.
+    and check -v no longer lists them one by one. check_file checked
+    nothing but the spec dir; it now checks the file, or a directory and
+    everything beneath it. A check now replaces pending changes only
+    for what it checked (the trees in the -s sets, the check_file path,
+    or for check_specs just the spec dir), keeping the rest from the
+    previous check; before, any check replaced all of them.
 8 November 2026 1.30:  No longer delete changed files when empty
     (use for verify_hosts), make changes exit 0 if changes are
     pending, 1 if changed file is empty, other nonzero for errors.

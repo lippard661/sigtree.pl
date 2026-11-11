@@ -474,6 +474,18 @@
 #    check had found the spec dir changed; and update stopped scanning
 #    the changed file at the first tree to update, so a tree no longer
 #    in the config was removed from it only if found before that.
+#    check_file checked nothing but the spec dir: the file's tree was
+#    dropped when trees were chosen by set (the path stood where the
+#    sets go), and for a directory below a tree's root, the paths of
+#    its entries left out that directory.
+#    A check now replaces only the changed file's records for what it
+#    covered: with -s, the trees in those sets; check_file, the path and
+#    everything beneath it; check_specs, only the spec dir (which every
+#    check covers). Pending changes elsewhere are carried over from the
+#    previous check, with their values and check times (a tree whose
+#    worker fails is carried over the same way). Before, every check
+#    replaced all of them, so a check of some sets, or check_file, lost
+#    the other trees' changes before they had been reviewed or updated.
 
 ### Required packages.
 
@@ -1847,7 +1859,7 @@ sub show_change_query {
 	    my @users = $changedfile->get_users ($tree);
 	    print "\n" if (defined ($last_tree));
 	    print "tree: $tree" . (($tree eq $spec_dir) ? " (specification dir)" : '');
-	    print ", checked " . localtime ($times[-1]) . " by $users[-1]" if (@times);
+	    print ", last checked " . localtime ($times[-1]) . " by $users[-1]" if (@times);
 	    print "\n";
 	    $last_tree = $tree;
 	}
@@ -2034,9 +2046,11 @@ sub check_sets {
 	$path = '.';
     }
 
-    # Make check behave like initialize.
+    # Make check behave like initialize. For check_file, @trees is the
+    # file's tree and @sets holds the file's path, not sets: before 1.31
+    # that tree was dropped here, so check_file checked only the spec dir.
     foreach $tree (@trees) {
-	push (@specified_trees, $tree) if ($config->tree_uses_sets ($tree, @sets));
+	push (@specified_trees, $tree) if ($subtree_only || $config->tree_uses_sets ($tree, @sets));
     }
     # Don't fork unnecessarily.
     if (scalar (@specified_trees) < $fork_children) {
@@ -2102,6 +2116,21 @@ sub check_sets {
 		}
 	    }
 	    );
+    }
+
+    # What this check covers, by tree: '.' for the whole tree, or for
+    # check_file the path checked. The changed file's records for
+    # everything else (other sets' trees, the rest of a tree for
+    # check_file, all trees for check_specs, and trees whose worker
+    # fails) are kept from the previous check; before 1.31 every check
+    # replaced them all. The spec dir is checked every time.
+    my %covered;
+    foreach $tree (@specified_trees) {
+	$tree_spec_name = path_to_spec ($tree);
+	next if ($specs_only ||
+		 (!$use_privsep && !-e "$spec_dir/$tree_spec_name") ||
+		 ($use_privsep && !grep { $_ eq $tree_spec_name } @EXISTING_SPECS));
+	$covered{$tree} = $path;
     }
 
     foreach $tree (@specified_trees) {
@@ -2229,20 +2258,37 @@ sub check_sets {
 	remove_temp_dir ($child_temp_dir);
     }
 
+    # Only if a failed worker cannot be matched to a tree (it should
+    # always be) is the changed file left as it was.
     if (@failed_trees) {
-	# Keep each failed tree's results from the previous check, so that
-	# neither they nor the other trees' results from this run are lost.
-	# Only if a failed worker cannot be matched to a tree (it should
-	# always be) is the changed file left as it was.
 	my %known = map { $_ => 1 } @specified_trees;
 	if (grep { !$known{$_} } @failed_trees) {
 	    show_change_details ($changedfile, $verbose, 0, $no_macos_app_contents);
 	    die "Check failed for " . scalar (@failed_trees) . " tree(s): @failed_trees\n" .
 		"The changed file was not updated; it still holds the previous check's results.\n";
 	}
-	foreach my $failed_tree (@failed_trees) {
-	    $changedfile->copy_tree_from ($previous_changedfile, $failed_tree);
-	}
+	# A failed tree's results from the previous check are kept.
+	delete ($covered{$_}) foreach (@failed_trees);
+    }
+
+    # Add the previous check's records for what this check did not cover.
+    my $carried = $previous_changedfile->copy;
+    $carried->keep_only (sub {
+	my ($tree, $full_path) = @_;
+	return 0 if ($tree eq $spec_dir);
+	return 1 unless (exists ($covered{$tree}));
+	return 0 if ($covered{$tree} eq '.');
+	# Joined as ChangedFile::add joins them.
+	my $checked = "$tree/$covered{$tree}";
+	return !($full_path eq $checked || index ($full_path, "$checked/") == 0);
+    });
+    # The check times are in the new changed file already (they are not
+    # reset).
+    $carried->{TIME} = {};
+    $carried->{USER} = {};
+    $changedfile->merge ($carried);
+
+    if (@failed_trees) {
 	show_change_details ($changedfile, $verbose, 1, $no_macos_app_contents);
 	die "Check failed for " . scalar (@failed_trees) . " tree(s): @failed_trees\n" .
 	    "The changed file holds this check's results for the other trees, and the\n" .
@@ -2409,22 +2455,18 @@ sub check_tree {
     # structure.
     if ($differences{'deleted_files'}) {
 	foreach $file (@{$differences{'deleted_files'}}) {
-	    $full_path = $file;
-	    if (!$tree_root) {
-	        $full_path = $path . '/' . $file;
-            }
+	    # Relative to the tree. (By $path, not $tree_root: check_file
+	    # can start at a directory below the tree's root.)
+	    $full_path = ($path eq '.') ? $file : $path . '/' . $file;
             check_tree ($config, $SUBTREE, $tree, $full_path, $spec, $changedfile);
 	}
     }
 
     if ($fileattr2->{TYPE} eq 'dir') {
 	# Read the entries' flags in batches rather than one ls each.
-	FileAttr::prefetch_flags ($tree, map { $tree_root ? $_ : "$path/$_" } @{$fileattr2->{FILES}});
+	FileAttr::prefetch_flags ($tree, map { ($path eq '.') ? $_ : "$path/$_" } @{$fileattr2->{FILES}});
         foreach $file (@{$fileattr2->{FILES}}) {
-	    $full_path = $file;
-	    if (!$tree_root) {
-	        $full_path = $path . '/' . $file;
-            }
+	    $full_path = ($path eq '.') ? $file : $path . '/' . $file;
             check_tree ($config, $SUBTREE, $tree, $full_path, $spec, $changedfile);
         }
     }
@@ -6906,7 +6948,7 @@ sub add {
     # that at once; scanning the list made recording N changes N*N/2
     # comparisons (an hour or more after a major OS upgrade). The index is
     # rebuilt whenever the list has changed under it (merge, delete,
-    # copy_tree_from, a changed file just read from disk), and is not
+    # keep_only, a changed file just read from disk), and is not
     # stored (store_changedfile).
     my $list = (${$self->{PATH}}{$tree} //= []);
     my $index = ${$self->{PATH_INDEX}}{$tree};
@@ -6938,50 +6980,6 @@ sub copy {
     my $self = shift;
 
     return Storable::dclone ($self);
-}
-
-# Method to copy one tree's records from another changed file: its
-# changed paths and the per-set lists and counts for paths in it. Used by
-# check to keep a tree's previous results when its worker failed. Check
-# times and users are not reset by reset_changed_file, so they are
-# already present.
-sub copy_tree_from {
-    my $self = shift;
-    my $class = ref ($self) || $self;
-    my ($other, $tree) = @_;
-    my $in_tree = qr{^\Q$tree\E(?:/|\z)};
-
-    return unless (${$other->{PATH}}{$tree});
-
-    foreach my $kind (['ADDITIONS', 'SET_TO_PATH_ADD'],
-		      ['DELETIONS', 'SET_TO_PATH_DEL']) {
-	my ($counts, $lists) = @{$kind};
-	foreach my $set (keys (%{$other->{$lists} || {}})) {
-	    my @paths = grep { /$in_tree/ } @{${$other->{$lists}}{$set}};
-	    next unless (@paths);
-	    push (@{${$self->{$lists}}{$set}}, @paths);
-	    ${$self->{$counts}}{$set} += @paths;
-	    ${$self->{$counts}}{'_total_'} += @paths;
-	}
-    }
-    # Changed paths and their changed attributes and values are parallel
-    # lists (the values may be missing, from a changed file from before
-    # 1.31).
-    foreach my $set (keys (%{$other->{SET_TO_PATH_CHANGE} || {}})) {
-	my $paths = ${$other->{SET_TO_PATH_CHANGE}}{$set};
-	my $attrs = ${$other->{SET_TO_PATH_CH_ATTR}}{$set} || [];
-	my $values = ${$other->{SET_TO_PATH_CH_VALUES} || {}}{$set} || [];
-	foreach my $i (0 .. $#{$paths}) {
-	    next unless ($paths->[$i] =~ $in_tree);
-	    push (@{${$self->{SET_TO_PATH_CHANGE}}{$set}}, $paths->[$i]);
-	    push (@{${$self->{SET_TO_PATH_CH_ATTR}}{$set}}, $attrs->[$i] // '');
-	    push (@{${$self->{SET_TO_PATH_CH_VALUES}}{$set}}, $values->[$i]);
-	    ${$self->{CHANGES}}{$set}++;
-	    ${$self->{CHANGES}}{'_total_'}++;
-	}
-    }
-    ${$self->{PATH}}{$tree} = [ @{${$other->{PATH}}{$tree}} ];
-    delete (${$self->{PATH_INDEX}}{$tree});
 }
 
 # Method to merge a changed file with the main changed file.
@@ -7027,8 +7025,8 @@ sub merge {
     # Add trees and check times and users for each tree.
     foreach $tree (@trees) {
 	push (@{${$self->{PATH}}{$tree}}, @{${$other->{PATH}}{$tree}});
-	push (@{${$self->{TIME}}{$tree}}, @{${$other->{TIME}}{$tree}});
-	push (@{${$self->{USER}}{$tree}}, @{${$other->{USER}}{$tree}});
+	push (@{${$self->{TIME}}{$tree}}, @{${$other->{TIME}}{$tree} || []});
+	push (@{${$self->{USER}}{$tree}}, @{${$other->{USER}}{$tree} || []});
     }
 }
 
@@ -7301,11 +7299,29 @@ sub delete {
     my $self = shift;
     my $class = ref ($self) || $self;
     my ($tree) = @_;
-    my @trees = keys (%{$self->{PATH}});
 
     # And the tree's paths from the per-set lists and counts, which
     # before 1.31 were left behind, so that after an update of some
     # trees, changes -v still listed the updated trees' paths.
+    $self->keep_only (sub { $_[0] ne $tree });
+
+    delete (${$self->{PATH}}{$tree});
+    delete (${$self->{PATH_INDEX}}{$tree});
+    delete (${$self->{TIME}}{$tree});
+    delete (${$self->{USER}}{$tree});
+}
+
+# Method to keep only the records of the paths for which
+# $keep->($tree, $full_path) is true: in the per-set lists (and their
+# counts) and the per-tree path lists. Check times and users are kept.
+# A path in a per-set list whose tree is no longer in the changed file
+# (left by a version before 1.31) is dropped.
+sub keep_only {
+    my $self = shift;
+    my $class = ref ($self) || $self;
+    my ($keep) = @_;
+    my @trees = keys (%{$self->{PATH}});
+
     foreach my $kind (['ADDITIONS', 'SET_TO_PATH_ADD'],
 		      ['DELETIONS', 'SET_TO_PATH_DEL'],
 		      ['CHANGES', 'SET_TO_PATH_CHANGE', 'SET_TO_PATH_CH_ATTR',
@@ -7313,7 +7329,8 @@ sub delete {
 	my ($counts, $lists, @parallel) = @{$kind};
 	foreach my $set (keys (%{$self->{$lists} || {}})) {
 	    my $paths = ${$self->{$lists}}{$set};
-	    my @keep = grep { (_path_tree ($paths->[$_], @trees) // '') ne $tree } (0 .. $#{$paths});
+	    my @keep = grep { my $tree = _path_tree ($paths->[$_], @trees);
+			      defined ($tree) && $keep->($tree, $paths->[$_]) } (0 .. $#{$paths});
 	    my $removed = scalar (@{$paths}) - scalar (@keep);
 	    next unless ($removed);
 	    foreach my $list ($lists, @parallel) {
@@ -7328,11 +7345,16 @@ sub delete {
 	    }
 	}
     }
-
-    delete (${$self->{PATH}}{$tree});
-    delete (${$self->{PATH_INDEX}}{$tree});
-    delete (${$self->{TIME}}{$tree});
-    delete (${$self->{USER}}{$tree});
+    foreach my $tree (@trees) {
+	my @paths = grep { $keep->($tree, ($_ eq '.') ? $tree : "$tree/$_") } @{${$self->{PATH}}{$tree}};
+	if (@paths) {
+	    ${$self->{PATH}}{$tree} = \@paths;
+	}
+	else {
+	    delete (${$self->{PATH}}{$tree});
+	}
+	delete (${$self->{PATH_INDEX}}{$tree});
+    }
 }
 
 # Method to delete a worker's temp changed file if there are no changed

@@ -14,6 +14,14 @@ BUGS:
 (1.31 fixed) check recorded no check time for the spec dir, so changes
     died (exit 2) whenever check had found the spec dir changed.
 
+(1.31 fixed) A check with -s (or check_file, or check_specs) replaced
+    all pending changes in the changed file, losing other trees' changes
+    not yet reviewed or updated. Now only what was checked is replaced.
+
+(1.31 fixed) check_file checked only the spec dir, never the file named
+    (its tree was dropped when trees were chosen by set), and for a
+    directory below a tree's root, its entries' paths were wrong.
+
 (1.31 fixed) if a tree is removed from config while present in the
     changed file: check already dropped it (reset_changed_file), and
     update now always removes it (it stopped scanning the changed file

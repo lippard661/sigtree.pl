@@ -138,7 +138,13 @@ changed file (and the secondary changed file) is kept when there is
 nothing in it, so its modification time is the time of the last check;
 test for pending changes with `changes`, not with the file's existence. For partial updates, only updated trees
 are removed from the pending changes file; unreviewed changes in other
-trees are preserved.
+trees are preserved. From 1.31 the same holds for check: `check -s`
+replaces the pending changes only for the trees in those sets,
+`check_file` only for that path (and everything beneath a directory),
+and `check_specs` only for the spec directory; the rest are kept from
+the previous check. (Before 1.31, any check replaced all of them, and
+`check_file` checked only the spec directory.) Successive checks without
+an update add to each tree's list of check times.
 
 From 1.31, check stores the spec's value and the value it found for each
 changed attribute, so check's closing summary and `changes -v` (which
