@@ -1,5 +1,14 @@
 BUGS:
 
+(1.32 fixed) After a review of 1.31 by another session: check_file did
+    not make its path canonical, so a trailing slash or .. recorded junk
+    paths (new exposure from the 1.31 check_file fix); update and some
+    warnings printed file names unescaped; some changes errors (bad
+    options, -k) did not exit 2; on OpenBSD with immutable-specs: no,
+    flags were recorded as undefined (chflags and ls not unveiled); under
+    privsep check -v always said there were no extraneous spec-dir files;
+    verify_hosts did not check that a spec holds the tree its name is for.
+
 (1.31 fixed) Partial update (or initialize) of some trees left their
     paths in the changed file's per-set lists, so changes -v (and
     check's summary) still listed changes to trees already updated.

@@ -486,6 +486,28 @@
 #    worker fails is carried over the same way). Before, every check
 #    replaced all of them, so a check of some sets, or check_file, lost
 #    the other trees' changes before they had been reviewed or updated.
+# Modified 11 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32), after a review of 1.31 by another session:
+#    check_file makes its path canonical as specs record paths (no "//",
+#    "/./" or trailing "/", and ".." resolved, refused after a symlink);
+#    since 1.31 made check_file work, "check_file dir/" or "../file"
+#    recorded every file under a name like "dir//file" that update then
+#    put in the spec for good. File names and privileged-parent errors are
+#    printed with control characters escaped in update's output (including
+#    the "There are no longer changes" warning), the spec dir's path list,
+#    the extraneous-file list, and the per-file warnings while hashing, as
+#    check -v and the summary already were. changes exits 2 on every error,
+#    including a bad option or -k keyword (the handler is now installed
+#    before options are checked), and an option given after the command
+#    ("changes -v") is refused as such before anything else. On OpenBSD,
+#    chflags and ls are unveiled whatever immutable-specs says: flags are
+#    read whenever a set has the flags keyword (a default), and with
+#    immutable-specs: no every path's flags were recorded as undefined.
+#    Under privsep, the spec dir's extraneous files are listed before the
+#    drop to _sigtree; check -v said there were none. verify_hosts checks
+#    that each spec holds the tree its file name is for (a validly signed
+#    spec copied over another tree's name), reports a mismatch and leaves
+#    that spec out.
 
 ### Required packages.
 
@@ -585,7 +607,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.31 of 10 November 2026';
+my $VERSION = 'sigtree 1.32 of 11 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -649,6 +671,7 @@ our $MAIN_PRIV_SOCK; # Main socket to privileged parent from unprivileged proces
 my @ALLOWED_TREES; # List of trees privileged parent can access.
 our $use_privsep;  # Use privilege separation.
 our @EXISTING_SPECS; # Collected before privs dropped to replace !-e tests.
+our @EXTRANEOUS_SPECS; # Likewise, extraneous files in the spec dir (privsep).
 
 # Return error codes for valid_setlist.
 my $SET_NAME_INVALID = 1;
@@ -726,8 +749,26 @@ our ($root_dir,     # Root dir to use.
 # Set umask.
 umask 077;
 
+# changes exits 0 if changes are pending and 1 if none are, so an error
+# must not exit 1. die's exit status is $! when that is set (it can be 1),
+# so for changes an error outside an eval exits 2. Installed before the
+# options are checked (1.32), since a bad option is an error too; $command
+# is set as soon as it is known (if getopts fails, from what it left).
+$SIG{__DIE__} = sub {
+    # Inside an eval, or while code is being compiled (a module's
+    # eval { require ... } at load time): let it be handled as usual.
+    return if (!defined ($^S) || $^S);
+    return unless (defined ($command) && $command eq 'changes');
+    print STDERR $_[0];
+    exit (2);
+};
+
 # Get/set options.
-getopts ('r:c:s:d:f:k:vhmpVD', \%opts) || die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+unless (getopts ('r:c:s:d:f:k:vhmpVD', \%opts)) {
+    $command = $ARGV[0];
+    die "sigtree.pl -h for help.\nUsage: sigtree.pl [options] command\n";
+}
+$command = $ARGV[0] if (@ARGV);
 
 # Debugging.
 $debug_flag = $opts{'D'} || 0;
@@ -862,22 +903,13 @@ die "The -k option can only be used with changes and verify_hosts.\n"
 # changes -k: show only these attributes.
 AttrDisplay::set_filter (AttrDisplay::keyword_attrs ($opts{'k'}))
     if (defined ($opts{'k'}) && $command eq 'changes');
+# getopts stops at the command, so "changes -v" passes -v on as an operand.
+die "Options go before the command: sigtree.pl " . AttrDisplay::esc ($ARGV[1]) . " changes\n"
+    if ($command eq 'changes' && $#ARGV == 1 && $ARGV[1] =~ /^-/);
 # changes spec or changes /path: the spec name or path asked about. The
 # paths are looked at again, which for flags runs ls or lsattr.
 $changes_query = $ARGV[1] if ($command eq 'changes' && $#ARGV == 1);
 
-# changes exits 0 if changes are pending and 1 if none are, so an error
-# must not exit 1. die's exit status is $! when that is set (it can be 1),
-# so for changes an error outside an eval exits 2.
-if ($command eq 'changes') {
-    $SIG{__DIE__} = sub {
-	# Inside an eval, or while code is being compiled (a module's
-	# eval { require ... } at load time): let it be handled as usual.
-	return if (!defined ($^S) || $^S);
-	print STDERR $_[0];
-	exit (2);
-    };
-}
 
 # verify_hosts reads other hosts' copied databases, not this host's
 # sigtree config, so it runs before that config is read.
@@ -1120,10 +1152,12 @@ if ($OSNAME eq 'openbsd') {
     # Need x to run the flag commands; r because they are file-tested.
     # (ls is run directly, not through /bin/sh.)
     # $SYSCTL absent because it's already been run.
-    if ($use_immutable) {
-	unveil ($CHFLAGS, 'rx');
-	unveil ($LIST_FLAGS_CMD, 'rx');
-    }
+    # Before 1.32 only with immutable flags in use, but flags are read
+    # with ls whenever a set has the flags keyword (a default), and the
+    # flag code tests that chflags exists first: without these, every
+    # path's flags were recorded as undefined.
+    unveil ($CHFLAGS, 'rx') if (-e $CHFLAGS);
+    unveil ($LIST_FLAGS_CMD, 'rx') if (-e $LIST_FLAGS_CMD);
     # Need x for crypto sign/verify and keys.
     if ($use_pgp) {
 	if ($use_signify) {
@@ -1183,13 +1217,12 @@ elsif ($command eq 'check' ||
     # Check existence of file with check_file. But don't abort, as if
     # it previously existed we'll report that in the check.
     if ($command eq 'check_file') {
-	print "File does not exist. $file\n" if (!-e $file);
-	if ($file =~ /^\.\// || $file !~ /^\//) {
+	if ($file !~ m{^/}) {
 	    require Cwd;
-	    my $cwd = Cwd::cwd();
-	    $file =~ s/^\.\///;
-	    $file = $cwd . '/' . $file;
+	    $file = Cwd::cwd () . '/' . $file;
 	}
+	$file = canonical_check_path ($file);
+	print "File does not exist. " . AttrDisplay::esc ($file) . "\n" if (!-e $file);
     }
 }
 elsif ($command eq 'update') {
@@ -1201,6 +1234,10 @@ elsif ($command eq 'update') {
 # Doing this AFTER any required dirs might have been created.
 if ($use_privsep) {
     @EXISTING_SPECS = _identify_extraneous_files ($config, $spec_dir, 1);
+    # And the extraneous ones, for check: after the drop to _sigtree the
+    # 0700 spec dir cannot be read, and before 1.32 check -v then said
+    # there were none.
+    @EXTRANEOUS_SPECS = _identify_extraneous_files ($config, $spec_dir);
     push (@EXISTING_SPECS, $changed_file) if (-e $changed_file);
 }
 
@@ -1310,6 +1347,35 @@ elsif ($command eq 'update') {
 }
 
 ### Subroutines.
+
+# Subroutine to make check_file's absolute path canonical, as the spec
+# records paths: no "//", "/./" or trailing "/", and ".." resolved. Before
+# 1.32, "check_file dir/" or "../file" was looked up as "dir/" or
+# "sub/../file", recorded as added under that name, and an update put the
+# name in the spec, where no check ever looks at it again. ".." is
+# resolved by removing the component before it, which is what the kernel
+# does unless that component is a symbolic link (then ".." is the link
+# target's parent), so in that case the path is refused. realpath is not
+# used: it would follow a symlink being checked, and turn a path through
+# a symlinked directory (/etc on macOS is /private/etc) into one that
+# matches no tree.
+sub canonical_check_path {
+    my ($path) = @_;
+    my @components;
+
+    foreach my $component (split (m{/+}, $path)) {
+	next if ($component eq '' || $component eq '.');
+	if ($component eq '..') {
+	    my $before = '/' . join ('/', @components);
+	    die "Cannot resolve \"..\" after the symbolic link " . AttrDisplay::esc ($before) .
+		"; give the path without \"..\".\n" if (@components && -l $before);
+	    pop (@components);
+	    next;
+	}
+	push (@components, $component);
+    }
+    return '/' . join ('/', @components);
+}
 
 # Subroutine to assist in optional module importing.
 # (Also used in reportnew.)
@@ -2511,7 +2577,7 @@ sub update_sets {
 	    # Why is there a blank first element in the array?
 	    foreach $changed_path (@changed_paths) {
 		$changed_path =~ s/^\.//;
-		print "   $changed_path\n" if ($changed_path ne '');
+		print "   " . AttrDisplay::esc ($changed_path) . "\n" if ($changed_path ne '');
 	    }
 	    # Instead of aborting, why not continue to update these?	    
 	    #	    return;
@@ -2628,19 +2694,19 @@ sub update_sets {
 				  $full_path !~ /$MACOS_APP_CONTENTS/);
 		$fileattr->display_diffs ($primary_set, $priority, %differences) if ($verbose && $macos_OK_flag);
 		if (!$differences{'any'}) {
-		    print "Warning: There are no longer changes to path $full_path.\n" if ($macos_OK_flag);
+		    print "Warning: There are no longer changes to path " . AttrDisplay::esc ($full_path) . ".\n" if ($macos_OK_flag);
 		}
 		elsif ($differences{'deleted'}) {
-		    print "   Deleting $path.\n" if ($verbose && $macos_OK_flag);
+		    print "   Deleting " . AttrDisplay::esc ($path) . ".\n" if ($verbose && $macos_OK_flag);
 		    $spec->delete ($tree, $changed_path);
 		}
 		else {
 		    if ($differences{'added'} && $differences{'type'} eq 'nonexistent') {
-			print "   No change made to spec for $path.\n" if ($verbose && $macos_OK_flag);
+			print "   No change made to spec for " . AttrDisplay::esc ($path) . ".\n" if ($verbose && $macos_OK_flag);
 		    }
 		    else {
-			print "   Adding $path.\n" if ($verbose && $differences{'added'} && $macos_OK_flag);
-			print "   Updating $path.\n" if ($verbose && !$differences{'added'} && $macos_OK_flag);
+			print "   Adding " . AttrDisplay::esc ($path) . ".\n" if ($verbose && $differences{'added'} && $macos_OK_flag);
+			print "   Updating " . AttrDisplay::esc ($path) . ".\n" if ($verbose && !$differences{'added'} && $macos_OK_flag);
 			$spec->update ($tree, $changed_path, $fileattr2);
 		    }
 		}
@@ -2987,11 +3053,11 @@ sub display_extraneous_files {
     my ($config, $spec_dir, $verbose) = @_;
     my (@extraneous_files, $file);
 
-    @extraneous_files = _identify_extraneous_files ($config, $spec_dir);
+    @extraneous_files = $use_privsep ? @EXTRANEOUS_SPECS : _identify_extraneous_files ($config, $spec_dir);
     if ($#extraneous_files >= 0) {
 	print "The following extraneous files were found in the specification dir $spec_dir.\n";
 	foreach $file (@extraneous_files) {
-	    print "   $file\n";
+	    print "   " . AttrDisplay::esc ($file) . "\n";
 	}
 	print "\n"; # Separator needed whether verbose or not. (Might be an edge case where this should not happen with verbose. check_specs -v?)
     }
@@ -5317,7 +5383,7 @@ sub request_stat {
 	my $errno = $response->{errno} // 0;
 	unless ($errno == ENOENT || $errno == ENOTDIR ||
 		(!$errno && $response->{error} =~ /No such file or directory/)) {
-	    warn "Privileged stat failed: $response->{error}\n";
+	    warn "Privileged stat failed: " . AttrDisplay::esc ($response->{error}) . "\n";
 	}
         return ();
     }
@@ -5358,10 +5424,10 @@ sub request_open {
     
     if ($response->{error}) {
 	if ($mode eq '>') {
-	    warn "Cannot write to $path: $response->{error}\n";
+	    warn "Cannot write to " . AttrDisplay::esc ($path) . ": " . AttrDisplay::esc ($response->{error}) . "\n";
 	}
 	else {
-	    warn "Privileged open failed: $response->{error}\n";
+	    warn "Privileged open failed: " . AttrDisplay::esc ($response->{error}) . "\n";
 	}
 	return undef;
     }
@@ -5387,7 +5453,7 @@ sub request_open {
 	warn "DEBUG: [PID $$] After recv FD, got fd=$fd for $path\n" if ($main::debug_flag);
 
 	if (!defined $fd || $fd < 0) {
-	    warn "Failed to receive file descriptor for $path [PID $$]\n";
+	    warn "Failed to receive file descriptor for " . AttrDisplay::esc ($path) . " [PID $$]\n";
 	    return undef;
 	}
 
@@ -5427,7 +5493,7 @@ sub request_readdir {
     my $response = recv_response($sock);
     
     if ($response->{error}) {
-        warn "Privileged readdir failed: $response->{error}\n";
+        warn "Privileged readdir failed: " . AttrDisplay::esc ($response->{error}) . "\n";
         return [];
     }
 
@@ -5448,7 +5514,7 @@ sub request_readlink {
     my $response = recv_response($sock);
     
     if ($response->{error}) {
-        warn "Privileged readlink failed: $response->{error}\n";
+        warn "Privileged readlink failed: " . AttrDisplay::esc ($response->{error}) . "\n";
         return undef;
     }
 
@@ -5468,7 +5534,7 @@ sub request_immutable_get {
     my $response = recv_response($sock);
     
     if ($response->{error}) {
-        warn "Privileged immutable check failed: $response->{error}\n";
+        warn "Privileged immutable check failed: " . AttrDisplay::esc ($response->{error}) . "\n";
         return undef;
     }
     
@@ -5896,7 +5962,7 @@ sub _get_sha_digest {
 	    my $err = $!;
 	    if ($err == ELOOP || $err == EMLINK) {
 		warn "File type changed between stat and open "
-		    . "(now a symlink): $full_path ($err)\n";
+		    . "(now a symlink): " . AttrDisplay::esc ($full_path) . " ($err)\n";
 	    }
             return undef;
         }
@@ -5913,7 +5979,7 @@ sub _get_sha_digest {
 	    my $err = $!;
 	    if ($err == ELOOP || $err == EMLINK) {
 		warn "File type changed between stat and open "
-		    . "(now a symlink): $full_path ($err)\n";
+		    . "(now a symlink): " . AttrDisplay::esc ($full_path) . " ($err)\n";
 		return undef;
 	    }
             # Unexpected - mode said we could read but we can't
@@ -5936,14 +6002,14 @@ sub _get_sha_digest {
 	    unless (@st) {
 		my $err = $!;
 		close $fh;
-		warn "fstat failed after open: $err ($full_path)\n";
+		warn "fstat failed after open: $err (" . AttrDisplay::esc ($full_path) . ")\n";
 		return undef;
 	    }
 	    if ($st[0] != $dev ||
 		$st[1] != $ino) {
 		close $fh;
 		warn "File identity changed between stat and open "
-		    . "(dev/ino mismatch): $full_path\n";
+		    . "(dev/ino mismatch): " . AttrDisplay::esc ($full_path) . "\n";
 		return undef;
 	    }
 	}
@@ -5972,7 +6038,7 @@ sub _get_sha_digest {
 	close $fh;
 	$err =~ s/ at \S+ line \d+\.?\n?\z//;
 	chomp ($err);
-	warn "$err ($full_path)\n";
+	warn AttrDisplay::esc ($err) . " (" . AttrDisplay::esc ($full_path) . ")\n";
 	return undef;
     }
     close $fh;
@@ -7635,6 +7701,7 @@ use constant DAY => 86400;
 # Spec attribute names that can be compared, and the FileAttr field each
 # one is stored in.
 our %ATTR_FIELD;
+our $LOAD_PROBLEM;     # why _load_spec refused a spec (1.32)
 
 sub _attr_fields {
     %ATTR_FIELD = (type => 'TYPE', shadigest => 'SHADIGEST', mode => 'MODE',
@@ -8382,11 +8449,9 @@ sub _compare_specs {
     foreach my $host (sort keys %{$verified}) {
 	foreach my $spec (@{$verified->{$host}}) {
 	    my ($name, $data) = @{$spec};
-	    open (my $mem, '<', \$data) || die "Cannot read spec $name from memory\n";
-	    my $obj = eval { fd_retrieve ($mem) };
-	    close ($mem);
-	    if (!ref ($obj) || !defined ($obj->{TREE}) || ref ($obj->{FILEATTR}) ne 'HASH') {
-		push (@lines, "$host: cannot load spec " . _esc ($name));
+	    my $obj = _load_spec ($data, $name);
+	    if (!$obj) {
+		push (@lines, "$host: " . ($LOAD_PROBLEM // "cannot load spec " . _esc ($name)));
 		next;
 	    }
 	    my $tree = $obj->{TREE};
@@ -8629,21 +8694,54 @@ sub _entries {
     return \%entries;
 }
 
+# Load a verified spec. Given its name (<host>.spec or <host>/<spec>),
+# also check that it holds the tree its file name is for (1.32): a
+# validly signed spec copied over another tree's spec would otherwise be
+# taken for that tree, and the tree whose name it took would drop out of
+# every comparison. On a mismatch it returns undef and says why in
+# $LOAD_PROBLEM (declared at the top of the package).
 sub _load_spec {
-    my ($data) = @_;
+    my ($data, $name) = @_;
+    $LOAD_PROBLEM = undef;
     return undef unless (defined ($data));
     open (my $mem, '<', \$data) || return undef;
     my $obj = eval { fd_retrieve ($mem) };
     close ($mem);
     return undef unless (ref ($obj) && defined ($obj->{TREE}) && ref ($obj->{FILEATTR}) eq 'HASH');
+    if (defined ($name) && !_name_fits_tree ($name, $obj->{TREE})) {
+	$LOAD_PROBLEM = "spec " . _esc ($name) . " holds tree " . _esc ($obj->{TREE}) .
+	    ", not the tree its name is for (a spec copied over another's?)";
+	return undef;
+    }
     return $obj;
+}
+
+# A tree spec is named for its tree (path_to_spec), and a host's spec of
+# specs (<host>.spec) holds its spec directory, specs/<host>.
+sub _name_fits_tree {
+    my ($name, $tree) = @_;
+    return (File::Basename::basename ($tree) eq $1) if ($name =~ m{\A([^/]+)\.spec\z});
+    return (main::path_to_spec ($tree) eq $1) if ($name =~ m{/([^/]+)\z});
+    return 0;
 }
 
 # Runs in the _sigtree child. For a path, the first line returned is
 # "\x01" followed by the old and new digests and sizes ("-" if none).
 sub _spec_details {
     my ($pairs, $path) = @_;
-    my @lines;
+    my (@lines, %bad);
+
+    # A copy holding another tree than its name says is reported, and that
+    # spec is left out.
+    foreach my $pair (@{$pairs}) {
+	foreach my $i (1, 2) {
+	    next if (!defined ($pair->[$i]) || _load_spec ($pair->[$i], $pair->[0]) ||
+		     !defined ($LOAD_PROBLEM));
+	    push (@lines, (($i == 1) ? "previous" : "current") . " copy of $LOAD_PROBLEM");
+	    $bad{$pair->[0]} = 1;
+	}
+    }
+    $pairs = [ grep { !$bad{$_->[0]} } @{$pairs} ];
 
     if (defined ($path)) {
 	# The longest tree that holds the path.
@@ -8656,7 +8754,7 @@ sub _spec_details {
 		($best, $best_tree) = ($pair, $tree) if (!defined ($best_tree) || length ($tree) > length ($best_tree));
 	    }
 	}
-	return ("no spec holds " . _esc ($path)) unless ($best);
+	return (@lines, "no spec holds " . _esc ($path)) unless ($best);
 	my ($spec, $old_data, $new_data) = @{$best};
 	my ($old, $new) = map { my $o = _load_spec ($_); $o ? _entries ($o)->{$path} : undef }
 	    ($old_data, $new_data);
@@ -8915,7 +9013,11 @@ sub _check_references {
 	next unless ($verified->{$host});
 	my %entries;
 	foreach my $spec (@{$verified->{$host}}) {
-	    my $obj = _load_spec ($spec->[1]) or next;
+	    my $obj = _load_spec ($spec->[1], $spec->[0]);
+	    if (!$obj) {
+		push (@lines, "$host: $LOAD_PROBLEM") if (defined ($LOAD_PROBLEM));
+		next;
+	    }
 	    my $e = _entries ($obj);
 	    @entries{keys %{$e}} = values %{$e};
 	}
@@ -8968,9 +9070,9 @@ sub _check_chroots {
 
     foreach my $host (sort keys %{$verified}) {
 	foreach my $spec (@{$verified->{$host}}) {
-	    my $obj = _load_spec ($spec->[1]);
+	    my $obj = _load_spec ($spec->[1], $spec->[0]);
 	    if (!$obj) {
-		push (@lines, "$host: cannot load spec " . _esc ($spec->[0]));
+		push (@lines, "$host: " . ($LOAD_PROBLEM // "cannot load spec " . _esc ($spec->[0])));
 		next;
 	    }
 	    my $e = _entries ($obj);

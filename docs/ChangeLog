@@ -1,3 +1,14 @@
+11 November 2026 1.32: Fixes after a review of 1.31 by another
+    session. check_file makes its path canonical (trailing /, //, /./,
+    .. resolved; .. after a symlink refused), so "check_file dir/" no
+    longer records junk paths that update puts in the spec. File names and
+    privileged errors are escaped in update output, the spec dir list,
+    the extraneous-file list and per-file warnings. changes exits 2 on
+    every error, including bad options, and refuses an option given after
+    the command. On OpenBSD, chflags and ls are unveiled even with
+    immutable-specs: no (flags were recorded as undefined). Under privsep,
+    check -v lists extraneous spec-dir files (it said there were none).
+    verify_hosts reports a spec that holds a different tree than its name.
 10 November 2026 1.31: verify_hosts detail query steps forward past
     snapshots whose spec signatures can't be verified (e.g., GPG-signed
     before the move to signify), hides mtime/ctime changes unless -v,

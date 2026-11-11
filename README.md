@@ -143,7 +143,10 @@ replaces the pending changes only for the trees in those sets,
 `check_file` only for that path (and everything beneath a directory),
 and `check_specs` only for the spec directory; the rest are kept from
 the previous check. (Before 1.31, any check replaced all of them, and
-`check_file` checked only the spec directory.) Successive checks without
+`check_file` checked only the spec directory.) `check_file` takes a
+relative or absolute path, and from 1.32 makes it canonical as specs
+record paths (a trailing `/`, `//`, `/./` and `..` are resolved; `..`
+after a symbolic link is refused). Successive checks without
 an update add to each tree's list of check times.
 
 From 1.31, check stores the spec's value and the value it found for each
