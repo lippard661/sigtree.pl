@@ -1,5 +1,10 @@
 BUGS:
 
+(1.32a fixed) 1.32 broke flag reading on every OpenBSD host: its new
+    unveil of chflags and ls was conditional on -e tests made after the
+    first unveil call, which fail, so ls could not be run ("Can't exec
+    /bin/ls: Permission denied") and all flags read as undefined.
+
 (1.32 fixed) After a review of 1.31 by another session: check_file did
     not make its path canonical, so a trailing slash or .. recorded junk
     paths (new exposure from the 1.31 check_file fix); update and some

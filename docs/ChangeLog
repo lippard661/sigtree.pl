@@ -1,3 +1,7 @@
+12 November 2026 1.32a: Fix 1.32's unveil change on OpenBSD: it
+    tested for chflags and ls after the first unveil call, so neither was
+    unveiled, ls could not be run, and every path's flags were recorded
+    as undefined. File tests in the unveil block now come first.
 11 November 2026 1.32: Fixes after a review of 1.31 by another
     session. check_file makes its path canonical (trailing /, //, /./,
     .. resolved; .. after a symlink refused), so "check_file dir/" no

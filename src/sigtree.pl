@@ -508,6 +508,15 @@
 #    that each spec holds the tree its file name is for (a validly signed
 #    spec copied over another tree's name), reports a mismatch and leaves
 #    that spec out.
+# Modified 12 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32a): on OpenBSD, 1.32 tested whether chflags and
+#    ls exist after the first unveil() call, when such a test reports any
+#    path not yet unveiled as missing, so neither was unveiled and every
+#    path's flags were recorded as undefined (a flags change on every
+#    path in every check). All the file tests in the unveil block are now
+#    made before the first unveil, which also corrects the test of an
+#    absolute -d spec dir outside the root dir (its parent was unveiled
+#    instead of the dir itself).
 
 ### Required packages.
 
@@ -607,7 +616,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.32 of 11 November 2026';
+my $VERSION = 'sigtree 1.32a of 12 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -1138,10 +1147,15 @@ if ($OSNAME eq 'openbsd') {
     # exec, and nothing is run from these directories. Walking through a
     # directory needs no unveil permission on it. Unveiling a path that
     # doesn't exist yet fails, so unveil its parent instead.
+    # From the first unveil() call on, a file test on a path not yet
+    # unveiled says it does not exist, so every test is made first. (1.32
+    # tested chflags and ls after unveiling the root dir, so neither was
+    # unveiled and every path's flags were recorded as undefined.)
+    my %exists = map { ($_ => (-e $_ ? 1 : 0)) } ($root_dir, $spec_dir_dir, $CHFLAGS, $LIST_FLAGS_CMD);
     foreach my $dir ($root_dir, $spec_dir_dir) {
 	# An absolute -d spec dir may lie outside $root_dir.
 	next if ($dir ne $root_dir && $dir =~ m{^\Q$root_dir\E(?:/|\z)});
-	if (-e $dir) {
+	if ($exists{$dir}) {
 	    unveil ($dir, 'rwc');
 	}
 	else {
@@ -1156,8 +1170,8 @@ if ($OSNAME eq 'openbsd') {
     # with ls whenever a set has the flags keyword (a default), and the
     # flag code tests that chflags exists first: without these, every
     # path's flags were recorded as undefined.
-    unveil ($CHFLAGS, 'rx') if (-e $CHFLAGS);
-    unveil ($LIST_FLAGS_CMD, 'rx') if (-e $LIST_FLAGS_CMD);
+    unveil ($CHFLAGS, 'rx') if ($exists{$CHFLAGS});
+    unveil ($LIST_FLAGS_CMD, 'rx') if ($exists{$LIST_FLAGS_CMD});
     # Need x for crypto sign/verify and keys.
     if ($use_pgp) {
 	if ($use_signify) {
