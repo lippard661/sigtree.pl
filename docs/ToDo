@@ -1,5 +1,8 @@
 BUGS:
 
+(1.32e fixed) -s new with initialize was rejected as an invalid set
+    name (and -s uninitialized as undefined) since it was added in 1.17.
+
 (1.32c fixed) verify_hosts reported a chroot's relinked libc and ld.so as
     differing between hosts although their system paths are in except:.
 

@@ -537,6 +537,13 @@
 #    other ownership than its system counterpart, such as /var/www/bin
 #    (group daemon) beside /bin. A mirror: entry with nothing in a host's
 #    copy of the chroot is reported, since it checks nothing.
+# Modified 14 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32e): "-s new" (and "-s uninitialized") with
+#    initialize works again, initializing only the trees without a spec;
+#    since 1.17 it was rejected as an invalid set name ("uninitialized" as
+#    undefined), and the code it should have reached called a method as a
+#    plain function. "new" and "uninitialized" are refused as set names in
+#    "set:" definitions, as the 1.17 notes said they were reserved.
 
 ### Required packages.
 
@@ -636,7 +643,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.32d of 14 November 2026';
+my $VERSION = 'sigtree 1.32e of 14 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -966,12 +973,15 @@ if ($set) {
 	    die "The set name \"$sets[$arg_no]\" given with -s option can only be used with the \"initialize\" command.\n";
 	}
 	# Add 'new' set to all trees without specs.
-	add_new_set_to_uninitialized_trees ($spec_dir);
+	$config->add_new_set_to_uninitialized_trees ($spec_dir);
     }
     $something_to_do = 0;
     foreach $set (@sets) {
 	if ($config->set_has_trees ($set)) {
 	    $something_to_do = 1;
+	}
+	elsif ($set eq 'new') {
+	    print "Every tree in the config has a specification already.\n";
 	}
 	else {
 	    print "Warning: Set \"$set\" has no trees as members. (It appears to be a\n   primary set rather than a tree-grouping set.)\n";
@@ -4509,6 +4519,10 @@ sub new {
 		}
 		$set_long_name = $1;
 		$set_short_name = $2;
+		foreach my $name ($set_long_name, $set_short_name) {
+		    die "Reserved set name \"$name\" (\"new\" and \"uninitialized\" mean the trees without a specification, with -s for initialize), line $line. $config_file\nLine: $raw_line"
+			if ($name eq 'new' || $name eq 'uninitialized');
+		}
 
 		if (length ($set_long_name) > 12) {
 		    die "Set name \"$set_long_name\" is longer than the maximum length of 12 characters.\n";
@@ -4806,8 +4820,8 @@ sub defined_set {
     # Undefined set always exists.
     return 1 if (!$set);
 
-    # "new" is a special case.
-    return 1 if ($set eq 'new');
+    # "new" and its synonym "uninitialized" are special cases.
+    return 1 if ($set eq 'new' || $set eq 'uninitialized');
 
     foreach $set_name (@{$self->{SETS}}) {
 	($set_long_name, $set_short_name) = split (/,/, $set_name);
@@ -4867,7 +4881,11 @@ sub valid_setlist {
 	}
 	$arg_no++;
     }
-    return ($uninitialized_arg_no, $set_includes_uninitialized, @return_sets);
+    # $SET_INCLUDES_UNINITIALIZED, not the flag itself: before 1.32e this
+    # returned 1, which is $SET_NAME_INVALID, so "-s new" was rejected as
+    # an invalid set name.
+    return ($uninitialized_arg_no, ($set_includes_uninitialized ? $SET_INCLUDES_UNINITIALIZED : 0),
+	    @return_sets);
 }
 
 # Internal subroutine to give the tree-relative form of an absolute
@@ -4955,11 +4973,11 @@ sub add_new_set_to_uninitialized_trees {
     my ($spec_dir) = @_;
     my (@trees, $tree, $tree_spec_name);
     
-    @trees = $config->all_trees;
+    @trees = $self->all_trees;
     foreach $tree (@trees) {
-	$tree_spec_name = path_to_spec ($tree);
+	$tree_spec_name = main::path_to_spec ($tree);
 	if (!-e "$spec_dir/$tree_spec_name") {
-	    _add_set_to_tree ($tree, 'new');
+	    $self->_add_set_to_tree ($tree, 'new');
 	}
     }
 }

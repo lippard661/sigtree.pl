@@ -1,3 +1,7 @@
+14 November 2026 1.32e: -s new (or -s uninitialized) with initialize
+    works again, initializing only trees without a spec (it had been
+    rejected as an invalid set name since 1.17); new and uninitialized
+    are refused as set names in set: definitions.
 14 November 2026 1.32d: verify_hosts chroot blocks take "mirror: -dir"
     to mirror a directory's contents but not the directory itself (for
     /var/www/bin, group daemon by mtree), and report a mirror: entry that
