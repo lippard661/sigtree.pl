@@ -1,3 +1,7 @@
+14 November 2026 1.32b: update and initialize stop before the passphrase
+    prompt when the specs are locked with schg and the securelevel is
+    above 0 (the test existed but could only be reached when the host
+    spec did not exist, so update failed at the first chflags instead).
 12 November 2026 1.32a: Fix 1.32's unveil change on OpenBSD: it
     tested for chflags and ls after the first unveil call, so neither was
     unveiled, ls could not be run, and every path's flags were recorded

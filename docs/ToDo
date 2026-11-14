@@ -1,5 +1,9 @@
 BUGS:
 
+(1.32b fixed) update at securelevel > 0 with schg specs asked for the
+    passphrase and then failed at chflags; the securelevel test was an
+    elsif reached only when the host spec did not exist.
+
 (1.32a fixed) 1.32 broke flag reading on every OpenBSD host: its new
     unveil of chflags and ls was conditional on -e tests made after the
     first unveil call, which fail, so ls could not be run ("Can't exec

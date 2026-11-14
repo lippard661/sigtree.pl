@@ -517,6 +517,13 @@
 #    made before the first unveil, which also corrects the test of an
 #    absolute -d spec dir outside the root dir (its parent was unveiled
 #    instead of the dir itself).
+# Modified 14 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32b): update and initialize stop, before the
+#    passphrase prompt, when the specs are locked with schg and the
+#    securelevel is above 0. The test was there, but as the last branch of
+#    an if/elsif chain that reached it only when the host spec did not
+#    exist, so update asked for the passphrase and then failed at the first
+#    chflags ("Operation not permitted").
 
 ### Required packages.
 
@@ -616,7 +623,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.32a of 12 November 2026';
+my $VERSION = 'sigtree 1.32b of 14 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -2983,8 +2990,18 @@ sub verify_required_dirs {
 	    die "Host specification is not writable. $spec_dir_dir/$spec_spec\n";
 	}
     }
-    elsif ($caller != $CHECK && $use_immutable && $SECURELEVEL > 0 && ($immutable_flag ne $BSD_USER_IMMUTABLE_FLAG)) {
-	die "Cannot write to existing host specification when kernel securelevel > 0.  Securelevel = $SECURELEVEL\n";
+
+    # Specs locked with a flag only securelevel 0 or -1 can clear (schg)
+    # cannot be rewritten above it, so stop here, before the passphrase
+    # prompt and before anything is changed. Before 1.32b this test was
+    # the last branch of the chain above, reached only when the host spec
+    # did not exist, so update went on and failed at the first chflags
+    # (-w does not help: root passes it on an schg file).
+    if ($caller != $CHECK && $use_immutable && $SECURELEVEL > 0 &&
+	$immutable_flag ne $BSD_USER_IMMUTABLE_FLAG && -e $spec_dir_dir . "/$spec_spec") {
+	die "Cannot write to existing host specification when kernel securelevel > 0 " .
+	    "(securelevel = $SECURELEVEL; the specs are locked with $immutable_flag, which only\n" .
+	    "securelevel 0 or -1 can clear: run this in single-user mode, or at securelevel 0).\n";
     }
 
     if ($use_pgp) {
