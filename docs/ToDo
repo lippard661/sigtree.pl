@@ -1,5 +1,8 @@
 BUGS:
 
+(1.32c fixed) verify_hosts reported a chroot's relinked libc and ld.so as
+    differing between hosts although their system paths are in except:.
+
 (1.32b fixed) update at securelevel > 0 with schg specs asked for the
     passphrase and then failed at chflags; the securelevel test was an
     elsif reached only when the host spec did not exist.

@@ -458,7 +458,9 @@ reports:
   are copies of the system's (`bin`, `usr/lib`, ...) that differ from
   the host's own copy, or have none: a chroot left behind by a syspatch,
   or a swapped binary or device node; and, across the hosts that have
-  it, files in those system parts that they all have and that differ;
+  it, files in those system parts that they all have and that differ
+  (except those whose system counterpart is in `except:`, such as the
+  libc and ld.so each host relinks at boot, from 1.32c);
 - for each file named in `reference:` (1.30 and later), every host whose
   copy differs from the copy on the server running `verify_hosts`, or
   whose specs have no copy (for configuration files kept in one place

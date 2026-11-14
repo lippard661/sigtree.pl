@@ -524,6 +524,12 @@
 #    an if/elsif chain that reached it only when the host spec did not
 #    exist, so update asked for the passphrase and then failed at the first
 #    chflags ("Operation not permitted").
+# Modified 14 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32c): verify_hosts's comparison of a chroot across
+#    its hosts leaves out a file whose system counterpart is in except:
+#    (libc, ld.so and the other files relinked at boot): each host's copy
+#    is a copy of its own relinked file, so they always differed. Each
+#    copy is still compared with its own host's system file.
 
 ### Required packages.
 
@@ -623,7 +629,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.32b of 14 November 2026';
+my $VERSION = 'sigtree 1.32c of 14 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -9178,7 +9184,11 @@ sub _check_chroots {
 	# Files that every host's copy of the chroot has must be the same,
 	# in the system parts only (the mirrored directories, dev/ and
 	# etc/): the rest (htdocs, cgi-bin, logs) serves each host's own
-	# purpose. compare-except: leaves out paths that differ by design.
+	# purpose. compare-except: leaves out paths that differ by design, and
+	# so does except: through each path's system counterpart (1.32c): a
+	# chroot's libc or ld.so is a copy of its own host's relinked system
+	# file, so the hosts' copies must differ. The mirror check above still
+	# compares each copy with its own host's system file.
 	next if (@hosts < 2);
 	my ($first, @rest) = @hosts;
 	my @diffs;
@@ -9187,6 +9197,8 @@ sub _check_chroots {
 	    my $rel = substr ($path, length ($root) + 1);
 	    next unless (grep { $rel eq $_ || index ($rel, "$_/") == 0 } (@{$chroot->{MIRROR}}, 'dev', 'etc'));
 	    next if (grep { $path =~ $_->[1] } @{$chroot->{COMPARE_EXCEPT}});
+	    my $system_path = ($sysroot eq '/') ? "/$rel" : "$sysroot/$rel";
+	    next if (grep { $system_path =~ $_->[1] } @{$cf->{EXCEPT}});
 	    foreach my $other (@rest) {
 		my @d = _copy_diff ($entries{$first}{$path}, $root, $entries{$other}{$path}, $root);
 		push (@diffs, _esc ($rel) . " ($first and $other: " . join (',', @d) . ")") if (@d);
