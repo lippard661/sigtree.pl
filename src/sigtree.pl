@@ -530,6 +530,13 @@
 #    (libc, ld.so and the other files relinked at boot): each host's copy
 #    is a copy of its own relinked file, so they always differed. Each
 #    copy is still compared with its own host's system file.
+# Modified 14 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32d): "mirror: -dir" in a verify_hosts chroot
+#    block mirrors a directory's contents but not the directory itself
+#    (as syslock's "-" prefix), for a directory that OpenBSD's mtree gives
+#    other ownership than its system counterpart, such as /var/www/bin
+#    (group daemon) beside /bin. A mirror: entry with nothing in a host's
+#    copy of the chroot is reported, since it checks nothing.
 
 ### Required packages.
 
@@ -629,7 +636,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.32c of 14 November 2026';
+my $VERSION = 'sigtree 1.32d of 14 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -7995,7 +8002,8 @@ sub _parse_config {
 	    die "Second \"chroot: $value\", line $line_no. $config_file\nLine: $raw"
 		if (grep { $_->{ROOT} eq $value } @{$cf{CHROOTS} || []});
 	    $chroot = { ROOT => $value, HOSTS => [], MIRROR => [], MIRROR_EXCEPT => [],
-			ALLOW_ONLY => [], ALLOW_EXTRA => [], RULES_EXCEPT => [], COMPARE_EXCEPT => [] };
+			ALLOW_ONLY => [], ALLOW_EXTRA => [], RULES_EXCEPT => [], COMPARE_EXCEPT => [],
+			CONTENTS_ONLY => {} };
 	    push (@{$cf{CHROOTS}}, $chroot);
 	}
 	elsif ($field =~ /^(chroot-hosts|mirror|mirror-except|allow-only|allow-extra|rules-except|compare-except)\z/) {
@@ -8007,13 +8015,19 @@ sub _parse_config {
 	    else {
 		(my $key = uc ($field)) =~ s/-/_/g;
 		foreach my $rel (split (/\s+/, $value)) {
+		    # "mirror: -dir" (1.32d): the directory's contents are copies
+		    # of the system's, the directory itself is not (OpenBSD's
+		    # mtree gives /var/www/bin group daemon), as syslock's "-"
+		    # locks a directory's contents but not the directory.
+		    my $contents_only = ($key eq 'MIRROR' && $rel =~ s/^-//);
 		    die "\"$field:\" paths are relative to the chroot and without \"..\", line $line_no. $config_file\nLine: $raw"
-			if ($rel =~ m{^/} || $rel =~ m{(?:^|/)\.\.(?:/|\z)});
+			if ($rel eq '' || $rel =~ m{^/} || $rel =~ m{(?:^|/)\.\.(?:/|\z)});
 		    $rel =~ s{/+\z}{};
 		    if ($key eq 'MIRROR') {
 			die "\"mirror:\" takes directories or files, not patterns, line $line_no. $config_file\nLine: $raw"
 			    if ($rel =~ /[*?]/);
 			push (@{$chroot->{MIRROR}}, $rel);
+			$chroot->{CONTENTS_ONLY}{$rel} = 1 if ($contents_only);
 		    }
 		    else {
 			push (@{$chroot->{$key}}, [$rel, _glob_to_regex ("$chroot->{ROOT}/$rel")]);
@@ -9121,7 +9135,8 @@ sub _check_chroots {
 		      ['not owned by root', 'OWNER'], ['group or world writable', 'WRITABLE'],
 		      ['not in allow-only', 'NOT_ALLOWED'],
 		      ['no copy on the system (not in allow-extra)', 'NO_COUNTERPART'],
-		      ['differs from the system copy', 'DIFFERS']);
+		      ['differs from the system copy', 'DIFFERS'],
+		      ['mirror: entry with nothing in this copy (a typo, or not built here?)', 'MIRROR_MISSING']);
 
     foreach my $chroot (@{$cf->{CHROOTS}}) {
 	my $root = $chroot->{ROOT};
@@ -9167,6 +9182,7 @@ sub _check_chroots {
 		}
 		next unless ($mirrored);
 		next if (grep { $path =~ $_->[1] } @{$chroot->{MIRROR_EXCEPT}});
+		next if ($chroot->{CONTENTS_ONLY}{$rel});
 		my $sys = ($sysroot eq '/') ? "/$rel" : "$sysroot/$rel";
 		my $sfa = $e->{$sys};
 		if (!$sfa) {
@@ -9176,6 +9192,10 @@ sub _check_chroots {
 		}
 		my @diffs = _copy_diff ($fa, $root, $sfa, $sysroot);
 		push (@{$found{DIFFERS}}, "$shown (" . join (',', @diffs) . ")") if (@diffs);
+	    }
+	    # A mirror: entry that matches nothing checks nothing, silently.
+	    foreach my $dir (@{$chroot->{MIRROR}}) {
+		push (@{$found{MIRROR_MISSING}}, _esc ($dir)) unless ($e->{"$root/$dir"});
 	    }
 	    my @found = map { _limited ($_->[0], $found{$_->[1]}) } grep { $found{$_->[1]} } @categories;
 	    push (@lines, "Chroot $root on $host:", map { "   $_" } @found) if (@found);

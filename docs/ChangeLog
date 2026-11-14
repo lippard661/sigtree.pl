@@ -1,3 +1,7 @@
+14 November 2026 1.32d: verify_hosts chroot blocks take "mirror: -dir"
+    to mirror a directory's contents but not the directory itself (for
+    /var/www/bin, group daemon by mtree), and report a mirror: entry that
+    matches nothing in a host's copy of the chroot.
 14 November 2026 1.32c: verify_hosts no longer reports chroot files
     whose system counterpart is in except: (libc, ld.so) as differing
     between hosts; each copy is still checked against its own host's
