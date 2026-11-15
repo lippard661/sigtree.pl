@@ -544,6 +544,28 @@
 #    undefined), and the code it should have reached called a method as a
 #    plain function. "new" and "uninitialized" are refused as set names in
 #    "set:" definitions, as the 1.17 notes said they were reserved.
+# Modified 15 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32f): verify_hosts compares only the specs that a
+#    host's spec of specs lists, and only if each matches the digest it
+#    records there. The copies on the central server are pulled without
+#    --delete, so a spec the host had removed stayed there, still validly
+#    signed, and was loaded beside the current one; its old entries took
+#    the place of the current ones for the same paths, so a host could
+#    appear to differ from its peers (or leave no majority) for files that
+#    were the same everywhere. A spec the spec of specs does not list, one
+#    that does not match it, and one it lists that the copy lacks are each
+#    reported.
+# Modified 15 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32g): "may-lack:" in a verify_hosts host block
+#    names common paths that host need not have: if it lacks them, it is
+#    not reported; if it has them, they are compared as usual.
+# Modified 15 November 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (version 1.32h): verify_hosts compares each attribute only
+#    among the hosts (or, for chroots, the copies) that recorded it. A
+#    missing value was compared as a value, so a host whose set records a
+#    digest for files its peers' sets do not "differed" from them, and a
+#    mix left no majority. Where a host records no digest or flags that
+#    its peers record, that is now reported once per host, with a count.
 
 ### Required packages.
 
@@ -643,7 +665,7 @@ my $BSD_USER_IMMUTABLE_FLAG = 'uchg';
 my $LINUX_IMMUTABLE_FLAG = '+i';
 my $LINUX_IMMUTABLE_FLAG_OFF = '-i';
 
-my $VERSION = 'sigtree 1.32e of 14 November 2026';
+my $VERSION = 'sigtree 1.32h of 15 November 2026';
 
 # Now set in the config file, crypto_sigs field.
 my $PGP_or_GPG = 'GPG'; # Set to PGP if you want to use PGP, GPG1 to use GPG 1, GPG to use GPG 2, signify to use signify.
@@ -7812,7 +7834,7 @@ sub run {
 	    push (@lines, _check_snapshots ($cf, $host, $snapshots, \%hash_cache))
 		if (defined ($cf->{SNAPSHOT_ROOT}));
 	    if (defined ($host->{KEY})) {
-		my ($sig_lines, $specs, $all_good) = _check_signatures ($cf, $host, $temp_dir);
+		my ($sig_lines, $specs, $all_good) = _check_signatures ($cf, $host, $temp_dir, $uid, $gid, $osname);
 		push (@lines, @{$sig_lines});
 		if ($all_good) {
 		    $verified{$host->{NAME}} = $specs if ($host->{PEER});
@@ -7994,7 +8016,7 @@ sub _parse_config {
 	    die "Invalid host name \"$value\", line $line_no. $config_file\nLine: $raw"
 		unless ($value =~ /^[\w][\w.-]*\z/);
 	    die "Second \"host: $value\", line $line_no. $config_file\nLine: $raw" if ($seen{$value}++);
-	    $current = { NAME => $value, PEER => 0 };
+	    $current = { NAME => $value, PEER => 0, MAY_LACK => [] };
 	    push (@{$cf{HOSTS}}, $current);
 	}
 	elsif ($field eq 'reference') {
@@ -8053,10 +8075,20 @@ sub _parse_config {
 		}
 	    }
 	}
-	elsif ($field eq 'key' || $field eq 'key-copy' || $field eq 'peer') {
+	elsif ($field eq 'key' || $field eq 'key-copy' || $field eq 'peer' || $field eq 'may-lack') {
 	    die "\"$field:\" before any \"host:\", line $line_no. $config_file\nLine: $raw"
 		unless (defined ($current));
-	    if ($field eq 'key') {
+	    if ($field eq 'may-lack') {
+		# Common paths this host need not have (1.32g): absent here, they
+		# are not reported; present, they are compared as usual.
+		foreach my $path (split (/\s+/, $value)) {
+		    die "\"may-lack:\" paths must be absolute, line $line_no. $config_file\nLine: $raw"
+			unless ($path =~ m{^/});
+		    $path =~ s{/+\z}{} unless ($path eq '/');
+		    push (@{$current->{MAY_LACK}}, [$path, _glob_to_regex ($path)]);
+		}
+	    }
+	    elsif ($field eq 'key') {
 		die "Second \"key:\" for host $current->{NAME}, line $line_no. $config_file\nLine: $raw"
 		    if (defined ($current->{KEY}));
 		die "\"key:\" must be the base64 line of a signify public key, line $line_no. $config_file\nLine: $raw"
@@ -8343,8 +8375,8 @@ sub _limited {
 # the verified tree specs as [name, data], and whether every spec and the
 # spec-of-specs verified.
 sub _check_signatures {
-    my ($cf, $host, $temp_dir) = @_;
-    my (@lines, @specs);
+    my ($cf, $host, $temp_dir, $uid, $gid, $osname) = @_;
+    my (@lines, @specs, $spec_of_specs);
     my $name = $host->{NAME};
     my $all_good = 1;
 
@@ -8377,8 +8409,87 @@ sub _check_signatures {
 	elsif ($spec ne "$name.spec") {
 	    push (@specs, [$spec, $data]);
 	}
+	else {
+	    $spec_of_specs = $data;
+	}
+    }
+
+    # Compare only the specs the host's spec of specs lists, and only if
+    # they match its digest (1.32f). The copy here is pulled without
+    # --delete, so a spec the host has since removed stays in it, still
+    # validly signed, and was loaded beside the current one: its old
+    # entries then took the place of the current ones for the same paths.
+    if (defined ($spec_of_specs) && defined ($uid) && @specs) {
+	my (%listed, @problems);
+	foreach my $line (_in_child ($uid, $gid, $osname, sub { _spec_of_specs_listing ($name, $spec_of_specs) })) {
+	    if ($line =~ /\A\x01([^\t]+)\t(\S+)\z/) {
+		$listed{$1} = $2;
+	    }
+	    else {
+		push (@problems, $line);
+	    }
+	}
+	if (@problems || !%listed) {
+	    push (@lines, @problems ? @problems : "the spec of specs lists no specs",
+		  "so every spec in this copy is compared");
+	}
+	else {
+	    my @kept;
+	    foreach my $spec (@specs) {
+		my $file = (split (m{/}, $spec->[0], 2))[1] // '';
+		my $digest = $listed{$file};
+		if (!defined ($digest)) {
+		    push (@lines, "spec " . _esc ($spec->[0]) . " is not in the spec of specs " .
+			  "(left in this copy after the host removed it?): not compared");
+		}
+		elsif ($digest ne '-' && !_data_matches (\$spec->[1], $digest)) {
+		    push (@lines, "spec " . _esc ($spec->[0]) . " does not match the spec of specs " .
+			  "(copied during an update?): not compared");
+		}
+		else {
+		    push (@kept, $spec);
+		}
+	    }
+	    my %have = map { ((split (m{/}, $_->[0], 2))[1] => 1) } @specs;
+	    foreach my $file (sort grep { !/\.sig\z/ && !$have{$_} } keys %listed) {
+		push (@lines, "the spec of specs lists " . _esc ($file) . ", which this copy lacks");
+	    }
+	    @specs = @kept;
+	}
     }
     return (\@lines, \@specs, $all_good);
+}
+
+# Runs in the _sigtree child: the spec files a host's spec of specs
+# lists, one line each, "\x01" then the name, a tab and its digest ("-"
+# if none). Names with control characters are left out (sigtree never
+# makes one, and one could forge a line).
+sub _spec_of_specs_listing {
+    my ($host, $data) = @_;
+    my $obj = _load_spec ($data, "$host.spec");
+    return ($LOAD_PROBLEM // "cannot load the spec of specs") unless ($obj);
+    my @out;
+    foreach my $key (sort keys %{$obj->{FILEATTR}}) {
+	my $fa = $obj->{FILEATTR}{$key};
+	next unless (ref ($fa) && ($fa->{TYPE} // '') eq 'file');
+	next if ($key =~ m{/} || $key =~ /[\x00-\x1f\x7f]/);
+	my $digest = $fa->{SHADIGEST};
+	push (@out, "\x01$key\t" . ((defined ($digest) && $digest =~ /\A[0-9a-f]+\z/i) ? lc ($digest) : '-'));
+    }
+    return @out;
+}
+
+# Whether data in memory has the given digest: SHA-3, then SHA-2, of the
+# size the digest's hex length implies (as _backup_matches for files).
+sub _data_matches {
+    my ($data_ref, $digest) = @_;
+    my %bits = (56 => 224, 64 => 256, 96 => 384, 128 => 512);
+    my $bits = $bits{length ($digest)} or return 0;
+    foreach my $ctx (Digest::SHA3->new ($bits), Digest::SHA->new ($bits)) {
+	$ctx->add (${$data_ref});
+	return 1 if ($ctx->hexdigest eq $digest);
+    }
+    return 0;
 }
 
 # Write the host's pinned key as a signify public key file in the
@@ -8541,10 +8652,13 @@ sub _compare_specs {
 		       @{$trees{$host} || []});
     };
     my @hosts = sort keys %{$verified};
-    my (%differs, %missing, %only, @no_majority);
+    my %may_lack = map { ($_->{NAME} => $_->{MAY_LACK} || []) } @{$cf->{HOSTS}};
+    my (%differs, %missing, %only, @no_majority, %unrecorded);
     foreach my $path (sort keys %entries) {
 	my $have = $entries{$path};
-	my @covering = grep { $covers->($_, $path) } @hosts;
+	# A host that lacks a path its may-lack: names is left out for it.
+	my @covering = grep { $covers->($_, $path) &&
+				  ($have->{$_} || !grep { $path =~ $_->[1] } @{$may_lack{$_}}) } @hosts;
 	next if (@covering < 2);
 	my @present = grep { $have->{$_} } @covering;
 	my @absent = grep { !$have->{$_} } @covering;
@@ -8556,22 +8670,39 @@ sub _compare_specs {
 	    push (@{$missing{$_}}, _esc ($path)) foreach (@absent);
 	}
 	next if (@present < 2);
-	my %count;
-	my %value;
-	foreach my $host (@present) {
-	    $value{$host} = join ("\0", map { $_ // '-' } @{$have->{$host}});
+	# Each attribute among the hosts that recorded it (1.32h). A host
+	# whose set does not check an attribute (no shadigest for files that
+	# change daily, say) records none, and before 1.32h that absence was
+	# compared as a value: one host recording a digest where the others
+	# record none "differed", and a mix left no majority.
+	my (%diff, $no_majority);
+	foreach my $i (0 .. $#attrs) {
+	    my %val = map { ($_ => $have->{$_}[$i]) } grep { defined ($have->{$_}[$i]) } @present;
+	    my @with = sort keys %val;
+	    if (@with && @with < @present && $attrs[$i] =~ /\A(?:shadigest|flags)\z/) {
+		# Counted for whichever side is the minority, so the host whose
+		# config is the odd one out is the one named.
+		my @without = grep { !defined ($have->{$_}[$i]) } @present;
+		my ($kind, @odd) = (@with < @without) ? ('records', @with) : ('lacks', @without);
+		foreach my $host (@odd) {
+		    $unrecorded{$host}{"$kind\0$attrs[$i]"}{COUNT}++;
+		    $unrecorded{$host}{"$kind\0$attrs[$i]"}{EXAMPLE} //= $path;
+		}
+	    }
+	    next if (@with < 2);
+	    my %count;
+	    $count{$_}++ foreach (values %val);
+	    next if (keys (%count) == 1);
+	    my ($top) = sort { $count{$b} <=> $count{$a} || $a cmp $b } keys %count;
+	    if ($count{$top} * 2 <= @with) {
+		$no_majority = 1;
+		next;
+	    }
+	    push (@{$diff{$_}}, $attrs[$i]) foreach (grep { $val{$_} ne $top } @with);
 	}
-	$count{$value{$_}}++ foreach (@present);
-	my ($top) = sort { $count{$b} <=> $count{$a} } keys %count;
-	next if (keys (%count) == 1);
-	if ($count{$top} * 2 <= @present) {
-	    push (@no_majority, _esc ($path));
-	    next;
-	}
-	my ($ref_host) = grep { $value{$_} eq $top } @present;
-	foreach my $host (grep { $value{$_} ne $top } @present) {
-	    my @which = grep { ($have->{$host}[$_] // '-') ne ($have->{$ref_host}[$_] // '-') } 0 .. $#attrs;
-	    push (@{$differs{$host}}, _esc ($path) . " (" . join (',', @attrs[@which]) . ")");
+	push (@no_majority, _esc ($path)) if ($no_majority);
+	foreach my $host (sort keys %diff) {
+	    push (@{$differs{$host}}, _esc ($path) . " (" . join (',', @{$diff{$host}}) . ")");
 	}
     }
 
@@ -8583,6 +8714,20 @@ sub _compare_specs {
     }
     push (@lines, _limited ("no majority among the peers", \@no_majority))
 	if (@no_majority);
+    # Where an attribute could not be compared because a host does not
+    # record it, once per host and attribute.
+    foreach my $host (sort keys %unrecorded) {
+	foreach my $key (sort keys %{$unrecorded{$host}}) {
+	    my ($kind, $attr) = split (/\0/, $key);
+	    my $u = $unrecorded{$host}{$key};
+	    my $paths = "$u->{COUNT} common path" . (($u->{COUNT} == 1) ? '' : 's');
+	    push (@lines, ($kind eq 'records') ?
+		  "$host records $attr for $paths that most peers do not (their sets lack the keyword?), e.g. " .
+		  _esc ($u->{EXAMPLE}) . ": not compared there" :
+		  "$host records no $attr for $paths that most peers record it for (its set lacks the keyword?), e.g. " .
+		  _esc ($u->{EXAMPLE}) . ": not compared there");
+	}
+    }
     return @lines;
 }
 
@@ -9266,8 +9411,11 @@ sub _copy_diff {
     foreach my $field (@fields) {
 	my ($a1, $b1) = ($x->{$field}, $y->{$field});
 	($a1, $b1) = ($rel_link->($a1, $xroot), $rel_link->($b1, $yroot)) if ($field eq 'LINK');
-	next if (!defined ($a1) && !defined ($b1));
-	next if (defined ($a1) && defined ($b1) && $a1 eq $b1);
+	# Only what both recorded (1.32h): a field one side's set does not
+	# check (a digest, a device number) is not a difference. A change of
+	# type, which also leaves a field on one side only, shows as type.
+	next if (!defined ($a1) || !defined ($b1));
+	next if ($a1 eq $b1);
 	push (@diffs, lc ($field));
     }
     return @diffs;

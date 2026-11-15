@@ -1,5 +1,13 @@
 BUGS:
 
+(1.32h fixed) verify_hosts compared an attribute a host does not record
+    (no shadigest in its set) as a value, so the one host that did record
+    digests for /etc/pf.tables appeared to differ from its peers.
+
+(1.32f fixed) verify_hosts loaded every validly signed spec in a host's
+    copied spec dir, including ones the host had removed, so old entries
+    could make a host differ from its peers for identical files.
+
 (1.32e fixed) -s new with initialize was rejected as an invalid set
     name (and -s uninitialized as undefined) since it was added in 1.17.
 
